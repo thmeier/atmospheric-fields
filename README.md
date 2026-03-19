@@ -15,3 +15,9 @@ Populate the new environment with the list of packages found in `./requirements.
 ```bash
 $ conda install --file requirements.txt
 ```
+
+In case the installation from the requirements.txt fails, try adding the conda-forge repo.
+
+```bash
+$ conda config --add channels conda-forge
+```
