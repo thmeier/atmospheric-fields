@@ -10,7 +10,7 @@
 
 #VENV_PATH=...
 CONDA_ENV_NAME=pmlr
-WORKDIR=$HOME/
+WORKDIR="/work/scratch/$USER"
 
 SOURCE="gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr"
 
