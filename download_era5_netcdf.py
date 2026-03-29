@@ -15,7 +15,7 @@ def download_era5_netcdf(
     time_end: str,
 ):
     print(f"Opening {source}...")
-    ds = xr.open_zarr(source, chunks=None)
+    ds = xr.open_zarr(source, chunks="auto")
 
     # Select variables
     if variables:
@@ -30,7 +30,7 @@ def download_era5_netcdf(
     print(f"Saving {ds.time.size} timesteps to {output_path}")
 
     # Save as NetCDF
-    ds.to_netcdf(output_path)
+    ds.to_netcdf(output_path, format="NETCDF4")
 
     print("Done!")
 

@@ -1,6 +1,8 @@
 """
 Quick exploration and plotting of downloaded ERA5 NetCDF data.
 """
+import argparse
+import os
 from pathlib import Path
 import numpy as np
 import xarray as xr
@@ -8,9 +10,24 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-DATA_PATH = Path(__file__).parent / "test_data.nc"
-PLOTS_DIR = Path(__file__).parent / "plots"
-PLOTS_DIR.mkdir(exist_ok=True)
+CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
+CLUSTER_PLOTS_DIR = Path(f"/work/scratch/{os.environ['USER']}/plots")
+
+LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local.nc"
+LOCAL_PLOTS_DIR = Path(__file__).parent / "plots"
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--local", action="store_true", help="Use local dataset and save plots locally")
+args = parser.parse_args()
+
+if args.local:
+    DATA_PATH = LOCAL_DATA_PATH
+    PLOTS_DIR = LOCAL_PLOTS_DIR
+else:
+    DATA_PATH = CLUSTER_DATA_PATH
+    PLOTS_DIR = CLUSTER_PLOTS_DIR
+
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── 1. Load & inspect ────────────────────────────────────────────────────────
 print("Loading dataset...")
@@ -37,16 +54,17 @@ def plot_map(da, title, filename, cmap="RdBu_r", units=""):
     ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
     ax.add_feature(cfeature.BORDERS, linewidth=0.3, linestyle=":")
 
+    da = da.transpose("latitude", "longitude")
     im = ax.pcolormesh(
         da.longitude, da.latitude, da.values,
         transform=ccrs.PlateCarree(),
-        cmap=cmap, shading="auto",
+        cmap=cmap, shading="nearest",
     )
     plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.04, shrink=0.8, label=units)
     ax.set_title(title, fontsize=13)
     fig.savefig(PLOTS_DIR / filename, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: plots/{filename}")
+    print(f"  Saved: {PLOTS_DIR / filename}")
 
 
 # ── 3. Snapshot plots (first timestep) ───────────────────────────────────────
@@ -88,6 +106,9 @@ fig.autofmt_xdate()
 fig.tight_layout()
 fig.savefig(PLOTS_DIR / "t2m_global_mean_timeseries.png", dpi=120)
 plt.close(fig)
-print("  Saved: plots/t2m_global_mean_timeseries.png")
+print(f"  Saved: {PLOTS_DIR / 't2m_global_mean_timeseries.png'}")
 
-print("\nAll done. Plots saved to ./plots/")
+print(f"\nAll done. Plots saved to {PLOTS_DIR}")
+if not args.local:
+    print(f"\nTo copy plots to your local machine, run:")
+    print(f"  scp -r {os.environ['USER']}@student-cluster.inf.ethz.ch:{PLOTS_DIR} ~/Downloads/era5_plots")

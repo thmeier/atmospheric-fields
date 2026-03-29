@@ -209,3 +209,5 @@ __marimo__/
 
 plots/
 test_data.nc
+data/
+.DS_Store
