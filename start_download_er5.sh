@@ -19,7 +19,7 @@ set -eo pipefail
 # the cona environment created for the dependencies
 CONDA_ENV_NAME=pmlr
 # this is the directory where the download_era5_netcdf.py is located
-WORKDIR="$HOME/atomspheric-fields/"
+WORKDIR="$HOME/atmospheric-fields/"
 # team shared output directory, i.e. only download data once,
 # but be careful to not overwrite data that is needed by others
 OUTPUT_DIR="/cluster/courses/pmlr/teams/team07/data"
@@ -36,7 +36,7 @@ TIME_START="2020-01-01"
 TIME_END="2020-01-07"
 # a file with this name will be created,
 # the script will fail if this already exists
-OUTPUT_FILENAME="test_$TIME_START_$TIME_END.nc"
+OUTPUT_FILENAME="test_${TIME_START}_${TIME_END}.nc"
 # do not modify
 OUTPUT_FILE="$OUTPUT_DIR/$OUTPUT_FILENAME"
 # which variables to pick from the observations
