@@ -1,0 +1,191 @@
+import argparse
+from pathlib import Path
+import torch
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+
+from dataset import AtmosphereDataset
+from models import MaskedAutoencoderViT
+
+CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
+LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local.nc"
+LARGE_LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local_5y.nc"
+
+def train_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0
+    
+    for batch_idx, data in enumerate(loader):
+        data = data.to(device)
+        
+        optimizer.zero_grad()
+        loss, _, _ = model(data, mask_ratio=0.75)
+        
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+            
+    return total_loss / len(loader)
+
+def validate_epoch(model, loader, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            loss, _, _ = model(data, mask_ratio=0.75)
+            total_loss += loss.item()
+            
+    return total_loss / len(loader)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local", action="store_true", help="Run locally using subset data")
+    parser.add_argument("--large-local", action="store_true", help="Run locally using the larger 5-year dataset")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--stats-chunk-size", type=int, default=64)
+    parser.add_argument("--recompute-stats", action="store_true", help="Ignore saved normalization stats and recompute them")
+    parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
+    parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
+    parser.set_defaults(lazy=None)
+    args = parser.parse_args()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # On macOS we can also try MPS
+    if torch.backends.mps.is_available():
+        device = torch.device('cpu')
+        print("Using CPU for local robust execution.")
+    else:
+        print(f"Using device: {device}")
+
+    # Paths and Hyperparameters
+    if args.local and args.large_local:
+        raise ValueError("Use only one of --local or --large-local.")
+
+    if args.local:
+        data_path = LOCAL_DATA_PATH
+        batch_size = 16 # smaller batch size locally
+        epochs = min(args.epochs, 2) # force small epochs for local testing
+        num_workers = 0 if args.num_workers is None else args.num_workers
+        print("Running in LOCAL mode.")
+    elif args.large_local:
+        data_path = LARGE_LOCAL_DATA_PATH
+        batch_size = args.batch_size
+        epochs = args.epochs
+        num_workers = 0 if args.num_workers is None else args.num_workers
+        print("Running in LARGE LOCAL mode.")
+    else:
+        data_path = CLUSTER_DATA_PATH
+        batch_size = args.batch_size
+        epochs = args.epochs
+        num_workers = 0 if args.num_workers is None else args.num_workers
+        print("Running in CLUSTER mode.")
+
+    if not data_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {data_path}")
+
+    print(f"Loading data from {data_path}...")
+
+    stats_dir = Path("checkpoints")
+    stats_dir.mkdir(exist_ok=True)
+    mean_path = stats_dir / "data_mean.npy"
+    std_path = stats_dir / "data_std.npy"
+
+    stats = None
+    if not args.recompute_stats and mean_path.exists() and std_path.exists():
+        print(f"Loading cached normalization stats from {stats_dir}...")
+        stats = (np.load(mean_path), np.load(std_path))
+    else:
+        print("Normalization stats not found in checkpoints or recomputation requested.")
+    
+    # Load Datasets
+    lazy_load = (not args.local) if args.lazy is None else args.lazy
+    print(f"Lazy loading: {lazy_load} | num_workers: {num_workers}")
+
+    train_dataset = AtmosphereDataset(
+        data_path,
+        split="train",
+        stats=stats,
+        lazy=lazy_load,
+        stats_chunk_size=args.stats_chunk_size,
+    )
+    stats = train_dataset.get_stats()
+    val_dataset = AtmosphereDataset(
+        data_path,
+        split="val",
+        stats=stats,
+        lazy=lazy_load,
+        stats_chunk_size=args.stats_chunk_size,
+    )
+    
+    # Save stats for future training/evaluation runs
+    np.save(mean_path, stats[0])
+    np.save(std_path, stats[1])
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    # Sequential access is materially faster for lazy NetCDF reads on cluster storage.
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=not lazy_load,
+        drop_last=True,
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        **loader_kwargs,
+    )
+
+    # Initialize Model
+    # Small ViT for v1
+    model = MaskedAutoencoderViT(
+        embed_dim=256, 
+        depth=6, 
+        num_heads=8,
+        decoder_embed_dim=128, 
+        decoder_depth=2, 
+        decoder_num_heads=4
+    ).to(device)
+
+    # Optimizer and Scheduler
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    print("\nStarting Training...")
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        print(f"\n--- Epoch {epoch+1}/{epochs} ---")
+        
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        val_loss = validate_epoch(model, val_loader, device)
+        
+        scheduler.step()
+        
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # Checkpointing
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt_path = stats_dir / "best_mae_model.pth"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"  -> Saved best model to {ckpt_path}")
+
+    print("\nTraining Complete.")
+
+if __name__ == "__main__":
+    main()

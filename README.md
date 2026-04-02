@@ -140,7 +140,61 @@ tail -f ~/atmospheric-fields/logs/test_<job_id>.out
 
 ## Usage
 
-TODO
+### Training
+
+Train the MAE model on the cluster:
+
+```bash
+sbatch submit_job.sh
+```
+
+Or run locally:
+
+```bash
+python train_mae.py --local
+python train_mae.py --large-local  # 5-year local dataset
+```
+
+Checkpoints and data statistics (`data_mean.npy`, `data_std.npy`, `best_mae_model.pth`) are saved to `checkpoints/`.
+
+### Evaluation
+
+Both eval scripts support `--local`, `--large-local`, or no flag (cluster dataset). Use `--eager` to load the full dataset into memory upfront.
+
+**Validation Protocol 1 — Linear Probe (severity regression):**
+
+Trains a small MLP on frozen MAE latents to predict corruption severity. Reports R² per corruption type.
+
+```bash
+python eval_probe.py --large-local --eager
+```
+
+**Validation Protocol 2 — Fréchet & MMD Distances:**
+
+Computes Fréchet Distance and MMD between the reference latent distribution and corrupted distributions across a severity ladder.
+
+```bash
+python eval_distances.py --large-local --eager
+```
+
+Plots are saved to `plots/`.
+
+### Corruptions
+
+`corruptions.py` defines four corruption types applied to input fields:
+
+| Corruption | Description | Severity → parameter |
+|---|---|---|
+| Gaussian Blur | Spatial smoothing | severity → sigma ∈ [0, 1.125] |
+| High-Freq Noise | Per-pixel iid Gaussian noise | severity → std ∈ [0, 0.25] |
+| GRF Noise | Spatially correlated Gaussian Random Field noise | severity → std ∈ [0, 0.375] |
+| Random Pixel Replace | Replaces random pixels with Gaussian samples | severity → replace prob ∈ [0, 0.3] |
+
+### Visualisation
+
+```bash
+python visualize_corruptions.py --local
+```
 
 ---
 
