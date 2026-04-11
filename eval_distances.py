@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from functools import partial
 import torch
 import numpy as np
 import scipy.linalg
@@ -12,6 +13,8 @@ from corruptions import (
     apply_high_freq_noise,
     apply_gaussian_field_noise,
     apply_random_pixel_replace,
+    apply_wind_patch_shuffle,
+    apply_wind_channel_rotation,
     get_corruption_ladder,
 )
 
@@ -119,6 +122,18 @@ def main():
     ckpt_path = stats_dir / "best_mae_model.pth"
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
+
+    ladders = {
+        "Gaussian Blur": (get_corruption_ladder("blur"), apply_gaussian_blur),
+        "High-Freq Noise": (get_corruption_ladder("noise"), apply_high_freq_noise),
+        "GRF Noise": (get_corruption_ladder("grf"), apply_gaussian_field_noise),
+        "Random Pixel Replace": (get_corruption_ladder("pixel_replace"), apply_random_pixel_replace),
+        "Spatial Shuffle (Wind Only)": (
+            get_corruption_ladder("wind_patch_shuffle"),
+            partial(apply_wind_patch_shuffle, patch_size=model.patch_size),
+        ),
+        "Channel Rotation": (get_corruption_ladder("wind_rotation"), apply_wind_channel_rotation),
+    }
     
     # Use smaller sample sets for distances to compute quickly locally
     n_samples = 200 if args.local else (400 if args.large_local else 1000)
@@ -152,20 +167,12 @@ def main():
     mu_ref = np.mean(Z_ref_np, axis=0)
     sigma_ref = np.cov(Z_ref_np, rowvar=False)
     
-    ladders = {
-        "Gaussian Blur": (get_corruption_ladder("blur"), apply_gaussian_blur),
-        "High-Freq Noise": (get_corruption_ladder("noise"), apply_high_freq_noise),
-        "GRF Noise": (get_corruption_ladder("grf"), apply_gaussian_field_noise),
-        "Random Pixel Replace": (get_corruption_ladder("pixel_replace"), apply_random_pixel_replace),
-    }
-    
     results = {}
-    
+
     for cond_name, (severities, apply_fn) in ladders.items():
-        print(f"\n--- Corridor: {cond_name} ---")
-        
+        print(f"\n--- Corruption: {cond_name} ---")
         results[cond_name] = {"severities": severities, "fid": [], "mmd": []}
-        
+
         for sev in severities:
             Z_cor = []
             with torch.no_grad():
@@ -174,63 +181,62 @@ def main():
                     corrupted = apply_fn(img, sev)
                     z = model.extract_features(corrupted)
                     Z_cor.append(z.cpu())
-                    
+
             Z_cor = torch.cat(Z_cor, dim=0)
             Z_cor_np = Z_cor.numpy()
-            
-            # Fréchet Distance
+
             mu_cor = np.mean(Z_cor_np, axis=0)
             sigma_cor = np.cov(Z_cor_np, rowvar=False)
-            
             fid = calculate_frechet_distance(mu_ref, sigma_ref, mu_cor, sigma_cor)
-            
-            # MMD
             mmd = mmd_rbf(Z_ref, Z_cor)
-            
+
             print(f"  Severity {sev} | FID: {fid:8.2f} | MMD: {mmd:8.5f}")
             results[cond_name]["fid"].append(fid)
             results[cond_name]["mmd"].append(mmd)
-            
-    # Plotting
+
     import matplotlib.pyplot as plt
     plots_dir = Path("plots") if (args.local or args.large_local) else Path("/work/scratch/ddemler/plots")
     plots_dir.mkdir(parents=True, exist_ok=True)
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
+
     colors = {
         "Gaussian Blur": "blue",
         "High-Freq Noise": "red",
         "GRF Noise": "green",
         "Random Pixel Replace": "orange",
+        "Spatial Shuffle (Wind Only)": "purple",
+        "Channel Rotation": "brown",
     }
     markers = {
         "Gaussian Blur": "o",
         "High-Freq Noise": "s",
         "GRF Noise": "^",
         "Random Pixel Replace": "D",
+        "Spatial Shuffle (Wind Only)": "P",
+        "Channel Rotation": "X",
     }
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     for cond_name in ladders.keys():
         sevs = results[cond_name]["severities"]
         fids = results[cond_name]["fid"]
         mmds = results[cond_name]["mmd"]
-        
+
         ax1.plot(sevs, fids, label=cond_name, marker=markers[cond_name], color=colors[cond_name], linewidth=2)
         ax2.plot(sevs, mmds, label=cond_name, marker=markers[cond_name], color=colors[cond_name], linewidth=2)
-        
+
     ax1.set_title("Fréchet Distance vs. Corruption Severity")
     ax1.set_xlabel("Severity Level")
     ax1.set_ylabel("Fréchet Distance")
     ax1.grid(True, alpha=0.3)
     ax1.legend()
-    
+
     ax2.set_title("Maximum Mean Discrepancy (MMD) vs. Corruption Severity")
     ax2.set_xlabel("Severity Level")
     ax2.set_ylabel("MMD")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
-    
+
     plot_path = plots_dir / "distances_vs_severity.png"
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")

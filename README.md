@@ -177,11 +177,11 @@ Computes Fréchet Distance and MMD between the reference latent distribution and
 python eval_distances.py --large-local --eager
 ```
 
-Plots are saved to `plots/`.
+Plots are saved to `plots/standard_corruptions/` and `plots/physical_decoupling/`.
 
 ### Corruptions
 
-`corruptions.py` defines four corruption types applied to input fields:
+`corruptions.py` defines six corruption types applied to input fields:
 
 | Corruption | Description | Severity → parameter |
 |---|---|---|
@@ -189,6 +189,8 @@ Plots are saved to `plots/`.
 | High-Freq Noise | Per-pixel iid Gaussian noise | severity → std ∈ [0, 0.25] |
 | GRF Noise | Spatially correlated Gaussian Random Field noise | severity → std ∈ [0, 0.375] |
 | Random Pixel Replace | Replaces random pixels with Gaussian samples | severity → replace prob ∈ [0, 0.3] |
+| Spatial Shuffle (Wind Only) | Shuffles 8x8 wind patches while leaving temperature and pressure unchanged | severity → shuffled patch fraction ∈ [0, 1] |
+| Channel Rotation | Rotates every wind vector while leaving temperature and pressure unchanged | severity → rotation angle ∈ [0°, 90°] |
 
 ### Visualisation
 

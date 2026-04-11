@@ -4,6 +4,10 @@ import numpy as np
 
 
 MAX_SEVERITY = 1.0
+T2M_CHANNEL = 0
+U10_CHANNEL = 1
+V10_CHANNEL = 2
+MSL_CHANNEL = 3
 PAD_TOP = 4
 PAD_BOTTOM = 3
 PAD_LEFT = 8
@@ -15,7 +19,14 @@ def get_corruption_ladder(corruption_type, n_steps=5):
     """
     Returns discrete severity levels in [0, MAX_SEVERITY] for distance evaluation.
     """
-    if corruption_type in ("blur", "noise", "grf", "pixel_replace"):
+    if corruption_type in (
+        "blur",
+        "noise",
+        "grf",
+        "pixel_replace",
+        "wind_patch_shuffle",
+        "wind_rotation",
+    ):
         return np.linspace(0.0, MAX_SEVERITY, n_steps).tolist()
     else:
         raise ValueError(f"Unknown corruption type: {corruption_type}")
@@ -34,6 +45,12 @@ def _repad_like_dataset(x):
     x_np = np.pad(x_np, pad_width=((0, 0), (0, 0), (0, 0), (PAD_LEFT, PAD_RIGHT)), mode="wrap")
     x_np = np.pad(x_np, pad_width=((0, 0), (0, 0), (PAD_TOP, PAD_BOTTOM), (0, 0)), mode="constant", constant_values=0)
     return torch.from_numpy(x_np).to(device=x.device, dtype=x.dtype)
+
+
+def _finalize_like_input(original_x, work_x):
+    if _is_model_padded_shape(original_x):
+        return _repad_like_dataset(work_x)
+    return work_x
 
 
 def apply_gaussian_blur(x, severity):
@@ -137,15 +154,99 @@ def apply_random_pixel_replace(x, severity, max_replace_prob=0.3):
     return corrupted
 
 
+def apply_wind_patch_shuffle(x, severity, patch_size=16):
+    """
+    Leaves temperature and pressure untouched while shuffling wind patches.
+    severity: fraction of wind patches to permute, in [0, 1].
+    """
+    if severity <= 0:
+        return x
+
+    work_x = (_crop_interior(x) if _is_model_padded_shape(x) else x).clone()
+    _, _, height, width = work_x.shape
+    shuffled_height = (height // patch_size) * patch_size
+    shuffled_width = (width // patch_size) * patch_size
+
+    if shuffled_height == 0 or shuffled_width == 0:
+        return x
+
+    wind_region = work_x[:, U10_CHANNEL:V10_CHANNEL + 1, :shuffled_height, :shuffled_width]
+    n_samples, _, _, _ = wind_region.shape
+    n_patch_rows = shuffled_height // patch_size
+    n_patch_cols = shuffled_width // patch_size
+    n_patches = n_patch_rows * n_patch_cols
+    n_shuffle = int(round(severity * n_patches))
+
+    if n_shuffle < 2:
+        return x
+
+    wind_patches = wind_region.reshape(
+        n_samples,
+        2,
+        n_patch_rows,
+        patch_size,
+        n_patch_cols,
+        patch_size,
+    )
+    wind_patches = wind_patches.permute(0, 2, 4, 1, 3, 5).reshape(n_samples, n_patches, 2, patch_size, patch_size)
+    shuffled_patches = wind_patches.clone()
+
+    for sample_idx in range(n_samples):
+        selected = torch.randperm(n_patches, device=work_x.device)[:n_shuffle]
+        permuted = selected[torch.randperm(n_shuffle, device=work_x.device)]
+        shuffled_patches[sample_idx, selected] = wind_patches[sample_idx, permuted]
+
+    shuffled_region = shuffled_patches.reshape(
+        n_samples,
+        n_patch_rows,
+        n_patch_cols,
+        2,
+        patch_size,
+        patch_size,
+    )
+    shuffled_region = shuffled_region.permute(0, 3, 1, 4, 2, 5).reshape(
+        n_samples,
+        2,
+        shuffled_height,
+        shuffled_width,
+    )
+    work_x[:, U10_CHANNEL:V10_CHANNEL + 1, :shuffled_height, :shuffled_width] = shuffled_region
+    return _finalize_like_input(x, work_x)
+
+
+def apply_wind_channel_rotation(x, severity):
+    """
+    Leaves temperature and pressure untouched while rotating every wind vector.
+    severity: rotation angle in [0, 90] degrees.
+    """
+    if severity <= 0:
+        return x
+
+    work_x = (_crop_interior(x) if _is_model_padded_shape(x) else x).clone()
+    angle = severity * (np.pi / 2.0)
+    cos_theta = float(np.cos(angle))
+    sin_theta = float(np.sin(angle))
+
+    u = work_x[:, U10_CHANNEL].clone()
+    v = work_x[:, V10_CHANNEL].clone()
+    work_x[:, U10_CHANNEL] = cos_theta * u - sin_theta * v
+    work_x[:, V10_CHANNEL] = sin_theta * u + cos_theta * v
+    return _finalize_like_input(x, work_x)
+
+
 if __name__ == "__main__":
     dummy_input = torch.randn(2, 4, 128, 256)
     blurred = apply_gaussian_blur(dummy_input, severity=0.5)
     noised = apply_high_freq_noise(dummy_input, severity=0.5)
     grf_noised = apply_gaussian_field_noise(dummy_input, severity=0.5)
     pixel_replaced = apply_random_pixel_replace(dummy_input, severity=0.5)
+    wind_shuffled = apply_wind_patch_shuffle(dummy_input, severity=0.5)
+    wind_rotated = apply_wind_channel_rotation(dummy_input, severity=0.5)
 
     print(f"Clean std: {dummy_input.std():.3f}")
     print(f"Blurred std: {blurred.std():.3f}")
     print(f"High-freq noised std: {noised.std():.3f}")
     print(f"GRF noised std: {grf_noised.std():.3f}")
     print(f"Pixel-replaced std: {pixel_replaced.std():.3f}")
+    print(f"Wind-shuffled std: {wind_shuffled.std():.3f}")
+    print(f"Wind-rotated std: {wind_rotated.std():.3f}")

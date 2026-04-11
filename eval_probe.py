@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from functools import partial
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, Subset
@@ -11,19 +12,14 @@ from corruptions import (
     apply_high_freq_noise,
     apply_gaussian_field_noise,
     apply_random_pixel_replace,
+    apply_wind_patch_shuffle,
+    apply_wind_channel_rotation,
     MAX_SEVERITY,
 )
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
 LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local_5y.nc"
-
-CORRUPTION_FNS = {
-    "Gaussian Blur": apply_gaussian_blur,
-    "High-Freq Noise": apply_high_freq_noise,
-    "GRF Noise": apply_gaussian_field_noise,
-    "Random Pixel Replace": apply_random_pixel_replace,
-}
 
 def main():
     parser = argparse.ArgumentParser()
@@ -73,6 +69,15 @@ def main():
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
 
+    corruption_fns = {
+        "Gaussian Blur": apply_gaussian_blur,
+        "High-Freq Noise": apply_high_freq_noise,
+        "GRF Noise": apply_gaussian_field_noise,
+        "Random Pixel Replace": apply_random_pixel_replace,
+        "Spatial Shuffle (Wind Only)": partial(apply_wind_patch_shuffle, patch_size=model.patch_size),
+        "Channel Rotation": apply_wind_channel_rotation,
+    }
+
     print("\n--- Validation Protocol 1: Linear Probe (Continuous Severity Regression) ---")
 
     n_samples = 50 if args.local else (250 if args.large_local else 1000)
@@ -92,11 +97,11 @@ def main():
     import matplotlib.pyplot as plt
     plots_dir = Path("plots") if (args.local or args.large_local) else Path("/work/scratch/ddemler/plots")
     plots_dir.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, len(CORRUPTION_FNS), figsize=(7 * len(CORRUPTION_FNS), 6))
-    if len(CORRUPTION_FNS) == 1:
+    fig, axes = plt.subplots(1, len(corruption_fns), figsize=(7 * len(corruption_fns), 6))
+    if len(corruption_fns) == 1:
         axes = [axes]
 
-    for ax, (corr_name, apply_fn) in zip(axes, CORRUPTION_FNS.items()):
+    for ax, (corr_name, apply_fn) in zip(axes, corruption_fns.items()):
         print(f"\n--- Corruption: {corr_name} ---")
 
         X_z = []
@@ -121,7 +126,6 @@ def main():
 
         print(f"Extracted feature matrix: {X_z.shape}")
 
-        # Train/test split
         split_idx = max(1, int(0.8 * X_z.shape[0]))
         perm = torch.randperm(X_z.shape[0])
         train_idx = perm[:split_idx]
@@ -134,7 +138,6 @@ def main():
         X_test = X_z[test_idx]
         y_test = y_severity[test_idx]
 
-        # 1-layer MLP probe (frozen encoder, trained probe)
         hidden_dim = 128
         probe = torch.nn.Sequential(
             torch.nn.Linear(X_train.shape[1], hidden_dim),
@@ -193,7 +196,6 @@ def main():
         lims = [0, MAX_SEVERITY]
         ax.plot(lims, lims, 'k--', alpha=0.5, label='Perfect prediction')
 
-        # Line of best fit
         fit = np.polyfit(y_true_np, y_pred_np, 1)
         fit_x = np.linspace(0, MAX_SEVERITY, 100)
         ax.plot(fit_x, np.polyval(fit, fit_x), 'r-', linewidth=2,
