@@ -1,0 +1,26 @@
+test_fake_nc_file: "/cluster/courses/pmlr/teams/team07/data/graphcast0_5steps_1.5deg_2019-01-01_2019-02-01.nc"
+test_real_nc_file: "/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc"
+real_nc_file: "/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc"
+fake_nc_file: "/cluster/courses/pmlr/teams/team07/data/graphcast0_5steps_1.5deg_2018-01-01_2018-12-31.nc"
+variables:
+  - "2m_temperature"
+  - "10m_u_component_of_wind"
+  - "10m_v_component_of_wind"
+selected_variable: "2m_temperature"
+#selected_variable: '10m_u_component_of_wind'
+batch_size: 16
+
+epochs: 2
+learning_rate: 1e-4
+#model_name: "resnet18"
+model_name: "squeezenet"
+num_workers: 4
+precision: "16-mixed"
+project_name: "weather-discriminator"
+output_dir: "results"
+
+# For comparative analysis
+comparison_files:
+  "GraphCast": "/cluster/courses/pmlr/teams/team07/data/graphcast0_5steps_1.5deg_2019-01-01_2019-02-01.nc"
+  # Add more models here, e.g.:
+  # "PanguWeather": "/path/to/pangu.nc"

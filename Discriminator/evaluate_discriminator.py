@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -6,148 +7,109 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import hydra
+from omegaconf import DictConfig
 
 # Import the Dataset and Model classes from your training script
-# (Assuming you saved the previous code as train_discriminator.py)
-from train_discriminator import WeatherDiscriminatorDataset, get_weather_discriminator
+from train_discriminator import WeatherDiscriminatorDataset, WeatherDiscriminator
 
-def evaluate_and_visualize():
+import os
+
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def evaluate_and_visualize(cfg: DictConfig):
     # --- Configuration ---
-    test_nc_file = "/cluster/courses/pmlr/teams/team07/data/graphcast_1.5deg_2019-01-01_2019-02-01.nc"  # Your separate test file
-    model_weights = "~/era5_data_handling/weather_discriminator_resnet18.pth"
-    model_vars = ['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind']
-    #plot_vars = ['wind_speed', '2m_temperature', 'mean_sea_level_pressure']
-    plot_vars = ['wind_speed', '2m_temperature']
+    real_nc_file = cfg.test_real_nc_file
+    fake_nc_file = cfg.test_fake_nc_file
+    
+    model_weights = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_lightning.pth")
+    model_vars = [cfg.selected_variable]
+    plot_vars = [cfg.selected_variable]
+    if cfg.selected_variable == '2m_temperature' and '10m_u_component_of_wind' in cfg.variables and '10m_v_component_of_wind' in cfg.variables:
+        plot_vars.append('wind_speed')
     
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Evaluating on device: {device}")
 
     # --- Setup Data and Model ---
-    test_dataset = WeatherDiscriminatorDataset(test_nc_file, model_vars)
+    test_dataset = WeatherDiscriminatorDataset(real_nc_file, fake_nc_file, model_vars)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    model = get_weather_discriminator(num_weather_channels=len(model_vars))
-    model.load_state_dict(torch.load(model_weights, map_location=device))
-    model.to(device)
-    model.eval()
+    lightning_model = WeatherDiscriminator(num_weather_channels=1, model_name=cfg.model_name)
+    lightning_model.model.load_state_dict(torch.load(model_weights, map_location=device))
+    model = lightning_model.to(device).eval()
 
     # --- 1. Run Inference ---
     results = []
-    print("Running inference on test set...")
-    
+    criterion = nn.BCEWithLogitsLoss()
+    running_loss, correct_predictions = 0.0, 0
+
     with torch.no_grad():
-        for idx, (inputs, labels) in enumerate(test_loader):
-            inputs = inputs.to(device)
-            logit = model(inputs).item()
-            label = labels.item()
-            
-            results.append({
-                'idx': idx,
-                'logit': logit,
-                'label': label
-            })
+        pbar = tqdm(test_loader, desc="Inference")
+        for idx, (inputs, labels) in enumerate(pbar):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item() * inputs.size(0)
+            correct_predictions += ((outputs > 0.0).float() == labels).sum().item()
+            results.append({'idx': idx, 'logit': outputs.item(), 'label': labels.item()})
+
+    print(f"\nOverall Test Accuracy: {correct_predictions / len(test_dataset):.4f}")
 
     # --- 2. Analyze Logits ---
+    realest = sorted(results, key=lambda x: -x['logit'])[:3]
     uncertain = sorted(results, key=lambda x: abs(x['logit']))[:3]
     fooled = sorted([r for r in results if r['label'] == 0.0], key=lambda x: x['logit'], reverse=True)[:3]
     obvious = sorted([r for r in results if r['label'] == 0.0], key=lambda x: x['logit'])[:3]
 
-    print(f"\nTop 'Fooled' Logit: {fooled[0]['logit']:.2f}")
-    print(f"Worst 'Obvious' Fake Logit: {obvious[0]['logit']:.2f}")
-
-    # --- 3. Generate 3x3 Cartopy Grids for Each Variable ---
-    print("\nGenerating 3x3 geographic visualizations...")
-    ds = xr.open_dataset(test_nc_file)
-    num_times = len(test_dataset.times)
-
-    categories = [
-        ("Most Uncertain\n(Near 0 Logit)", uncertain),
-        ("Best Fakes\n", fooled),
-        ("Worst Fakes\n", obvious)
-    ]
-
-    # Configuration for how each variable should look
+    categories = [("Realest", realest), ("Most Uncertain", uncertain), ("Best Fakes", fooled), ("Worst Fakes", obvious)]
     plot_configs = {
+        '10m_u_component_of_wind': {'cmap': 'viridis', 'title': '10m u wind', 'unit': 'm/s'},
+        '10m_v_component_of_wind': {'cmap': 'viridis', 'title': '10m v wind', 'unit': 'm/s'},
         'wind_speed': {'cmap': 'viridis', 'title': '10m Wind Speed', 'unit': 'm/s'},
         '2m_temperature': {'cmap': 'inferno', 'title': '2m Temperature', 'unit': 'K'},
-        #'mean_sea_level_pressure': {'cmap': 'coolwarm', 'title': 'Mean Sea Level Pressure', 'unit': 'Pa'}
     }
 
-    # Loop through each variable to create a separate 3x3 file
+    # --- 3. Visualization ---
     for var_name in plot_vars:
-        print(f"Plotting {var_name}...")
         config = plot_configs[var_name]
-        
-        # Initialize figure with PlateCarree projection for all subplots
-        fig, axes = plt.subplots(
-            3, 3, 
-            figsize=(18, 15), 
-            subplot_kw={'projection': ccrs.PlateCarree()}
-        )
+        fig, axes = plt.subplots(4, 3, figsize=(18, 15), subplot_kw={'projection': ccrs.PlateCarree()})
         fig.suptitle(f"Discriminator Evaluation: {config['title']}", fontsize=20, y=0.98)
 
         for row_idx, (cat_name, cat_list) in enumerate(categories):
             for col_idx, item in enumerate(cat_list):
                 ax = axes[row_idx, col_idx]
-                global_idx = item['idx']
-                logit = item['logit']
+                global_idx, logit = item['idx'], item['logit']
                 
-                # Reverse-engineer the dataset index
-                if global_idx < num_times:
-                    time_idx = global_idx
-                    lead_idx = 0
-                    data_type = "REAL (ERA5)"
+                # Logic matched to train_discriminator.py
+                samples_per_class = test_dataset.samples_per_class
+                is_fake = global_idx >= samples_per_class
+                sub_idx = global_idx % samples_per_class
+                
+                if not is_fake:
+                    ds_to_plot = test_dataset.real_ds
+                    time_val = test_dataset.real_times[sub_idx % test_dataset.total_real_samples]
+                    lead_idx = test_dataset.real_lead_idx
+                    data_type = "REAL"
                 else:
-                    time_idx = global_idx - num_times
-                    lead_idx = 1
-                    data_type = "FAKE (Gen)"
+                    ds_to_plot = test_dataset.fake_ds
+                    f_idx = sub_idx % test_dataset.total_fake_samples
+                    time_idx = f_idx // test_dataset.num_fake_leads
+                    time_val = test_dataset.fake_times[time_idx]
+                    lead_inner_idx = f_idx % test_dataset.num_fake_leads
+                    lead_idx = test_dataset.fake_lead_indices[lead_inner_idx]
+                    data_type = "FAKE"
 
-                # Extract map slice
-                map_slice = ds.isel(time=time_idx, prediction_timedelta=lead_idx)
+                map_slice = ds_to_plot.sel(time=time_val)
+                if lead_idx is not None:
+                    map_slice = map_slice.isel(prediction_timedelta=lead_idx)
                 
-                # Handle derived variables vs standard variables
-                if var_name == 'wind_speed':
-                    u = map_slice['10m_u_component_of_wind']
-                    v = map_slice['10m_v_component_of_wind']
-                    plot_data = (u**2 + v**2)**0.5
-                else:
-                    plot_data = map_slice[var_name]
-                
-                # Plot using Cartopy transform
-                im = plot_data.plot(
-                    ax=ax, 
-                    x="longitude",
-                    y="latitude",
-                    transform=ccrs.PlateCarree(),
-                    cmap=config['cmap'], 
-                    robust=True, 
-                    add_colorbar=False
-                )
-                
-                # Add Geographic Features
-                ax.coastlines(color='black', linewidth=0.8)
-                ax.add_feature(cfeature.BORDERS, linestyle=':', alpha=0.5)
-                
-                # Clean up the axis
-                init_time = str(test_dataset.times[time_idx]).split('T')[0]
-                ax.set_title(f"True: {data_type} | Logit: {logit:.2f}\nInit: {init_time}", fontsize=11)
-                
-                if col_idx == 0:
-                    # Add row labels as text since ylabel conflicts with cartopy gridlines
-                    ax.text(-0.15, 0.5, cat_name, va='bottom', ha='center',
-                            rotation='vertical', rotation_mode='anchor',
-                            transform=ax.transAxes, fontsize=14, fontweight='bold')
+                plot_data = (map_slice['10m_u_component_of_wind']**2 + map_slice['10m_v_component_of_wind']**2)**0.5 if var_name == 'wind_speed' else map_slice[var_name]
+                plot_data.plot(ax=ax, x="longitude", y="latitude", transform=ccrs.PlateCarree(), cmap=config['cmap'], robust=True, add_colorbar=False)
+                ax.coastlines(); ax.add_feature(cfeature.BORDERS, alpha=0.5)
+                ax.set_title(f"{data_type} | Logit: {logit:.2f}\n{str(time_val)[:13]}", fontsize=10)
 
-            # Add a dedicated colorbar for each row
-            cbar = fig.colorbar(im, ax=axes[row_idx, :].ravel().tolist(), location="bottom", pad=0.02, shrink=0.6)
-            cbar.set_label(f"{config['title']} ({config['unit']})")
-
-        plt.tight_layout(rect=[0.05, 0.03, 1, 0.95]) 
-        filename = f"discriminator_3x3_{var_name}.png"
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.close(fig) # Clear memory before the next variable
-
-    print("All visualizations saved successfully.")
+        plt.savefig(os.path.join(cfg.output_dir, f"evaluation_{cfg.model_name}_{var_name}.png"), dpi=300, bbox_inches='tight')
+        plt.close()
 
 if __name__ == "__main__":
     evaluate_and_visualize()
