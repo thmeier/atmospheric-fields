@@ -292,7 +292,13 @@ def main():
     mask_generator = MultiBlockMaskGenerator(
         input_size=(128, 256),
         patch_size=model.patch_size,
+        enc_mask_scale=(0.85, 1.0),
+        pred_mask_scale=(0.15, 0.2),
+        aspect_ratio=(0.75, 1.5),
+        nenc=1,
+        npred=4,
         min_keep=4,
+        allow_overlap=False,
     )
 
     total_steps = max(1, len(train_loader) * args.epochs)

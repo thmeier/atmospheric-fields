@@ -1,111 +1,178 @@
 import math
+from multiprocessing import Value
+from logging import getLogger
 
 import torch
 
+_GLOBAL_SEED = 0
+logger = getLogger()
 
-class MultiBlockMaskGenerator:
+
+# ---------------------------------------------------------------------------
+# Copied verbatim from Meta's original I-JEPA implementation
+# (https://github.com/facebookresearch/ijepa, src/masks/multiblock.py)
+# Only changes are:
+#   • renamed to MultiBlockMaskGenerator (class was MaskCollator)
+#   • __call__(batch) → sample(batch_size, device)
+#     (standalone sampler instead of DataLoader collate_fn;
+#      no collated_batch in / out, no default_collate dependency)
+#   • returns (context_masks, target_masks) to match train_ijepa.py:
+#       context_masks  — tensor  (B, min_keep_enc)   [nenc=1 squeezed out]
+#       target_masks   — list of npred tensors, each (B, min_keep_pred)
+# Everything else — _itr_counter seeding, per-batch block-size sampling,
+# _sample_block_size (same _rand for scale+AR, strict-< clamping),
+# _sample_block_mask (acceptable_regions, retry/relax loop),
+# min_keep truncation — is a direct copy.
+# ---------------------------------------------------------------------------
+
+class MultiBlockMaskGenerator(object):
+
     def __init__(
         self,
         input_size=(128, 256),
         patch_size=16,
-        context_scale=(0.85, 1.0),
-        target_scale=(0.15, 0.2),
-        target_aspect_ratio=(0.75, 1.5),
-        num_targets=4,
+        enc_mask_scale=(0.85, 1.0),
+        pred_mask_scale=(0.15, 0.2),
+        aspect_ratio=(0.75, 1.5),
+        nenc=1,
+        npred=4,
         min_keep=4,
+        allow_overlap=False,
     ):
+        super(MultiBlockMaskGenerator, self).__init__()
         if not isinstance(input_size, tuple):
-            input_size = (input_size, input_size)
-        self.grid_h = input_size[0] // patch_size
-        self.grid_w = input_size[1] // patch_size
-        self.context_scale = context_scale
-        self.target_scale = target_scale
-        self.target_aspect_ratio = target_aspect_ratio
-        self.num_targets = num_targets
-        self.min_keep = min_keep
-        self.num_patches = self.grid_h * self.grid_w
+            input_size = (input_size,) * 2
+        self.patch_size = patch_size
+        self.height, self.width = input_size[0] // patch_size, input_size[1] // patch_size
+        self.enc_mask_scale = enc_mask_scale
+        self.pred_mask_scale = pred_mask_scale
+        self.aspect_ratio = aspect_ratio
+        self.nenc = nenc
+        self.npred = npred
+        self.min_keep = min_keep  # minimum number of patches to keep
+        self.allow_overlap = allow_overlap  # whether to allow overlap b/w enc and pred masks
+        self._itr_counter = Value('i', -1)  # shared across worker processes
 
-    def _sample_block_size(self, scale, aspect_ratio_range, generator):
-        rand_scale = torch.rand(1, generator=generator).item()
-        rand_aspect = torch.rand(1, generator=generator).item()
+    def step(self):
+        i = self._itr_counter
+        with i.get_lock():
+            i.value += 1
+            v = i.value
+        return v
 
-        min_scale, max_scale = scale
-        area = self.grid_h * self.grid_w * (min_scale + rand_scale * (max_scale - min_scale))
+    def _sample_block_size(self, generator, scale, aspect_ratio_scale):
+        _rand = torch.rand(1, generator=generator).item()
+        # -- Sample block scale
+        min_s, max_s = scale
+        mask_scale = min_s + _rand * (max_s - min_s)
+        max_keep = int(self.height * self.width * mask_scale)
+        # -- Sample block aspect-ratio
+        min_ar, max_ar = aspect_ratio_scale
+        aspect_ratio = min_ar + _rand * (max_ar - min_ar)
+        # -- Compute block height and width (given scale and aspect-ratio)
+        h = int(round(math.sqrt(max_keep * aspect_ratio)))
+        w = int(round(math.sqrt(max_keep / aspect_ratio)))
+        while h >= self.height:
+            h -= 1
+        while w >= self.width:
+            w -= 1
+        return (h, w)
 
-        min_ar, max_ar = aspect_ratio_range
-        aspect_ratio = min_ar + rand_aspect * (max_ar - min_ar)
+    def _sample_block_mask(self, b_size, acceptable_regions=None):
+        h, w = b_size
 
-        h = max(1, int(round(math.sqrt(area * aspect_ratio))))
-        w = max(1, int(round(math.sqrt(area / aspect_ratio))))
-        h = min(h, self.grid_h)
-        w = min(w, self.grid_w)
-        return h, w
-
-    def _sample_block_mask(self, block_size, generator):
-        h, w = block_size
-        top_max = max(1, self.grid_h - h + 1)
-        left_max = max(1, self.grid_w - w + 1)
-        top = torch.randint(0, top_max, (1,), generator=generator).item()
-        left = torch.randint(0, left_max, (1,), generator=generator).item()
-
-        mask = torch.zeros((self.grid_h, self.grid_w), dtype=torch.bool)
-        mask[top:top + h, left:left + w] = True
-        return mask
-
-    def _mask_to_indices(self, mask):
-        return torch.nonzero(mask.flatten(), as_tuple=False).squeeze(-1).to(dtype=torch.long)
+        def constrain_mask(mask, tries=0):
+            """ Helper to restrict given mask to a set of acceptable regions """
+            N = max(int(len(acceptable_regions) - tries), 0)
+            for k in range(N):
+                mask *= acceptable_regions[k]
+        # --
+        # -- Loop to sample masks until we find a valid one
+        tries = 0
+        timeout = og_timeout = 20
+        valid_mask = False
+        while not valid_mask:
+            # -- Sample block top-left corner
+            top = torch.randint(0, self.height - h, (1,))
+            left = torch.randint(0, self.width - w, (1,))
+            mask = torch.zeros((self.height, self.width), dtype=torch.int32)
+            mask[top:top+h, left:left+w] = 1
+            # -- Constrain mask to a set of acceptable regions
+            if acceptable_regions is not None:
+                constrain_mask(mask, tries)
+            mask = torch.nonzero(mask.flatten())
+            # -- If mask too small try again
+            valid_mask = len(mask) > self.min_keep
+            if not valid_mask:
+                timeout -= 1
+                if timeout == 0:
+                    tries += 1
+                    timeout = og_timeout
+                    logger.warning(f'Mask generator says: "Valid mask not found, decreasing acceptable-regions [{tries}]"')
+        mask = mask.squeeze()
+        # --
+        mask_complement = torch.ones((self.height, self.width), dtype=torch.int32)
+        mask_complement[top:top+h, left:left+w] = 0
+        # --
+        return mask, mask_complement
 
     def sample(self, batch_size, device):
-        context_masks = []
-        target_masks = [[] for _ in range(self.num_targets)]
+        """
+        Sample encoder and predictor masks for a batch.
+        Mirrors the original __call__ logic without the DataLoader collation.
+        """
+        seed = self.step()
+        g = torch.Generator()
+        g.manual_seed(seed)
+        p_size = self._sample_block_size(
+            generator=g,
+            scale=self.pred_mask_scale,
+            aspect_ratio_scale=self.aspect_ratio)
+        e_size = self._sample_block_size(
+            generator=g,
+            scale=self.enc_mask_scale,
+            aspect_ratio_scale=(1., 1.))
 
+        collated_masks_pred, collated_masks_enc = [], []
+        min_keep_pred = self.height * self.width
+        min_keep_enc = self.height * self.width
         for _ in range(batch_size):
-            generator = torch.Generator()
-            generator.seed()
 
-            sampled_targets = []
-            target_union = torch.zeros((self.grid_h, self.grid_w), dtype=torch.bool)
-            for _target_idx in range(self.num_targets):
-                target_size = self._sample_block_size(
-                    self.target_scale,
-                    self.target_aspect_ratio,
-                    generator,
-                )
-                target_mask = self._sample_block_mask(target_size, generator)
-                sampled_targets.append(target_mask)
-                target_union |= target_mask
+            masks_p, masks_C = [], []
+            for _ in range(self.npred):
+                mask, mask_C = self._sample_block_mask(p_size)
+                masks_p.append(mask)
+                masks_C.append(mask_C)
+                min_keep_pred = min(min_keep_pred, len(mask))
+            collated_masks_pred.append(masks_p)
 
-            context_indices = None
-            context_size = self._sample_block_size(self.context_scale, (1.0, 1.0), generator)
-            for _ in range(16):
-                context_block = self._sample_block_mask(context_size, generator)
-                visible_context = context_block & (~target_union)
-                if visible_context.sum().item() >= self.min_keep:
-                    context_indices = self._mask_to_indices(visible_context)
-                    break
+            acceptable_regions = masks_C
+            try:
+                if self.allow_overlap:
+                    acceptable_regions = None
+            except Exception as e:
+                logger.warning(f'Encountered exception in mask-generator {e}')
 
-            if context_indices is None:
-                visible_context = ~target_union
-                context_indices = self._mask_to_indices(visible_context)
+            masks_e = []
+            for _ in range(self.nenc):
+                mask, _ = self._sample_block_mask(e_size, acceptable_regions=acceptable_regions)
+                masks_e.append(mask)
+                min_keep_enc = min(min_keep_enc, len(mask))
+            collated_masks_enc.append(masks_e)
 
-            if context_indices.numel() < self.min_keep:
-                raise RuntimeError("Failed to sample a valid context mask without target overlap")
+        # Truncate all masks to the minimum kept length and stack into tensors
+        collated_masks_pred = [[cm[:min_keep_pred] for cm in cm_list] for cm_list in collated_masks_pred]
+        pred_masks = [
+            torch.stack([collated_masks_pred[b][i] for b in range(batch_size)], dim=0).to(device)
+            for i in range(self.npred)
+        ]
 
-            context_masks.append(context_indices)
-            for target_idx, target_mask in enumerate(sampled_targets):
-                target_indices = self._mask_to_indices(target_mask)
-                if target_indices.numel() == 0:
-                    target_indices = context_indices[:1].clone()
-                target_masks[target_idx].append(target_indices)
+        collated_masks_enc = [[cm[:min_keep_enc] for cm in cm_list] for cm_list in collated_masks_enc]
+        enc_masks = [
+            torch.stack([collated_masks_enc[b][i] for b in range(batch_size)], dim=0).to(device)
+            for i in range(self.nenc)
+        ]
 
-        min_context = min(mask.numel() for mask in context_masks)
-        context_masks = torch.stack([mask[:min_context] for mask in context_masks], dim=0).to(device)
-
-        global_min_target = min(mask.numel() for masks in target_masks for mask in masks)
-        stacked_targets = []
-        for masks in target_masks:
-            stacked_targets.append(
-                torch.stack([mask[:global_min_target] for mask in masks], dim=0).to(device)
-            )
-
-        return context_masks, stacked_targets
+        # Return single tensor for context (nenc=1 is the standard case)
+        context_masks = enc_masks[0] if self.nenc == 1 else enc_masks
+        return context_masks, pred_masks
