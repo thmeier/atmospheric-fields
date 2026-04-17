@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+from copy import deepcopy
 
 def get_1d_sincos_pos_embed(embed_dim, positions):
     if embed_dim % 2 != 0:
@@ -267,6 +269,263 @@ class MaskedAutoencoderViT(nn.Module):
         # Mean pool patch tokens (ignore CLS token here, or pool it, let's pool the patch tokens)
         z = x[:, 1:, :].mean(dim=1)
         return z
+
+
+def _normalize_mask_groups(masks):
+    if isinstance(masks, torch.Tensor):
+        if masks.ndim == 2:
+            return [masks]
+        if masks.ndim == 3:
+            return [masks[i] for i in range(masks.shape[0])]
+    return list(masks)
+
+
+def apply_index_masks(x, masks):
+    mask_groups = _normalize_mask_groups(masks)
+    gathered = []
+    for mask in mask_groups:
+        index = mask.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        gathered.append(torch.gather(x, dim=1, index=index))
+    return torch.cat(gathered, dim=0)
+
+
+def repeat_interleave_batch(x, batch_size, repeat):
+    if repeat == 1:
+        return x
+    chunks = torch.split(x, batch_size, dim=0)
+    interleaved = []
+    for chunk in chunks:
+        interleaved.extend([chunk] * repeat)
+    return torch.cat(interleaved, dim=0)
+
+
+class RectangularVisionTransformer(nn.Module):
+    def __init__(
+        self,
+        img_size=(128, 256),
+        patch_size=16,
+        in_chans=4,
+        embed_dim=192,
+        depth=8,
+        num_heads=3,
+        mlp_ratio=4.0,
+    ):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.grid_size = (img_size[0] // patch_size, img_size[1] // patch_size)
+        num_patches = self.patch_embed.num_patches
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim), requires_grad=False)
+        pos_embed = get_2d_sincos_pos_embed(embed_dim, self.grid_size[0], self.grid_size[1], cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+            dropout=0.0,
+        )
+        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.Conv2d):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x, masks=None):
+        x = self.patch_embed(x)
+        x = x + self.pos_embed
+        if masks is not None:
+            x = apply_index_masks(x, masks)
+        x = self.blocks(x)
+        return self.norm(x)
+
+    def extract_features(self, x):
+        return self.forward(x).mean(dim=1)
+
+
+class IJEPAPredictor(nn.Module):
+    def __init__(
+        self,
+        grid_size,
+        num_patches,
+        embed_dim,
+        predictor_embed_dim=192,
+        depth=3,
+        num_heads=3,
+        mlp_ratio=4.0,
+    ):
+        super().__init__()
+        self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+        self.predictor_pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches, predictor_embed_dim), requires_grad=False
+        )
+        pos_embed = get_2d_sincos_pos_embed(
+            predictor_embed_dim,
+            grid_size[0],
+            grid_size[1],
+            cls_token=False,
+        )
+        self.predictor_pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=predictor_embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(predictor_embed_dim * mlp_ratio),
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+            dropout=0.0,
+        )
+        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(predictor_embed_dim)
+        self.proj = nn.Linear(predictor_embed_dim, embed_dim)
+
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0)
+
+    def forward(self, context_tokens, context_masks, target_masks):
+        context_masks = _normalize_mask_groups(context_masks)
+        target_masks = _normalize_mask_groups(target_masks)
+
+        batch_size = context_tokens.shape[0] // len(context_masks)
+        x = self.predictor_embed(context_tokens)
+
+        context_pos = self.predictor_pos_embed.repeat(batch_size, 1, 1)
+        x = x + apply_index_masks(context_pos, context_masks)
+        _, n_context, _ = x.shape
+
+        target_pos = self.predictor_pos_embed.repeat(batch_size, 1, 1)
+        target_pos = apply_index_masks(target_pos, target_masks)
+        target_pos = repeat_interleave_batch(target_pos, batch_size, repeat=len(context_masks))
+
+        pred_tokens = self.mask_token.repeat(target_pos.shape[0], target_pos.shape[1], 1) + target_pos
+        x = x.repeat(len(target_masks), 1, 1)
+        x = torch.cat([x, pred_tokens], dim=1)
+
+        x = self.blocks(x)
+        x = self.norm(x)
+        x = self.proj(x[:, n_context:, :])
+        return x
+
+
+class IJEPA(nn.Module):
+    def __init__(
+        self,
+        img_size=(128, 256),
+        patch_size=16,
+        in_chans=4,
+        embed_dim=192,
+        depth=8,
+        num_heads=3,
+        predictor_embed_dim=192,
+        predictor_depth=3,
+        predictor_num_heads=3,
+        mlp_ratio=4.0,
+    ):
+        super().__init__()
+        self.context_encoder = RectangularVisionTransformer(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+        )
+        self.target_encoder = deepcopy(self.context_encoder)
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+
+        self.predictor = IJEPAPredictor(
+            grid_size=self.context_encoder.grid_size,
+            num_patches=self.context_encoder.patch_embed.num_patches,
+            embed_dim=embed_dim,
+            predictor_embed_dim=predictor_embed_dim,
+            depth=predictor_depth,
+            num_heads=predictor_num_heads,
+            mlp_ratio=mlp_ratio,
+        )
+        self.patch_size = patch_size
+        self.grid_size = self.context_encoder.grid_size
+        self.embed_dim = embed_dim
+
+    @torch.no_grad()
+    def update_target_encoder(self, momentum):
+        for context_param, target_param in zip(
+            self.context_encoder.parameters(), self.target_encoder.parameters()
+        ):
+            target_param.data.mul_(momentum).add_(context_param.data, alpha=1.0 - momentum)
+
+    def forward(self, imgs, context_masks, target_masks):
+        self.target_encoder.eval()
+        with torch.no_grad():
+            target_tokens = self.target_encoder(imgs)
+            target_tokens = F.layer_norm(target_tokens, (target_tokens.size(-1),))
+            target_tokens = apply_index_masks(target_tokens, target_masks)
+
+        context_tokens = self.context_encoder(imgs, masks=context_masks)
+        pred_tokens = self.predictor(context_tokens, context_masks, target_masks)
+        loss = F.smooth_l1_loss(pred_tokens, target_tokens)
+        return loss, pred_tokens, target_tokens
+
+    @torch.no_grad()
+    def extract_features(self, imgs):
+        return self.target_encoder.extract_features(imgs)
+
+    @property
+    def encoder(self):
+        return self.context_encoder
+
+
+def build_ijepa(model_size="tiny", img_size=(128, 256), patch_size=16, in_chans=4):
+    configs = {
+        "tiny": {
+            "embed_dim": 192,
+            "depth": 8,
+            "num_heads": 3,
+            "predictor_embed_dim": 192,
+            "predictor_depth": 3,
+            "predictor_num_heads": 3,
+        },
+        "small": {
+            "embed_dim": 384,
+            "depth": 10,
+            "num_heads": 6,
+            "predictor_embed_dim": 192,
+            "predictor_depth": 4,
+            "predictor_num_heads": 3,
+        },
+    }
+    if model_size not in configs:
+        raise ValueError(f"Unknown I-JEPA model size: {model_size}")
+    return IJEPA(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **configs[model_size])
 
 if __name__ == "__main__":
     model = MaskedAutoencoderViT()

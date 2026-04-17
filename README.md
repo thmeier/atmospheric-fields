@@ -109,10 +109,10 @@ conda install --file requirements.txt
 To download ERA5 data to the shared cluster directory, edit and submit the Slurm job:
 
 ```bash
-sbatch ~/atmospheric-fields/start_download_er5.sh
+sbatch ~/atmospheric-fields/scripts/start_download_er5.sh
 ```
 
-The key settings in `start_download_er5.sh`:
+The key settings in `scripts/start_download_er5.sh`:
 
 ```
          SOURCE : Google Cloud bucket URL (determines resolution)
@@ -145,43 +145,57 @@ tail -f ~/atmospheric-fields/logs/test_<job_id>.out
 Train the MAE model on the cluster:
 
 ```bash
-sbatch submit_job.sh
+sbatch scripts/submit_job.sh
 ```
 
 Or run locally:
 
 ```bash
-python train_mae.py --local
-python train_mae.py --large-local  # 5-year local dataset
+python train/train_mae.py --local
+python train/train_mae.py --large-local  # 5-year local dataset
 ```
 
-Checkpoints and data statistics (`data_mean.npy`, `data_std.npy`, `best_mae_model.pth`) are saved to `checkpoints/`.
+Train the spatial-only I-JEPA proof of concept locally:
+
+```bash
+python train/train_ijepa.py --local
+python train/train_ijepa.py --local --smoke-test
+```
+
+Checkpoints and data statistics (`data_mean.npy`, `data_std.npy`, `best_mae_model.pth`, `best_ijepa_model.pth`) are saved to `checkpoints/`.
 
 ### Evaluation
 
 Both eval scripts support `--local`, `--large-local`, or no flag (cluster dataset). Use `--eager` to load the full dataset into memory upfront.
+Both scripts also support `--model mae` or `--model ijepa`.
 
 **Validation Protocol 1 — Linear Probe (severity regression):**
 
 Trains a small MLP on frozen MAE latents to predict corruption severity. Reports R² per corruption type.
 
 ```bash
-python eval_probe.py --large-local --eager
+python eval/eval_probe.py --model mae --large-local --eager
+python eval/eval_probe.py --model ijepa --local
 ```
+
+Saved plot names include the model, e.g. `probe_scatter_combined_mae.png` and `probe_scatter_combined_ijepa.png`.
 
 **Validation Protocol 2 — Fréchet & MMD Distances:**
 
 Computes Fréchet Distance and MMD between the reference latent distribution and corrupted distributions across a severity ladder.
 
 ```bash
-python eval_distances.py --large-local --eager
+python eval/eval_distances.py --model mae --large-local --eager
+python eval/eval_distances.py --model ijepa --local
 ```
+
+Saved plot names include the model, e.g. `distances_vs_severity_mae.png` and `distances_vs_severity_ijepa.png`.
 
 Plots are saved to `plots/standard_corruptions/` and `plots/physical_decoupling/`.
 
 ### Corruptions
 
-`corruptions.py` defines six corruption types applied to input fields:
+`utils/corruptions.py` defines six corruption types applied to input fields:
 
 | Corruption | Description | Severity → parameter |
 |---|---|---|
@@ -195,7 +209,7 @@ Plots are saved to `plots/standard_corruptions/` and `plots/physical_decoupling/
 ### Visualisation
 
 ```bash
-python visualize_corruptions.py --local
+python eval/visualize_corruptions.py
 ```
 
 ---

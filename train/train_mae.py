@@ -1,33 +1,36 @@
-import argparse
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 
-from dataset import AtmosphereDataset
-from models import MaskedAutoencoderViT
+from utils.dataset import AtmosphereDataset
+from utils.models import MaskedAutoencoderViT
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
-LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local.nc"
-LARGE_LOCAL_DATA_PATH = Path(__file__).parent / "data" / "test_data_local_5y.nc"
+LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
+LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 def train_epoch(model, loader, optimizer, device):
     model.train()
     total_loss = 0
-    
+
     for batch_idx, data in enumerate(loader):
         data = data.to(device)
-        
+
         optimizer.zero_grad()
         loss, _, _ = model(data, mask_ratio=0.75)
-        
+
         loss.backward()
         optimizer.step()
-        
+
         total_loss += loss.item()
-            
+
     return total_loss / len(loader)
 
 def validate_epoch(model, loader, device):
@@ -38,7 +41,7 @@ def validate_epoch(model, loader, device):
             data = data.to(device)
             loss, _, _ = model(data, mask_ratio=0.75)
             total_loss += loss.item()
-            
+
     return total_loss / len(loader)
 
 def main():
@@ -55,7 +58,7 @@ def main():
     parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
     parser.set_defaults(lazy=None)
     args = parser.parse_args()
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # On macOS we can also try MPS
     if torch.backends.mps.is_available():
@@ -103,7 +106,7 @@ def main():
         stats = (np.load(mean_path), np.load(std_path))
     else:
         print("Normalization stats not found in checkpoints or recomputation requested.")
-    
+
     # Load Datasets
     lazy_load = (not args.local) if args.lazy is None else args.lazy
     print(f"Lazy loading: {lazy_load} | num_workers: {num_workers}")
@@ -123,7 +126,7 @@ def main():
         lazy=lazy_load,
         stats_chunk_size=args.stats_chunk_size,
     )
-    
+
     # Save stats for future training/evaluation runs
     np.save(mean_path, stats[0])
     np.save(std_path, stats[1])
@@ -137,10 +140,9 @@ def main():
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
-    # Sequential access is materially faster for lazy NetCDF reads on cluster storage.
     train_loader = DataLoader(
         train_dataset,
-        shuffle=not lazy_load,
+        shuffle=True,
         drop_last=True,
         **loader_kwargs,
     )
@@ -153,31 +155,31 @@ def main():
     # Initialize Model
     # Small ViT for v1
     model = MaskedAutoencoderViT(
-        embed_dim=256, 
-        depth=6, 
+        embed_dim=256,
+        depth=6,
         num_heads=8,
-        decoder_embed_dim=128, 
-        decoder_depth=2, 
+        decoder_embed_dim=128,
+        decoder_depth=2,
         decoder_num_heads=4
     ).to(device)
 
     # Optimizer and Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    
+
     print("\nStarting Training...")
     best_val_loss = float('inf')
-    
+
     for epoch in range(epochs):
         print(f"\n--- Epoch {epoch+1}/{epochs} ---")
-        
+
         train_loss = train_epoch(model, train_loader, optimizer, device)
         val_loss = validate_epoch(model, val_loader, device)
-        
+
         scheduler.step()
-        
+
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
-        
+
         # Checkpointing
         if val_loss < best_val_loss:
             best_val_loss = val_loss

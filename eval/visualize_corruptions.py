@@ -1,12 +1,15 @@
 """Visualize blur, high-freq noise & GRF noise corruption ladders."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 from functools import partial
 
-from dataset import AtmosphereDataset
-from models import MaskedAutoencoderViT
-from corruptions import (
+from utils.dataset import AtmosphereDataset
+from utils.models import MaskedAutoencoderViT
+from utils.corruptions import (
     apply_gaussian_blur,
     apply_high_freq_noise,
     apply_gaussian_field_noise,
@@ -16,7 +19,7 @@ from corruptions import (
     get_corruption_ladder,
 )
 
-DATA_PATH = Path(__file__).parent / "data" / "test_data_local.nc"
+DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 STATS_DIR = Path("checkpoints")
 
 VAR_NAMES = ["2m Temperature", "10m U-Wind", "10m V-Wind", "Mean Sea Level Pressure"]
