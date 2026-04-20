@@ -232,6 +232,8 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max grad norm; set to 0 to disable clipping.")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-samples", type=int, default=64)
+    parser.add_argument("--early-stopping-patience", type=int, default=0,
+                        help="Stop if val loss doesn't improve for this many epochs. 0 = disabled.")
     args = parser.parse_args()
 
     if args.model_size == "small":
@@ -323,6 +325,7 @@ def main():
 
     best_val_loss = float("inf")
     best_path = checkpoint_dir / "best_ijepa_model.pth"
+    epochs_no_improve = 0
 
     print(
         f"JEPA setup: grid={model.grid_size}, embed_dim={model.embed_dim}, "
@@ -364,8 +367,15 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             save_ijepa_checkpoint(best_path, model, optimizer, epoch + 1, val_loss, args)
             print(f"  -> Saved best model to {best_path}")
+        else:
+            epochs_no_improve += 1
+
+        if args.early_stopping_patience > 0 and epochs_no_improve >= args.early_stopping_patience:
+            print(f"\nEarly stopping: val loss did not improve for {args.early_stopping_patience} epochs.")
+            break
 
 
 if __name__ == "__main__":

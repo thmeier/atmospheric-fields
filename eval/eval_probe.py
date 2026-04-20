@@ -25,7 +25,7 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 
-def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_size, num_workers, local_flags):
+def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_size, num_workers, local_flags, n_probe_samples=None):
     print(f"Loading {model_name.upper()} model...")
     model = build_model(model_name, device=device, ijepa_size=ijepa_size)
     ckpt_path = checkpoint_path(model_name, stats_dir)
@@ -43,7 +43,8 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
 
     print(f"\n--- Validation Protocol 1: Linear Probe (Continuous Severity Regression, {model_name.upper()}) ---")
 
-    n_samples = 50 if local_flags["local"] else (250 if local_flags["large_local"] else 1000)
+    default_n = 50 if local_flags["local"] else (250 if local_flags["large_local"] else 1000)
+    n_samples = n_probe_samples if n_probe_samples is not None else default_n
     indices = np.random.choice(len(dataset), min(n_samples, len(dataset)), replace=False)
     subset = Subset(dataset, indices.tolist())
     loader_kwargs = {
@@ -151,6 +152,7 @@ def main():
     parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
     parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
     parser.set_defaults(lazy=None)
+    parser.add_argument("--n-probe-samples", type=int, default=None)
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -197,6 +199,7 @@ def main():
             batch_size=args.batch_size,
             num_workers=num_workers,
             local_flags={"local": args.local, "large_local": args.large_local},
+            n_probe_samples=args.n_probe_samples,
         )
         all_results[model_name] = results
         all_scatters[model_name] = scatters

@@ -79,7 +79,7 @@ def mmd_rbf(X, Y, gamma=None):
     return mmd2.item()
 
 
-def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_size, num_workers, local_flags):
+def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_size, num_workers, local_flags, n_severity_steps=5):
     print(f"Loading {model_name.upper()} model...")
     model = build_model(model_name, device=device, ijepa_size=ijepa_size)
     ckpt_path = checkpoint_path(model_name, stats_dir)
@@ -87,12 +87,12 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
     model.eval()
 
     ladders = {
-        "Gaussian Blur": (get_corruption_ladder("blur"), apply_gaussian_blur),
-        "High-Freq Noise": (get_corruption_ladder("noise"), apply_high_freq_noise),
-        "GRF Noise": (get_corruption_ladder("grf"), apply_gaussian_field_noise),
-        "Random Pixel Replace": (get_corruption_ladder("pixel_replace"), apply_random_pixel_replace),
-        "Spatial Shuffle (Wind Only)": (get_corruption_ladder("wind_patch_shuffle"), partial(apply_wind_patch_shuffle, patch_size=model.patch_size)),
-        "Channel Rotation": (get_corruption_ladder("wind_rotation"), apply_wind_channel_rotation),
+        "Gaussian Blur": (get_corruption_ladder("blur", n_severity_steps), apply_gaussian_blur),
+        "High-Freq Noise": (get_corruption_ladder("noise", n_severity_steps), apply_high_freq_noise),
+        "GRF Noise": (get_corruption_ladder("grf", n_severity_steps), apply_gaussian_field_noise),
+        "Random Pixel Replace": (get_corruption_ladder("pixel_replace", n_severity_steps), apply_random_pixel_replace),
+        "Spatial Shuffle (Wind Only)": (get_corruption_ladder("wind_patch_shuffle", n_severity_steps), partial(apply_wind_patch_shuffle, patch_size=model.patch_size)),
+        "Channel Rotation": (get_corruption_ladder("wind_rotation", n_severity_steps), apply_wind_channel_rotation),
     }
 
     n_samples = 200 if local_flags["local"] else (400 if local_flags["large_local"] else 1000)
@@ -157,6 +157,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
     parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
+    parser.add_argument("--n-severity-steps", type=int, default=5)
     parser.set_defaults(lazy=None)
     args = parser.parse_args()
 
@@ -200,6 +201,7 @@ def main():
             batch_size=args.batch_size,
             num_workers=num_workers,
             local_flags={"local": args.local, "large_local": args.large_local},
+            n_severity_steps=args.n_severity_steps,
         )
         all_results[model_name] = results
 
