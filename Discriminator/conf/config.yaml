@@ -1,16 +1,36 @@
-test_fake_nc_file: "/cluster/courses/pmlr/teams/team07/data/graphcast0_5steps_1.5deg_2019-01-01_2019-02-01.nc"
-test_real_nc_file: "/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc"
-real_nc_file: "/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc"
-fake_nc_file: "/cluster/courses/pmlr/teams/team07/data/graphcast0_5steps_1.5deg_2018-01-01_2018-12-31.nc"
-variables:
-  - "2m_temperature"
-  - "10m_u_component_of_wind"
-  - "10m_v_component_of_wind"
-selected_variable: "2m_temperature"
-#selected_variable: '10m_u_component_of_wind'
-batch_size: 16
+# Data paths
+data_dir: "/cluster/courses/pmlr/teams/team07/data"
+real_nc_file: "${data_dir}/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
+fake_nc_file: "${data_dir}/graphcast_6steps_1.5deg_2018-01-01_2018-12-31.nc"
 
+test_real_nc_file: "${data_dir}/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
+test_fake_nc_file: "${data_dir}/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+
+# Variables and Level
+variables:
+  - "temperature"
+  - "u_component_of_wind"
+  - "v_component_of_wind"
+  - "specific_humidity"
+selected_variable: "temperature"
+level: 850
+
+# Training Time Ranges
+train_real_range: ["2008-01-01", "2018-12-31"]
+train_fake_range: ["2018-01-01", "2018-12-31"]
+
+# Testing Time Ranges
+test_real_ranges:
+  - ["2004-01-01", "2007-12-31"]
+  - ["2019-01-01", "2023-12-31"]
+test_fake_range: ["2020-01-01", "2020-12-31"]
+
+# Lead Times (hours)
+lead_times: [6, 12, 24, 48, 96, 192]
+
+batch_size: 64
 epochs: 2
+#epochs: 5
 learning_rate: 1e-4
 #model_name: "resnet18"
 model_name: "squeezenet"
@@ -21,6 +41,11 @@ output_dir: "results"
 
 # For comparative analysis
 comparison_files:
-  "GraphCast": "/cluster/courses/pmlr/teams/team07/data/graphcast0_5steps_1.5deg_2019-01-01_2019-02-01.nc"
-  # Add more models here, e.g.:
-  # "PanguWeather": "/path/to/pangu.nc"
+  "GraphCast": "${data_dir}/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  #"PanguWeather": "${data_dir}/pangu_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "IFS HRES": "${data_dir}/ifs-hres_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "FuXi": "${data_dir}/fuxi_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "NeuralGCM": "${data_dir}/neuralgcm_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "SphericalCNN": "${data_dir}/spherical-cnn_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "Kesler": "${data_dir}/kesler_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "ERA5 Forecast": "${data_dir}/era5-forecast_6steps_1.5deg_2020-01-01_2020-12-31.nc"

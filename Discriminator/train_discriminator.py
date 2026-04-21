@@ -20,96 +20,127 @@ load_dotenv("../wandb_info.env")
 # 1. Dataset Definition
 # ==========================================
 class WeatherDiscriminatorDataset(Dataset):
-    def __init__(self, real_nc_path, fake_nc_path, variables, means=None, stds=None):
+    def __init__(self, real_nc_path, fake_nc_path, variables, 
+                 real_range=None, fake_range=None, lead_times=None, level=None, 
+                 means=None, stds=None, balanced=True):
         self.variables = variables
+        self.balanced = balanced
         self.real_ds = xr.open_dataset(real_nc_path)
         self.fake_ds = xr.open_dataset(fake_nc_path)
         
-        # Restrict to common time range [t_min, t_max]
-        t_min = max(self.real_ds.time.min(), self.fake_ds.time.min())
-        t_max = min(self.real_ds.time.max(), self.fake_ds.time.max())
+        # 1. Level Selection
+        if level is not None:
+            for ds_attr in ['real_ds', 'fake_ds']:
+                ds = getattr(self, ds_attr)
+                if 'level' in ds.dims:
+                    setattr(self, ds_attr, ds.sel(level=level))
+                elif 'pressure_level' in ds.dims:
+                    setattr(self, ds_attr, ds.sel(pressure_level=level))
+
+        # 2. Time Range Selection
+        if real_range:
+            # Check if it's a list of ranges (nested list/ListConfig)
+            # If the first element is not a string, we assume it's a [start, end] pair
+            if not isinstance(real_range[0], str):
+                combined = [self.real_ds.sel(time=slice(r[0], r[1])) for r in real_range]
+                self.real_ds = xr.concat(combined, dim='time')
+            else:
+                self.real_ds = self.real_ds.sel(time=slice(real_range[0], real_range[1]))
         
-        self.real_ds = self.real_ds.sel(time=slice(t_min, t_max))
-        self.fake_ds = self.fake_ds.sel(time=slice(t_min, t_max))
-        
+        if fake_range:
+            self.fake_ds = self.fake_ds.sel(time=slice(fake_range[0], fake_range[1]))
+            
         self.real_times = self.real_ds.time.values
         self.fake_times = self.fake_ds.time.values
         
-        print(f"Dataset Initialized (Time Range: {str(t_min.values)[:13]} to {str(t_max.values)[:13]}):")
-        print(f"  REAL samples: {len(self.real_times)} time steps.")
-        print(f"  FAKE samples: {len(self.fake_times)} time steps.")
+        # 3. Lead Time Filtering
+        if "prediction_timedelta" in self.fake_ds.dims:
+            lt = self.fake_ds.prediction_timedelta.values
+            lt_h = lt.astype('timedelta64[h]').astype(int) if np.issubdtype(lt.dtype, np.timedelta64) else lt
+            if lead_times is not None:
+                self.fake_lead_indices = [np.where(lt_h == h)[0][0] for h in lead_times if h in lt_h]
+            else:
+                self.fake_lead_indices = np.where(lt_h > 0)[0].tolist()
+        else:
+            self.fake_lead_indices = [None]
 
-        # Identify lead indices for REAL (0h in real_ds)
         if "prediction_timedelta" in self.real_ds.dims:
-            real_leads = self.real_ds.prediction_timedelta.values
-            real_lead_hours = real_leads.astype('timedelta64[h]').astype(int) if np.issubdtype(real_leads.dtype, np.timedelta64) else real_leads
-            zero_indices = np.where(real_lead_hours == 0)[0]
-            self.real_lead_idx = int(zero_indices[0]) if len(zero_indices) > 0 else 0
+            lt = self.real_ds.prediction_timedelta.values
+            lt_h = lt.astype('timedelta64[h]').astype(int) if np.issubdtype(lt.dtype, np.timedelta64) else lt
+            zero_idx = np.where(lt_h == 0)[0]
+            self.real_lead_idx = int(zero_idx[0]) if len(zero_idx) > 0 else 0
         else:
             self.real_lead_idx = None
 
-        # Identify ALL lead indices for FAKE > 0h
-        if "prediction_timedelta" in self.fake_ds.dims:
-            fake_leads = self.fake_ds.prediction_timedelta.values
-            fake_lead_hours = fake_leads.astype('timedelta64[h]').astype(int) if np.issubdtype(fake_leads.dtype, np.timedelta64) else fake_leads
-            self.fake_lead_indices = np.where(fake_lead_hours > 0)[0].tolist()
-            if len(self.fake_lead_indices) == 0:
-                raise ValueError(f"No lead times > 0h found in {fake_nc_path}")
-            print(f"Using {len(self.fake_lead_indices)} FAKE lead times: {fake_lead_hours[self.fake_lead_indices]}h")
-        else:
-            raise ValueError(f"Fake dataset {fake_nc_path} is missing 'prediction_timedelta' dimension.")
-
+        # 4. Normalization Stats (from REAL)
         if means is None or stds is None:
-            print(f"Calculating global normalization statistics from REAL dataset...")
-            self.means = {var: float(self.real_ds[var].mean()) for var in variables}
-            self.stds = {var: float(self.real_ds[var].std()) for var in variables}
-            print(f"Global Stats - Means: {self.means}, Stds: {self.stds}")
+            print(f"Calculating stats from REAL dataset...")
+            self.means = {}
+            self.stds = {}
+            for v in self.variables:
+                if v in self.real_ds.data_vars:
+                    self.means[v] = float(self.real_ds[v].mean())
+                    self.stds[v] = float(self.real_ds[v].std())
+                else:
+                    self.means[v] = 0.0
+                    self.stds[v] = 1.0
         else:
-            self.means = means
-            self.stds = stds
+            self.means, self.stds = means, stds
 
-        # Class balancing
+        # 5. Class Balancing
         self.num_fake_leads = len(self.fake_lead_indices)
         self.total_fake_samples = len(self.fake_times) * self.num_fake_leads
         self.total_real_samples = len(self.real_times)
-        self.samples_per_class = max(self.total_fake_samples, self.total_real_samples)
+
+        
+        if self.balanced:
+            self.samples_per_class = max(self.total_fake_samples, self.total_real_samples)
+        
+        print(f"Dataset Initialized (Balanced={self.balanced}):")
+        print(f"  REAL: {self.total_real_samples} | FAKE: {self.total_fake_samples}")
 
     def __len__(self):
-        return self.samples_per_class * 2
+        if self.balanced:
+            return self.samples_per_class * 2
+        else:
+            return self.total_real_samples + self.total_fake_samples
 
     def __getitem__(self, idx):
-        is_fake = idx >= self.samples_per_class
-        sub_idx = idx % self.samples_per_class
-        
-        if not is_fake:
-            # REAL
-            ds_to_use = self.real_ds
-            time_val = self.real_times[sub_idx % self.total_real_samples]
-            lead_idx = self.real_lead_idx
-            label = torch.tensor([1.0], dtype=torch.float32)
+        if self.balanced:
+            is_fake = idx >= self.samples_per_class
+            sub_idx = idx % self.samples_per_class
+            if not is_fake:
+                ds, t_val, l_idx = self.real_ds, self.real_times[sub_idx % self.total_real_samples], self.real_lead_idx
+                label = torch.tensor([1.0], dtype=torch.float32)
+            else:
+                f_idx = sub_idx % self.total_fake_samples
+                ds, t_val, l_idx = self.fake_ds, self.fake_times[f_idx // self.num_fake_leads], self.fake_lead_indices[f_idx % self.num_fake_leads]
+                label = torch.tensor([0.0], dtype=torch.float32)
         else:
-            # FAKE
-            ds_to_use = self.fake_ds
-            f_idx = sub_idx % self.total_fake_samples
-            time_idx = f_idx // self.num_fake_leads
-            lead_inner_idx = f_idx % self.num_fake_leads
-            
-            time_val = self.fake_times[time_idx]
-            lead_idx = self.fake_lead_indices[lead_inner_idx]
-            label = torch.tensor([0.0], dtype=torch.float32)
+            is_fake = idx >= self.total_real_samples
+            if not is_fake:
+                ds, t_val, l_idx = self.real_ds, self.real_times[idx], self.real_lead_idx
+                label = torch.tensor([1.0], dtype=torch.float32)
+            else:
+                f_idx = idx - self.total_real_samples
+                ds, t_val, l_idx = self.fake_ds, self.fake_times[f_idx // self.num_fake_leads], self.fake_lead_indices[f_idx % self.num_fake_leads]
+                label = torch.tensor([0.0], dtype=torch.float32)
 
-        if lead_idx is not None:
-            ds_slice = ds_to_use.sel(time=time_val).isel(prediction_timedelta=lead_idx)
-        else:
-            ds_slice = ds_to_use.sel(time=time_val)
+        ds_slice = ds.sel(time=t_val)
+        if l_idx is not None:
+            ds_slice = ds_slice.isel(prediction_timedelta=l_idx)
 
         channels = []
-        for var in self.variables:
-            data_array = ds_slice[var].values.astype(np.float32)
-            mean, std = self.means[var], self.stds[var]
-            norm_data = (data_array - mean) / std if std > 1e-8 else data_array - mean
-            norm_data = np.nan_to_num(norm_data, nan=0.0)
-            channels.append(norm_data)
+        for v in self.variables:
+            if v in ds_slice.data_vars:
+                val = ds_slice[v].values.astype(np.float32)
+                norm = (val - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0)
+                channels.append(np.nan_to_num(norm, nan=0.0))
+            else:
+                # Zero-fill missing variables to maintain channel count
+                # Using temperature as a reference for shape
+                ref_shape = ds_slice.temperature.shape if 'temperature' in ds_slice.data_vars else list(ds_slice.data_vars.values())[0].shape
+                channels.append(np.zeros(ref_shape, dtype=np.float32))
             
         return torch.tensor(np.stack(channels), dtype=torch.float32), label
 
@@ -177,13 +208,24 @@ class WeatherDiscriminator(L.LightningModule):
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    selected_vars = [cfg.selected_variable]
+    vars_to_use = list(cfg.variables)
     real_path, fake_path = cfg.real_nc_file, cfg.fake_nc_file
     
-    dataset = WeatherDiscriminatorDataset(real_path, fake_path, selected_vars)
+    dataset = WeatherDiscriminatorDataset(
+        real_path, fake_path, vars_to_use,
+        real_range=cfg.train_real_range,
+        fake_range=cfg.train_fake_range,
+        lead_times=cfg.lead_times,
+        level=cfg.get("level"),
+        balanced=True
+    )
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     
-    model = WeatherDiscriminator(num_weather_channels=1, model_name=cfg.model_name, learning_rate=cfg.learning_rate)
+    model = WeatherDiscriminator(
+        num_weather_channels=len(vars_to_use), 
+        model_name=cfg.model_name, 
+        learning_rate=cfg.learning_rate
+    )
     
     wandb_logger = WandbLogger(project=cfg.project_name, config=OmegaConf.to_container(cfg, resolve=True))
     trainer = L.Trainer(max_epochs=cfg.epochs, logger=wandb_logger, accelerator="auto", precision=cfg.precision if torch.cuda.is_available() else 32)

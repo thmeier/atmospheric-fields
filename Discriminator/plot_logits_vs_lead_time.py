@@ -12,8 +12,13 @@ import os
 from train_discriminator import WeatherDiscriminator
 
 class SimpleInferenceDataset(Dataset):
-    def __init__(self, ds, variables, means, stds):
+    def __init__(self, ds, variables, means, stds, level=None):
         self.ds = ds
+        if level is not None:
+            if 'level' in self.ds.dims:
+                self.ds = self.ds.sel(level=level)
+            elif 'pressure_level' in self.ds.dims:
+                self.ds = self.ds.sel(pressure_level=level)
         self.variables = variables
         self.means = means
         self.stds = stds
@@ -40,7 +45,17 @@ class SimpleInferenceDataset(Dataset):
         if self.has_lead_dim:
             ds_slice = ds_slice.isel(prediction_timedelta=l_idx)
             
-        channels = [np.nan_to_num((ds_slice[v].values.astype(np.float32) - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0), nan=0.0) for v in self.variables]
+        channels = []
+        for v in self.variables:
+            if v in ds_slice.data_vars:
+                val = ds_slice[v].values.astype(np.float32)
+                norm = (val - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0)
+                channels.append(np.nan_to_num(norm, nan=0.0))
+            else:
+                # Zero-fill missing variables
+                ref_shape = ds_slice.temperature.shape if 'temperature' in ds_slice.data_vars else list(ds_slice.data_vars.values())[0].shape
+                channels.append(np.zeros(ref_shape, dtype=np.float32))
+
         return torch.tensor(np.stack(channels), dtype=torch.float32), l_idx
 
 def run_inference(dataset, model, cfg, device, desc="Inference"):
@@ -57,44 +72,54 @@ def run_inference(dataset, model, cfg, device, desc="Inference"):
 def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     real_ds_global = xr.open_dataset(cfg.test_real_nc_file)
-    model_vars = [cfg.selected_variable]
-    means = {v: float(real_ds_global[v].mean()) for v in model_vars}
-    stds = {v: float(real_ds_global[v].std()) for v in model_vars}
+    model_vars = list(cfg.variables)
     
-    model = WeatherDiscriminator(1, cfg.model_name).to(device)
+    # Slice ERA5 to test ranges
+    combined_real = []
+    for r in cfg.test_real_ranges:
+        combined_real.append(real_ds_global.sel(time=slice(r[0], r[1])))
+    curr_real = xr.concat(combined_real, dim='time')
+    
+    # Use training range for means/stds
+    stats_ds = real_ds_global.sel(time=slice(cfg.train_real_range[0], cfg.train_real_range[1]))
+    means = {}
+    stds = {}
+    for v in model_vars:
+        if v in stats_ds.data_vars:
+            means[v] = float(stats_ds[v].mean())
+            stds[v] = float(stats_ds[v].std())
+        else:
+            means[v] = 0.0
+            stds[v] = 1.0
+    
+    model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
     model.model.load_state_dict(torch.load(os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_lightning.pth"), map_location=device))
     model.eval()
 
     plt.figure(figsize=(10, 6))
-    files = cfg.get("comparison_files", {"Default": cfg.test_fake_nc_file})
-    if not isinstance(files, (dict, DictConfig)):
-        files = {"Default": files}
+    
+    # Real Baseline
+    _, r_means, r_stds = run_inference(SimpleInferenceDataset(curr_real, model_vars, means, stds, level=cfg.get("level")), model, cfg, device, "Baseline (ERA5)")
+    plt.errorbar([0], [r_means[0]], yerr=[r_stds[0]], fmt='o', label="ERA5 (Ground Truth)", markersize=10, color='black')
 
+    files = cfg.comparison_files
     for label, path in files.items():
-        if not os.path.exists(path): continue
+        if not os.path.exists(path): 
+            print(f"Skipping {label}: file not found at {path}")
+            continue
         fake_ds = xr.open_dataset(path)
         
-        # Calculate common range for this specific file
-        t_min = max(real_ds_global.time.min(), fake_ds.time.min())
-        t_max = min(real_ds_global.time.max(), fake_ds.time.max())
-        
-        # Slice both to common range
-        curr_real = real_ds_global.sel(time=slice(t_min, t_max))
-        curr_fake = fake_ds.sel(time=slice(t_min, t_max))
-        
-        if len(curr_real.time) == 0 or len(curr_fake.time) == 0:
-            print(f"Skipping {label}: No overlapping time range.")
+        # Slice fake to test range
+        curr_fake = fake_ds.sel(time=slice(cfg.test_fake_range[0], cfg.test_fake_range[1]))
+        if len(curr_fake.time) == 0:
+            print(f"Skipping {label}: No samples in test range.")
             continue
 
-        # Real Baseline (t=0) for this range
-        _, r_means, r_stds = run_inference(SimpleInferenceDataset(curr_real, model_vars, means, stds), model, cfg, device, f"Baseline {label}")
-        t0_mean, t0_std = r_means[0], r_stds[0]
-
         # Fake Inference
-        l_hrs, m_l, s_l = run_inference(SimpleInferenceDataset(curr_fake, model_vars, means, stds), model, cfg, device, label)
+        l_hrs, m_l, s_l = run_inference(SimpleInferenceDataset(curr_fake, model_vars, means, stds, level=cfg.get("level")), model, cfg, device, label)
         
-        leads, ms, ss = (np.concatenate([[0], l_hrs]), np.concatenate([[t0_mean], m_l]), np.concatenate([[t0_std], s_l])) if 0 not in l_hrs else (l_hrs, m_l, s_l)
-        idx = np.argsort(leads); plt.errorbar(leads[idx], ms[idx], yerr=ss[idx], fmt='-o', label=label)
+        idx = np.argsort(l_hrs)
+        plt.errorbar(l_hrs[idx], [m_l[i] for i in idx], yerr=[s_l[i] for i in idx], fmt='-o', label=label)
         fake_ds.close()
 
     plt.axhline(0, color='black', linestyle='-', alpha=0.3)
