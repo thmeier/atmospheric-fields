@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
     parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
-    parser.add_argument("--n-severity-steps", type=int, default=5)
+    parser.add_argument("--n-severity-steps", type=int, default=9)
     parser.set_defaults(lazy=None)
     args = parser.parse_args()
 
@@ -311,6 +311,52 @@ def main():
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"\nSaved distance plots to {plot_path}")
+
+    # ── Normalized per-corruption subplots (FID and MMD as separate figures) ──
+    corruption_names = list(ladders.keys())
+    n_corruptions = len(corruption_names)
+    ncols = 3
+    nrows = (n_corruptions + ncols - 1) // ncols
+
+    model_colors = {"mae": "#2196F3", "ijepa": "#FF5722"}
+    model_labels = {"mae": "MAE", "ijepa": "I-JEPA"}
+
+    for metric_key, metric_label in [("fid", "FID"), ("mmd", "MMD")]:
+        fig2, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+        axes = axes.flatten()
+
+        for ax_idx, cond_name in enumerate(corruption_names):
+            ax = axes[ax_idx]
+            for model_name, results in all_results.items():
+                sevs = np.array(results[cond_name]["severities"])
+                vals = np.array(results[cond_name][metric_key])
+                vals_norm = (vals - vals[0]) / (np.abs(vals[0]) + 1e-8)
+
+                color = model_colors.get(model_name, "gray")
+                label = model_labels.get(model_name, model_name)
+                ax.plot(sevs, vals_norm, color=color, linestyle="-", marker="o", markersize=4, label=label)
+
+            ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
+            ax.set_title(cond_name, fontsize=11)
+            ax.set_xlabel("Severity")
+            ax.set_ylabel(f"Normalised {metric_label} increase")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        for ax_idx in range(n_corruptions, len(axes)):
+            axes[ax_idx].set_visible(False)
+
+        fig2.suptitle(
+            f"Normalised {metric_label} Increase vs. Corruption Severity ({title_model})\n"
+            r"$(d - d_0)\,/\,|d_0|$",
+            fontsize=13,
+            y=1.01,
+        )
+        norm_plot_path = plots_dir / f"distances_normalised_{metric_key}_{args.model}.png"
+        fig2.tight_layout()
+        fig2.savefig(norm_plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"Saved normalised {metric_label} plots to {norm_plot_path}")
 
     # ── Summary table ──
     print("\n" + "=" * 80)

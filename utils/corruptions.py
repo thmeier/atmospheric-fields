@@ -3,7 +3,7 @@ import scipy.ndimage as ndimage
 import numpy as np
 
 
-MAX_SEVERITY = 1.0
+MAX_SEVERITY = 2.0
 T2M_CHANNEL = 0
 U10_CHANNEL = 1
 V10_CHANNEL = 2
@@ -15,7 +15,7 @@ PAD_RIGHT = 8
 PADDED_SHAPE = (128, 256)
 
 
-def get_corruption_ladder(corruption_type, n_steps=5):
+def get_corruption_ladder(corruption_type, n_steps=9):
     """
     Returns discrete severity levels in [0, MAX_SEVERITY] for distance evaluation.
     """
@@ -175,7 +175,7 @@ def apply_wind_patch_shuffle(x, severity, patch_size=16):
     n_patch_rows = shuffled_height // patch_size
     n_patch_cols = shuffled_width // patch_size
     n_patches = n_patch_rows * n_patch_cols
-    n_shuffle = int(round(severity * n_patches))
+    n_shuffle = min(int(round(severity * n_patches)), n_patches)
 
     if n_shuffle < 2:
         return x

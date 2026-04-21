@@ -41,7 +41,7 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
         "Channel Rotation": apply_wind_channel_rotation,
     }
 
-    print(f"\n--- Validation Protocol 1: Linear Probe (Continuous Severity Regression, {model_name.upper()}) ---")
+    print(f"\n--- Validation Protocol 1: Linear Regression Probe (Continuous Severity Regression, {model_name.upper()}) ---")
 
     default_n = 50 if local_flags["local"] else (250 if local_flags["large_local"] else 1000)
     n_samples = n_probe_samples if n_probe_samples is not None else default_n
@@ -92,11 +92,7 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
         x_test = x_z[test_idx]
         y_test = y_severity[test_idx]
 
-        probe = torch.nn.Sequential(
-            torch.nn.Linear(x_train.shape[1], 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, 1),
-        ).to(device)
+        probe = torch.nn.Linear(x_train.shape[1], 1).to(device)
 
         optimizer = torch.optim.Adam(probe.parameters(), lr=1e-3)
         probe_batch_size = min(64, x_train.shape[0])
@@ -129,7 +125,7 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
         mse = torch.mean((y_pred - y_true) ** 2).item()
         y_var = torch.var(y_true).item()
         r2 = 1 - mse / y_var if y_var > 0 else 0.0
-        print(f"\nMLP Probe Results ({corr_name}, continuous severity):")
+        print(f"\nLinear Probe Results ({corr_name}, continuous severity):")
         print(f"  MSE: {mse:.4f}")
         print(f"  R^2: {r2:.4f}")
 
@@ -258,7 +254,7 @@ def main():
 
                 ax.set_xlim(lims)
                 ax.set_ylim(lims)
-                ax.set_title(f"{model_name.upper()} | {corr_name}\n$R^2$ = {r2:.4f}")
+                ax.set_title(f"{model_name.upper()} | {corr_name}\n$R^2$ = {r2:.4f} (linear probe)")
                 ax.set_xlabel("True Severity")
                 ax.set_ylabel("Predicted Severity")
                 ax.grid(True, alpha=0.3)
@@ -304,7 +300,7 @@ def main():
 
             ax.set_xlim(lims)
             ax.set_ylim(lims)
-            ax.set_title(f"MLP Probe ({model_name.upper()}): {corr_name}\n$R^2$ = {r2:.4f}")
+            ax.set_title(f"Linear Probe ({model_name.upper()}): {corr_name}\n$R^2$ = {r2:.4f}")
             ax.set_xlabel("True Severity")
             ax.set_ylabel("Predicted Severity")
             ax.legend(loc="upper left")
