@@ -28,7 +28,11 @@ test_fake_range: ["2020-01-01", "2020-12-31"]
 # Lead Times (hours)
 lead_times: [6, 12, 24, 48, 96, 192]
 
-batch_size: 64
+# Sampling for analysis (0 = no limit)
+max_samples: 0
+
+batch_size: 16
+
 epochs: 2
 #epochs: 5
 learning_rate: 1e-4

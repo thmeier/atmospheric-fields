@@ -12,18 +12,27 @@ import os
 from train_discriminator import WeatherDiscriminator
 
 class SimpleInferenceDataset(Dataset):
-    def __init__(self, ds, variables, means, stds, level=None):
+    def __init__(self, ds, variables, means, stds, level=None, max_samples=0):
         self.ds = ds
         if level is not None:
             if 'level' in self.ds.dims:
                 self.ds = self.ds.sel(level=level)
             elif 'pressure_level' in self.ds.dims:
                 self.ds = self.ds.sel(pressure_level=level)
+        
         self.variables = variables
         self.means = means
         self.stds = stds
-        self.times = self.ds.time.values
         
+        all_times = self.ds.time.values
+        if max_samples > 0 and len(all_times) > max_samples:
+            # Subsample times uniformly
+            indices = np.linspace(0, len(all_times) - 1, max_samples, dtype=int)
+            self.times = all_times[indices]
+            self.ds = self.ds.isel(time=indices)
+        else:
+            self.times = all_times
+
         if "prediction_timedelta" in self.ds.dims:
             lt = self.ds.prediction_timedelta.values
             self.lead_hours = lt.astype('timedelta64[h]').astype(int) if np.issubdtype(lt.dtype, np.timedelta64) else lt
