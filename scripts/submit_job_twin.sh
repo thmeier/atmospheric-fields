@@ -17,8 +17,10 @@ export PYTHONUNBUFFERED=1
 cd ~/atmospheric-fields
 mkdir -p checkpoints
 mkdir -p plots
+mkdir -p logs
 
 echo "Starting full pipeline on node: $(hostname)"
+echo "Conda Env:" $(conda info --envs | grep -v '#' | grep '*' | awk '{print $1}')
 echo "Using GPU: $CUDA_VISIBLE_DEVICES"
 nvidia-smi
 python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA built:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available())"
