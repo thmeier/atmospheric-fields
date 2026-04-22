@@ -288,7 +288,7 @@ def main():
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
-    model = build_model("ijepa", device=device, ijepa_size=args.model_size)
+    model = build_model("ijepa", device=device, model_size=args.model_size)
     optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
 
     mask_generator = MultiBlockMaskGenerator(

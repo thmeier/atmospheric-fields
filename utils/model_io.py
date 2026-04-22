@@ -1,32 +1,23 @@
-from pathlib import Path
-
 import torch
+from pathlib import Path
+from .models import build_mae, build_ijepa
 
-from .models import MaskedAutoencoderViT, build_ijepa
 
-
-def build_model(model_name, device, ijepa_size="tiny"):
+def build_model(model_name, device, model_size):
     if model_name == "mae":
-        model = MaskedAutoencoderViT(
-            embed_dim=256,
-            depth=6,
-            num_heads=8,
-            decoder_embed_dim=128,
-            decoder_depth=2,
-            decoder_num_heads=4,
-        )
+        model = build_mae(model_size=model_size)
     elif model_name == "ijepa":
-        model = build_ijepa(model_size=ijepa_size)
+        model = build_ijepa(model_size=model_size)
     else:
         raise ValueError(f"Unknown model: {model_name}")
     return model.to(device)
 
 
-def checkpoint_path(model_name, checkpoint_dir=Path("checkpoints")):
+def checkpoint_path(model_name, model_size, checkpoint_dir=Path("checkpoints")):
     if model_name == "mae":
-        return checkpoint_dir / "best_mae_model.pth"
+        return checkpoint_dir / f"best_mae_model_{model_size}.pth"
     if model_name == "ijepa":
-        return checkpoint_dir / "best_ijepa_model.pth"
+        return checkpoint_dir / f"best_ijepa_model_{model_size}.pth"
     raise ValueError(f"Unknown model: {model_name}")
 
 

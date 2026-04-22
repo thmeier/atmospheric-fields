@@ -25,10 +25,10 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 
-def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_size, num_workers, local_flags, n_probe_samples=None):
+def evaluate_model(model_name, model_size, device, stats_dir, dataset, batch_size, num_workers, local_flags, n_probe_samples=None):
     print(f"Loading {model_name.upper()} model...")
-    model = build_model(model_name, device=device, ijepa_size=ijepa_size)
-    ckpt_path = checkpoint_path(model_name, stats_dir)
+    model = build_model(model_name, device=device, model_size=model_size)
+    ckpt_path = checkpoint_path(model_name, model_size, stats_dir)
     model = load_model_checkpoint(model_name, model, ckpt_path, device)
     model.eval()
 
@@ -140,7 +140,7 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa", "both"], default="mae")
-    parser.add_argument("--ijepa-size", choices=["tiny", "small"], default="tiny")
+    parser.add_argument("--model-size", choices=["tiny", "small", "twin", "default"], default="tiny")
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--large-local", action="store_true")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -188,7 +188,7 @@ def main():
     for model_name in models_to_run:
         results, scatters, corruption_fns = evaluate_model(
             model_name=model_name,
-            ijepa_size=args.ijepa_size,
+            model_size=args.model_size,
             device=device,
             stats_dir=stats_dir,
             dataset=dataset,
