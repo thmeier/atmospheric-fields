@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=atm_fields_full
+#SBATCH --job-name=atm_fields_full_twin
 #SBATCH --time=48:00:00
 #SBATCH --account=pmlr_jobs
 #SBATCH --mem=36G
 #SBATCH --gpus=1
 #SBATCH --constraint=2080ti
-#SBATCH --output=slurm_%j.out
-#SBATCH --error=slurm_%j.err
+#SBATCH --output=logs/twin_mae_ijepa_%j.out
+#SBATCH --error=logs/twin_mae_ijepa_%j.err
 
 . /etc/profile.d/modules.sh
 source ~/miniconda3/etc/profile.d/conda.sh
