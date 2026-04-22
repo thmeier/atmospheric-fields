@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Subset
 
 from utils.dataset import AtmosphereDataset
 from utils.ijepa_masking import MultiBlockMaskGenerator
-from utils.model_io import build_model, checkpoint_path, save_ijepa_checkpoint
+from utils.model_io import build_model, checkpoint_path, save_mae_checkpoint, save_ijepa_checkpoint
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
 LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
@@ -175,15 +175,11 @@ def val_epoch(model, loader, device, forward_fn, mask_generator):
 
 def save_checkpoint(model_name, model, optimizer, epoch, val_loss, args, path):
     if model_name == "mae":
-        torch.save({
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "val_loss": val_loss,
-            "config": vars(args),
-        }, path)
-    else:
+        save_mae_checkpoint(path, model, optimizer, epoch, val_loss, args)
+    elif model_name == "ijepa":
         save_ijepa_checkpoint(path, model, optimizer, epoch, val_loss, args)
+    else:
+        raise ValueError(f"model {model_name} not recognized!")
 
 
 # ---------------------------------------------------------------------------
