@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os
 import argparse
 from functools import partial
 import torch
@@ -255,7 +256,7 @@ def main():
     num_workers = 0 if args.num_workers is None else args.num_workers
     dataset = AtmosphereDataset(data_path, split="val", stats=stats, lazy=lazy_load)
 
-    plots_dir = Path("plots") if (args.local or args.large_local) else Path("/work/scratch/ddemler/plots")
+    plots_dir = Path("plots") if (args.local or args.large_local) else Path(f"/work/scratch/{os.environ['USER']}/plots")
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     models_to_run = ["mae", "ijepa"] if args.model == "both" else [args.model]
