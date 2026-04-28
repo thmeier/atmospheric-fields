@@ -27,6 +27,13 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 
+def format_model_label(model_name, model_size, model_variant=None):
+    label = f"{model_name.upper()} ({model_size})"
+    if model_variant:
+        label += f" [{model_variant}]"
+    return label
+
+
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     mu1, mu2 = np.atleast_1d(mu1), np.atleast_1d(mu2)
     sigma1, sigma2 = np.atleast_2d(sigma1), np.atleast_2d(sigma2)
@@ -59,11 +66,11 @@ def mmd_rbf(X, Y, gamma=None):
     return (K_XX.sum() / (N * (N - 1)) + K_YY.sum() / (M * (M - 1)) - 2 * K_XY.mean()).item()
 
 
-def evaluate_model(model_name, model_size, device, stats_dir, dataset, batch_size,
+def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dataset, batch_size,
                    num_workers, local_flags, n_severity_steps=5):
-    print(f"Loading {model_name.upper()} ({model_size}) model...")
+    print(f"Loading {format_model_label(model_name, model_size, model_variant)} model...")
     model = build_model(model_name, device=device, model_size=model_size)
-    ckpt_path = checkpoint_path(model_name, model_size, stats_dir)
+    ckpt_path = checkpoint_path(model_name, model_size, stats_dir, variant=model_variant)
     model = load_model_checkpoint(model_name, model, ckpt_path, device)
     model.eval()
 
@@ -125,7 +132,7 @@ def evaluate_model(model_name, model_size, device, stats_dir, dataset, batch_siz
     return results, ladders
 
 
-def plot_distances(all_results, models_to_run, model_sizes, ladders, plots_dir, run_tag):
+def plot_distances(all_results, models_to_run, model_sizes, model_variants, ladders, plots_dir, run_tag):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
@@ -143,7 +150,7 @@ def plot_distances(all_results, models_to_run, model_sizes, ladders, plots_dir, 
     model_widths = [2.0, 3.0]
     model_alphas = [0.8, 1.0]
 
-    labels = [f"{m.upper()} ({model_sizes[m]})" for m in models_to_run]
+    labels = [format_model_label(m, model_sizes[m], model_variants[m]) for m in models_to_run]
     title_model = " vs ".join(labels)
     is_comparison = len(models_to_run) == 2
 
@@ -193,6 +200,7 @@ def plot_distances(all_results, models_to_run, model_sizes, ladders, plots_dir, 
     else:
         ax1.legend(); ax2.legend()
 
+    fig.suptitle(f"Run: {run_tag}", fontsize=12, y=1.02)
     fig.tight_layout()
     fig.savefig(plots_dir / f"distances_vs_severity_{run_tag}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -215,7 +223,7 @@ def plot_distances(all_results, models_to_run, model_sizes, ladders, plots_dir, 
                 ax.plot(sevs, vals_norm,
                         color=model_colors.get(model_name, "gray"),
                         linestyle="-", marker="o", markersize=4,
-                        label=f"{model_name.upper()} ({model_sizes[model_name]})")
+                        label=format_model_label(model_name, model_sizes[model_name], model_variants[model_name]))
             ax.axhline(0, color="gray", lw=0.8, ls=":")
             ax.set_title(cond_name, fontsize=11)
             ax.set_xlabel("Severity")
@@ -226,7 +234,8 @@ def plot_distances(all_results, models_to_run, model_sizes, ladders, plots_dir, 
             axes[ax_idx].set_visible(False)
         fig2.suptitle(
             f"Normalised {metric_label} Increase vs. Corruption Severity\n"
-            f"({title_model})\n" + r"$(d - d_0)\,/\,|d_0|$",
+            f"({title_model})\n"
+            f"Run: {run_tag}\n" + r"$(d - d_0)\,/\,|d_0|$",
             fontsize=13, y=1.01,
         )
         fig2.tight_layout()
@@ -255,8 +264,10 @@ def print_summary(all_results, models_to_run, model_sizes):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa", "both"], default="mae")
-    parser.add_argument("--mae-size", choices=["default", "twin"], default="default")
-    parser.add_argument("--ijepa-size", choices=["tiny", "small", "twin"], default="tiny")
+    parser.add_argument("--mae-size", choices=["default", "twin"], default="twin")
+    parser.add_argument("--ijepa-size", choices=["tiny", "small", "twin"], default="twin")
+    parser.add_argument("--mae-variant", type=str, default=None)
+    parser.add_argument("--ijepa-variant", type=str, default=None)
     parser.add_argument("--twin", action="store_true",
                         help="Shorthand for --mae-size twin --ijepa-size twin")
     parser.add_argument("--local", action="store_true")
@@ -274,6 +285,7 @@ def main():
         args.ijepa_size = "twin"
 
     model_sizes = {"mae": args.mae_size, "ijepa": args.ijepa_size}
+    model_variants = {"mae": args.mae_variant, "ijepa": args.ijepa_variant}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.backends.mps.is_available() and device.type != "cuda":
@@ -302,6 +314,7 @@ def main():
         results, ladders = evaluate_model(
             model_name=model_name,
             model_size=model_sizes[model_name],
+            model_variant=model_variants[model_name],
             device=device,
             stats_dir=stats_dir,
             dataset=dataset,
@@ -313,11 +326,14 @@ def main():
         all_results[model_name] = results
 
     if args.model == "both":
-        run_tag = f"both_mae-{args.mae_size}_ijepa-{args.ijepa_size}"
+        mae_tag = args.mae_size if not args.mae_variant else f"{args.mae_size}-{args.mae_variant}"
+        ijepa_tag = args.ijepa_size if not args.ijepa_variant else f"{args.ijepa_size}-{args.ijepa_variant}"
+        run_tag = f"both_mae-{mae_tag}_ijepa-{ijepa_tag}"
     else:
-        run_tag = f"{args.model}_{model_sizes[args.model]}"
+        variant = model_variants[args.model]
+        run_tag = f"{args.model}_{model_sizes[args.model]}" if not variant else f"{args.model}_{model_sizes[args.model]}-{variant}"
 
-    plot_distances(all_results, models_to_run, model_sizes, ladders, plots_dir, run_tag)
+    plot_distances(all_results, models_to_run, model_sizes, model_variants, ladders, plots_dir, run_tag)
     print_summary(all_results, models_to_run, model_sizes)
 
 

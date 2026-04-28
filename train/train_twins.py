@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 
 from utils.dataset import AtmosphereDataset
-from utils.ijepa_masking import MultiBlockMaskGenerator
+from utils.ijepa_masking import MultiBlockMaskGenerator, target_masks_to_mae_masks
 from utils.model_io import build_model, checkpoint_path, save_mae_checkpoint, save_ijepa_checkpoint
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
@@ -92,12 +92,18 @@ def make_optimizer(model, lr, weight_decay):
 # Per-model forward pass - the only place the two models diverge
 # ---------------------------------------------------------------------------
 
-def forward_mae(model, batch, mask_generator, device):
-    loss, _, _ = model(batch, mask_ratio=0.75)
+def forward_mae(model, batch, mask_generator, device, args):
+    if args.mae_mask_mode == "random":
+        loss, _, _ = model(batch, mask_ratio=0.75)
+        return loss
+
+    _, target_masks = mask_generator.sample(batch.shape[0], device=device)
+    visible_indices, loss_mask = target_masks_to_mae_masks(target_masks, model.patch_embed.num_patches)
+    loss, _, _ = model(batch, visible_indices=visible_indices, loss_mask=loss_mask)
     return loss
 
 
-def forward_ijepa(model, batch, mask_generator, device):
+def forward_ijepa(model, batch, mask_generator, device, args):
     context_masks, target_masks = mask_generator.sample(batch.shape[0], device=device)
     loss, _, _ = model(batch, context_masks, target_masks)
     return loss
@@ -116,7 +122,7 @@ def get_forward_fn(model_name):
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizer, device, forward_fn, mask_generator,
-                lr_schedule, wd_schedule, grad_clip):
+                lr_schedule, wd_schedule, grad_clip, args):
     model.train()
     total_loss = 0.0
     total_batches = 0
@@ -129,7 +135,7 @@ def train_epoch(model, loader, optimizer, device, forward_fn, mask_generator,
     for batch in loader:
         batch = batch.to(device, non_blocking=device.type == "cuda")
         optimizer.zero_grad()
-        loss = forward_fn(model, batch, mask_generator, device)
+        loss = forward_fn(model, batch, mask_generator, device, args)
 
         if not torch.isfinite(loss):
             raise RuntimeError("Encountered non-finite loss")
@@ -155,13 +161,13 @@ def train_epoch(model, loader, optimizer, device, forward_fn, mask_generator,
 
 
 @torch.no_grad()
-def val_epoch(model, loader, device, forward_fn, mask_generator):
+def val_epoch(model, loader, device, forward_fn, mask_generator, args):
     model.eval()
     total_loss = 0.0
     total_batches = 0
     for batch in loader:
         batch = batch.to(device, non_blocking=device.type == "cuda")
-        loss = forward_fn(model, batch, mask_generator, device)
+        loss = forward_fn(model, batch, mask_generator, device, args)
         if not torch.isfinite(loss):
             raise RuntimeError("Encountered non-finite val loss")
         total_loss += loss.item()
@@ -205,6 +211,35 @@ def build_datasets(data_path, stats, lazy_load, stats_chunk_size):
     return train_dataset, val_dataset, stats
 
 
+def build_mask_generator(args):
+    return MultiBlockMaskGenerator(
+        input_size=(128, 256),
+        patch_size=16,
+        enc_mask_scale=(0.85, 1.0),
+        pred_mask_scale=(0.15, 0.2),
+        aspect_ratio=(0.75, 1.5),
+        nenc=1,
+        npred=4,
+        min_keep=4,
+        allow_overlap=False,
+        context_mode=args.ijepa_context_mode,
+        disjoint_targets=args.target_mask_mode == "shared-blocks",
+    )
+
+
+def resolve_variant(model_name, args):
+    tags = []
+    if args.target_mask_mode == "shared-blocks":
+        tags.append("shared-targets")
+    if model_name == "mae" and args.mae_mask_mode == "random":
+        tags = []
+    if model_name == "ijepa" and args.ijepa_context_mode == "world-band":
+        tags.append("world-band")
+    if args.variant_suffix:
+        tags.append(args.variant_suffix)
+    return "__".join(tags) or None
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -235,7 +270,16 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-samples", type=int, default=64)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--mae-mask-mode", choices=["random", "target-blocks"], default="random")
+    parser.add_argument("--target-mask-mode", choices=["baseline", "shared-blocks"], default="baseline")
+    parser.add_argument("--ijepa-context-mode", choices=["multiblock", "world-band"], default="multiblock")
+    parser.add_argument("--variant-suffix", type=str, default=None)
     args = parser.parse_args()
+
+    if args.model == "mae" and args.mae_mask_mode == "target-blocks":
+        args.target_mask_mode = "shared-blocks"
+    if args.model == "mae" and args.ijepa_context_mode != "multiblock":
+        raise ValueError("MAE training does not use ijepa context masks; keep --ijepa-context-mode=multiblock.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.backends.mps.is_available() and device.type != "cuda":
@@ -285,15 +329,7 @@ def main():
     model = build_model(args.model, device=device, model_size="twin")
     optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
     forward_fn = get_forward_fn(args.model)
-
-    mask_generator = MultiBlockMaskGenerator(
-        input_size=(128, 256),
-        patch_size=16,
-        enc_mask_scale=(0.85, 1.0),
-        pred_mask_scale=(0.15, 0.2),
-        aspect_ratio=(0.75, 1.5),
-        nenc=1, npred=4, min_keep=4, allow_overlap=False,
-    )
+    mask_generator = build_mask_generator(args)
 
     total_steps = max(1, len(train_loader) * args.epochs)
     warmup_steps = min(total_steps, max(1, len(train_loader) * args.warmup_epochs))
@@ -308,15 +344,20 @@ def main():
     )
 
     best_val_loss = float("inf")
-    best_path = checkpoint_path(args.model, model_size="twin",
-                                 checkpoint_dir=checkpoint_dir)
+    variant = resolve_variant(args.model, args)
+    best_path = checkpoint_path(
+        args.model,
+        model_size="twin",
+        checkpoint_dir=checkpoint_dir,
+        variant=variant,
+    )
     epochs_no_improve = 0
 
     for epoch in range(args.epochs):
         print(f"\n--- Epoch {epoch + 1}/{args.epochs} ---")
         train_metrics = train_epoch(model, train_loader, optimizer, device, forward_fn,
-                                     mask_generator, lr_schedule, wd_schedule, args.grad_clip)
-        val_metrics = val_epoch(model, val_loader, device, forward_fn, mask_generator)
+                                     mask_generator, lr_schedule, wd_schedule, args.grad_clip, args)
+        val_metrics = val_epoch(model, val_loader, device, forward_fn, mask_generator, args)
         val_loss = val_metrics["loss"]
 
         print(f"Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_loss:.4f} | "

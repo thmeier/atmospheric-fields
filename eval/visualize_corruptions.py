@@ -29,29 +29,40 @@ V10_CHANNEL = 2
 MSL_CHANNEL = 3
 
 
+def _orient_for_display(field):
+    # Match the geographic orientation verified by the reference map:
+    # north up and longitudes mirrored relative to the raw tensor layout.
+    return np.fliplr(field)
+
+
 def _show_scalar_panel(ax, field, var_idx, vmin, vmax):
     ax.imshow(
-        field,
+        _orient_for_display(field),
         cmap=CMAPS[var_idx],
         aspect="auto",
         vmin=vmin,
         vmax=vmax,
         interpolation="nearest",
+        origin="lower",
     )
 
 
 def _show_msl_with_wind(ax, msl_field, u_field, v_field, u_ref=None, v_ref=None):
     _show_scalar_panel(ax, msl_field, MSL_CHANNEL, float(msl_field.min()), float(msl_field.max()))
+    u_field = _orient_for_display(u_field)
+    v_field = _orient_for_display(v_field)
     step = 12
     y = np.arange(0, u_field.shape[0], step)
     x = np.arange(0, u_field.shape[1], step)
     xx, yy = np.meshgrid(x, y)
     if u_ref is not None and v_ref is not None:
+        u_ref = _orient_for_display(u_ref)
+        v_ref = _orient_for_display(v_ref)
         ref_quiver = ax.quiver(
             xx,
             yy,
             u_ref[::step, ::step],
-            -v_ref[::step, ::step],
+            v_ref[::step, ::step],
             color="gray",
             alpha=0.55,
             scale=40,
@@ -60,7 +71,7 @@ def _show_msl_with_wind(ax, msl_field, u_field, v_field, u_ref=None, v_ref=None)
         ref_quiver.set_linestyle(":")
     uu = u_field[::step, ::step]
     vv = v_field[::step, ::step]
-    ax.quiver(xx, yy, uu, -vv, color="black", scale=40, width=0.002)
+    ax.quiver(xx, yy, uu, vv, color="black", scale=40, width=0.002)
 
 def main():
     mean = np.load(STATS_DIR / "data_mean.npy")

@@ -162,12 +162,27 @@ python train/train_ijepa.py --local
 python train/train_ijepa.py --local --smoke-test
 ```
 
+Run the controlled twin experiments:
+
+```bash
+python train/train_twins.py --model mae --large-local --mae-mask-mode target-blocks
+python train/train_twins.py --model ijepa --large-local --target-mask-mode shared-blocks
+python train/train_twins.py --model ijepa --large-local --ijepa-context-mode world-band
+```
+
 Checkpoints and data statistics (`data_mean.npy`, `data_std.npy`, `best_mae_model.pth`, `best_ijepa_model.pth`) are saved to `checkpoints/`.
+
+Overnight Slurm launchers for the new ablations:
+
+```bash
+sbatch scripts/submit_job_shared_targets.sh
+sbatch scripts/submit_job_world_band.sh
+```
 
 ### Evaluation
 
 Both eval scripts support `--local`, `--large-local`, or no flag (cluster dataset). Use `--eager` to load the full dataset into memory upfront.
-Both scripts also support `--model mae` or `--model ijepa`.
+Both scripts also support `--model mae` or `--model ijepa`, plus `--mae-variant` / `--ijepa-variant` to load experiment-specific twin checkpoints such as `shared-targets` or `world-band`.
 
 **Validation Protocol 1 — Linear Probe (severity regression):**
 

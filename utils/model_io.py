@@ -13,9 +13,10 @@ def build_model(model_name, device, model_size):
     return model.to(device)
 
 
-def checkpoint_path(model_name, model_size, checkpoint_dir=Path("checkpoints")):
+def checkpoint_path(model_name, model_size, checkpoint_dir=Path("checkpoints"), variant=None):
     if model_name in ("mae", "ijepa"):
-        return checkpoint_dir / f"best_{model_name}_model_{model_size}.pth"
+        suffix = f"_{variant}" if variant else ""
+        return checkpoint_dir / f"best_{model_name}_model_{model_size}{suffix}.pth"
     raise ValueError(f"Unknown model: {model_name}")
 
 def save_mae_checkpoint(path, model, optimizer, epoch, val_loss, args):

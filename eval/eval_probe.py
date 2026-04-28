@@ -26,11 +26,18 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 
-def evaluate_model(model_name, model_size, device, stats_dir, dataset, batch_size,
+def format_model_label(model_name, model_size, model_variant=None):
+    label = f"{model_name.upper()} ({model_size})"
+    if model_variant:
+        label += f" [{model_variant}]"
+    return label
+
+
+def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dataset, batch_size,
                    num_workers, local_flags, n_probe_samples=None):
-    print(f"Loading {model_name.upper()} ({model_size}) model...")
+    print(f"Loading {format_model_label(model_name, model_size, model_variant)} model...")
     model = build_model(model_name, device=device, model_size=model_size)
-    ckpt_path = checkpoint_path(model_name, model_size, stats_dir)
+    ckpt_path = checkpoint_path(model_name, model_size, stats_dir, variant=model_variant)
     model = load_model_checkpoint(model_name, model, ckpt_path, device)
     model.eval()
 
@@ -119,13 +126,13 @@ def evaluate_model(model_name, model_size, device, stats_dir, dataset, batch_siz
 
 
 def plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
-                    corruption_fns, plots_dir, run_tag):
+                    model_variants, corruption_fns, plots_dir, run_tag):
     import matplotlib.pyplot as plt
 
     corr_names = list(corruption_fns.keys())
     x = np.arange(len(corr_names))
     width = 0.35
-    labels = [f"{m.upper()} ({model_sizes[m]})" for m in models_to_run]
+    labels = [format_model_label(m, model_sizes[m], model_variants[m]) for m in models_to_run]
     colors = ["steelblue", "darkorange"]
 
     # R² bar chart + delta
@@ -137,7 +144,7 @@ def plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(corr_names, rotation=30, ha="right")
     axes[0].set_ylabel("$R^2$")
-    axes[0].set_title(f"Linear Probe Severity Prediction ({' vs '.join(labels)})")
+    axes[0].set_title("Linear Probe Severity Prediction")
     axes[0].legend(); axes[0].grid(True, axis="y", alpha=0.3)
 
     if len(models_to_run) == 2:
@@ -153,6 +160,7 @@ def plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
     else:
         axes[1].axis("off")
 
+    fig.suptitle(f"Run: {run_tag}", fontsize=12, y=1.02)
     fig.tight_layout()
     fig.savefig(plots_dir / f"probe_comparison_{run_tag}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -217,8 +225,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa", "both"], default="mae")
     # Per-model size flags for the mixed comparison (mae default vs ijepa small)
-    parser.add_argument("--mae-size", choices=["default", "twin"], default="default")
-    parser.add_argument("--ijepa-size", choices=["tiny", "small", "twin"], default="tiny")
+    parser.add_argument("--mae-size", choices=["default", "twin"], default="twin")
+    parser.add_argument("--ijepa-size", choices=["tiny", "small", "twin"], default="twin")
+    parser.add_argument("--mae-variant", type=str, default=None)
+    parser.add_argument("--ijepa-variant", type=str, default=None)
     # Convenience flag: sets both to twin
     parser.add_argument("--twin", action="store_true",
                         help="Shorthand for --mae-size twin --ijepa-size twin")
@@ -238,6 +248,7 @@ def main():
 
     # Map model name -> size for easy lookup
     model_sizes = {"mae": args.mae_size, "ijepa": args.ijepa_size}
+    model_variants = {"mae": args.mae_variant, "ijepa": args.ijepa_variant}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.backends.mps.is_available() and device.type != "cuda":
@@ -266,6 +277,7 @@ def main():
         results, scatters, corruption_fns = evaluate_model(
             model_name=model_name,
             model_size=model_sizes[model_name],
+            model_variant=model_variants[model_name],
             device=device,
             stats_dir=stats_dir,
             dataset=dataset,
@@ -279,12 +291,15 @@ def main():
 
     # Build a tag for filenames, e.g. "both_mae-default_ijepa-twin" or "mae_default"
     if args.model == "both":
-        run_tag = f"both_mae-{args.mae_size}_ijepa-{args.ijepa_size}"
+        mae_tag = args.mae_size if not args.mae_variant else f"{args.mae_size}-{args.mae_variant}"
+        ijepa_tag = args.ijepa_size if not args.ijepa_variant else f"{args.ijepa_size}-{args.ijepa_variant}"
+        run_tag = f"both_mae-{mae_tag}_ijepa-{ijepa_tag}"
     else:
-        run_tag = f"{args.model}_{model_sizes[args.model]}"
+        variant = model_variants[args.model]
+        run_tag = f"{args.model}_{model_sizes[args.model]}" if not variant else f"{args.model}_{model_sizes[args.model]}-{variant}"
 
     plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
-                    corruption_fns, plots_dir, run_tag)
+                    model_variants, corruption_fns, plots_dir, run_tag)
     print_summary(all_results, models_to_run, model_sizes, corruption_fns)
 
 

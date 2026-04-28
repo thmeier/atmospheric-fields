@@ -155,10 +155,34 @@ class MaskedAutoencoderViT(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
         return x_masked, mask, ids_restore
 
-    def forward_encoder(self, x, mask_ratio):
+    def structured_masking(self, x, visible_indices, loss_mask):
+        _, L, D = x.shape
+        ids_keep = visible_indices.long()
+        x_visible = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
+
+        mask = loss_mask.to(device=x.device, dtype=x.dtype)
+        masked_counts = mask.sum(dim=1).to(dtype=torch.int64)
+        if not torch.all(masked_counts == masked_counts[0]):
+            raise ValueError("Structured masking requires a fixed number of masked patches per batch")
+
+        ids_mask = torch.argsort(mask, dim=1, descending=True)[:, :masked_counts[0].item()]
+        ids_shuffle = torch.cat([ids_keep, ids_mask], dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        if ids_restore.shape[1] != L:
+            raise ValueError("Structured masking produced an invalid restore index shape")
+        return x_visible, mask, ids_restore
+
+    def forward_encoder(self, x, mask_ratio=None, visible_indices=None, loss_mask=None):
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        if visible_indices is not None:
+            if loss_mask is None:
+                raise ValueError("loss_mask is required when visible_indices are provided")
+            x, mask, ids_restore = self.structured_masking(x, visible_indices, loss_mask)
+        else:
+            if mask_ratio is None:
+                raise ValueError("mask_ratio is required for random masking")
+            x, mask, ids_restore = self.random_masking(x, mask_ratio)
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
@@ -195,8 +219,13 @@ class MaskedAutoencoderViT(nn.Module):
         x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * self.in_chans))
         return x
 
-    def forward(self, imgs, mask_ratio=0.75):
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+    def forward(self, imgs, mask_ratio=0.75, visible_indices=None, loss_mask=None):
+        latent, mask, ids_restore = self.forward_encoder(
+            imgs,
+            mask_ratio=mask_ratio,
+            visible_indices=visible_indices,
+            loss_mask=loss_mask,
+        )
         pred = self.forward_decoder(latent, ids_restore)
         loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
@@ -790,7 +819,7 @@ def build_ijepa(model_size="tiny", img_size=(128, 256), patch_size=16, in_chans=
         raise ValueError(f"Unknown I-JEPA model size: {model_size}")
     return IJEPA(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **configs[model_size])
 
-def build_mae(model_size="default", img_size=(128, 256), patch_size=16, in_chans=4):
+def build_mae(model_size="twin", img_size=(128, 256), patch_size=16, in_chans=4):
     configs = {
         "default": {
             "embed_dim": 256,

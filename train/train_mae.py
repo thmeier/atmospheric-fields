@@ -10,7 +10,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 
 from utils.dataset import AtmosphereDataset
-from utils.models import MaskedAutoencoderViT
+from utils.model_io import checkpoint_path, save_mae_checkpoint
+from utils.models import build_mae
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
 LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
@@ -53,6 +54,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--stats-chunk-size", type=int, default=64)
+    parser.add_argument("--model-size", choices=["default", "twin"], default="twin")
     parser.add_argument("--recompute-stats", action="store_true", help="Ignore saved normalization stats and recompute them")
     parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
     parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
@@ -154,14 +156,7 @@ def main():
 
     # Initialize Model
     # Small ViT for v1
-    model = MaskedAutoencoderViT(
-        embed_dim=256,
-        depth=6,
-        num_heads=8,
-        decoder_embed_dim=128,
-        decoder_depth=2,
-        decoder_num_heads=4
-    ).to(device)
+    model = build_mae(model_size=args.model_size).to(device)
 
     # Optimizer and Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
@@ -183,8 +178,8 @@ def main():
         # Checkpointing
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            ckpt_path = stats_dir / "best_mae_model.pth"
-            torch.save(model.state_dict(), ckpt_path)
+            ckpt_path = checkpoint_path("mae", args.model_size, stats_dir)
+            save_mae_checkpoint(ckpt_path, model, optimizer, epoch + 1, val_loss, args)
             print(f"  -> Saved best model to {ckpt_path}")
 
     print("\nTraining Complete.")
