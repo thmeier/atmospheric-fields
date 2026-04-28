@@ -66,6 +66,7 @@ class MaskedAutoencoderViT(nn.Module):
         decoder_depth=3,
         decoder_num_heads=4,
         mlp_ratio=4.0,
+        init_std=0.02,
     ):
         super().__init__()
         self.patch_embed = PatchEmbedMAE(img_size, patch_size, in_chans, embed_dim)
@@ -77,12 +78,15 @@ class MaskedAutoencoderViT(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        dpr = [x.item() for x in torch.linspace(0, 0., depth)]  # no drop path by default
+        self.encoder_blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                drop_path=dpr[i],
+            )
+            for i in range(depth)
+        ])
         self.encoder_norm = nn.LayerNorm(embed_dim)
 
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
@@ -98,6 +102,8 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
         self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True)
+
+        self.init_std=init_std
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -107,8 +113,34 @@ class MaskedAutoencoderViT(nn.Module):
             self.decoder_pos_embed.shape[-1], self.grid_size[0], self.grid_size[1], cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(enc_pe).float().unsqueeze(0))
         self.decoder_pos_embed.data.copy_(torch.from_numpy(dec_pe).float().unsqueeze(0))
-        nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.normal_(self.mask_token, std=0.02)
+        # nn.init.normal_(self.cls_token, std=self.init_std)
+        # nn.init.normal_(self.mask_token, std=self.init_std)
+        trunc_normal_(self.cls_token, std=self.init_std)
+        trunc_normal_(self.mask_token, std=self.init_std)
+        # apply same init scheme as in VisionTransformer
+        self.apply(self._init_weights)
+        self.fix_init_weight()
+
+    def fix_init_weight(self):
+        def rescale(param, layer_id):
+            param.div_(math.sqrt(2.0 * layer_id))
+
+        for layer_id, layer in enumerate(self.encoder_blocks):
+            rescale(layer.attn.proj.weight.data, layer_id + 1)
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=self.init_std)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            trunc_normal_(m.weight, std=self.init_std)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def random_masking(self, x, mask_ratio):
         N, L, D = x.shape
@@ -130,7 +162,8 @@ class MaskedAutoencoderViT(nn.Module):
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        x = self.encoder(x)
+        for blk in self.encoder_blocks:
+            x = blk(x)
         x = self.encoder_norm(x)
         return x, mask, ids_restore
 
@@ -174,7 +207,8 @@ class MaskedAutoencoderViT(nn.Module):
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        x = self.encoder(x)
+        for blk in self.encoder_blocks:
+            x = blk(x)
         x = self.encoder_norm(x)
         return x[:, 1:, :].mean(dim=1)
 
@@ -742,11 +776,43 @@ def build_ijepa(model_size="tiny", img_size=(128, 256), patch_size=16, in_chans=
             "predictor_depth": 4,
             "predictor_num_heads": 3,
         },
+        "twin": {
+            # Matches MAE 'twin' encoder exactly
+            "embed_dim": 192,
+            "depth": 8,
+            "num_heads": 3,
+            "predictor_embed_dim": 192,
+            "predictor_depth": 3,
+            "predictor_num_heads": 3,
+        },
     }
     if model_size not in configs:
         raise ValueError(f"Unknown I-JEPA model size: {model_size}")
     return IJEPA(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **configs[model_size])
 
+def build_mae(model_size="default", img_size=(128, 256), patch_size=16, in_chans=4):
+    configs = {
+        "default": {
+            "embed_dim": 256,
+            "depth": 6,
+            "num_heads": 8,
+            "decoder_embed_dim": 128,
+            "decoder_depth": 2,
+            "decoder_num_heads": 4,
+        },
+        "twin": {
+            # Encoder matches IJEPA tiny exactly for fair comparison
+            "embed_dim": 192,
+            "depth": 8,
+            "num_heads": 3,
+            "decoder_embed_dim": 96,
+            "decoder_depth": 2,
+            "decoder_num_heads": 3,
+        },
+    }
+    if model_size not in configs:
+        raise ValueError(f"Unknown MAE model size: {model_size}")
+    return MaskedAutoencoderViT(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **configs[model_size])
 
 if __name__ == "__main__":
     model = MaskedAutoencoderViT()

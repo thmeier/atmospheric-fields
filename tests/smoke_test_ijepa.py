@@ -36,7 +36,7 @@ def main():
     dataset = AtmosphereDataset(LOCAL_DATA_PATH, split="train", stats=(mean, std), lazy=True)
     batch = torch.stack([dataset[i] for i in range(args.batch_size)], dim=0).to(device)
 
-    model = build_model("ijepa", device=device, ijepa_size=args.model_size)
+    model = build_model("ijepa", device=device, model_size=args.model_size)
     mask_generator = MultiBlockMaskGenerator(input_size=(128, 256), patch_size=model.patch_size)
 
     context_masks, target_masks = mask_generator.sample(batch.shape[0], device=device)

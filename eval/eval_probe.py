@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os
 import argparse
 from functools import partial
 import torch
@@ -25,10 +26,11 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 
-def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_size, num_workers, local_flags, n_probe_samples=None):
-    print(f"Loading {model_name.upper()} model...")
-    model = build_model(model_name, device=device, ijepa_size=ijepa_size)
-    ckpt_path = checkpoint_path(model_name, stats_dir)
+def evaluate_model(model_name, model_size, device, stats_dir, dataset, batch_size,
+                   num_workers, local_flags, n_probe_samples=None):
+    print(f"Loading {model_name.upper()} ({model_size}) model...")
+    model = build_model(model_name, device=device, model_size=model_size)
+    ckpt_path = checkpoint_path(model_name, model_size, stats_dir)
     model = load_model_checkpoint(model_name, model, ckpt_path, device)
     model.eval()
 
@@ -41,17 +43,15 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
         "Channel Rotation": apply_wind_channel_rotation,
     }
 
-    print(f"\n--- Validation Protocol 1: Linear Regression Probe (Continuous Severity Regression, {model_name.upper()}) ---")
+    print(f"\n--- Linear Probe ({model_name.upper()}, {model_size}) ---")
 
     default_n = 50 if local_flags["local"] else (250 if local_flags["large_local"] else 1000)
     n_samples = n_probe_samples if n_probe_samples is not None else default_n
     indices = np.random.choice(len(dataset), min(n_samples, len(dataset)), replace=False)
     subset = Subset(dataset, indices.tolist())
     loader_kwargs = {
-        "batch_size": batch_size,
-        "shuffle": False,
-        "num_workers": num_workers,
-        "pin_memory": device.type == "cuda",
+        "batch_size": batch_size, "shuffle": False,
+        "num_workers": num_workers, "pin_memory": device.type == "cuda",
     }
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
@@ -61,134 +61,211 @@ def evaluate_model(model_name, ijepa_size, device, stats_dir, dataset, batch_siz
     results = {}
     scatters = {}
     for corr_name, apply_fn in corruption_fns.items():
-        print(f"\n--- Corruption: {corr_name} ---")
-        x_z = []
-        y_severity = []
-
-        print(f"Extracting latents for {len(indices)} samples with independent random severities...")
+        print(f"\n  Corruption: {corr_name}")
+        x_z, y_severity = [], []
         with torch.no_grad():
             for base_img in subset_loader:
                 base_img = base_img.to(device, non_blocking=device.type == "cuda")
-                batch_len = base_img.shape[0]
-                for j in range(batch_len):
+                for j in range(base_img.shape[0]):
                     sev = np.random.uniform(0.0, MAX_SEVERITY)
-                    corrupted = apply_fn(base_img[j:j + 1], severity=sev)
+                    corrupted = apply_fn(base_img[j:j+1], severity=sev)
                     x_z.append(model.extract_features(corrupted).cpu())
                     y_severity.append(sev)
 
         x_z = torch.cat(x_z, dim=0)
         y_severity = torch.tensor(y_severity, dtype=torch.float32).unsqueeze(1)
-        print(f"Extracted feature matrix: {x_z.shape}")
 
         split_idx = max(1, int(0.8 * x_z.shape[0]))
         perm = torch.randperm(x_z.shape[0])
-        train_idx = perm[:split_idx]
-        test_idx = perm[split_idx:]
+        train_idx, test_idx = perm[:split_idx], perm[split_idx:]
         if test_idx.numel() == 0:
             test_idx = train_idx
 
-        x_train = x_z[train_idx]
-        y_train = y_severity[train_idx]
-        x_test = x_z[test_idx]
-        y_test = y_severity[test_idx]
+        x_train, y_train = x_z[train_idx], y_severity[train_idx]
+        x_test, y_test = x_z[test_idx], y_severity[test_idx]
 
         probe = torch.nn.Linear(x_train.shape[1], 1).to(device)
-
         optimizer = torch.optim.Adam(probe.parameters(), lr=1e-3)
         probe_batch_size = min(64, x_train.shape[0])
-        x_train_d = x_train.to(device)
-        y_train_d = y_train.to(device)
+        x_train_d, y_train_d = x_train.to(device), y_train.to(device)
         x_test_d = x_test.to(device)
 
         probe.train()
         for epoch in range(200):
-            perm_epoch = torch.randperm(x_train_d.shape[0], device=device)
-            epoch_loss = 0.0
-            n_batches = 0
+            perm_e = torch.randperm(x_train_d.shape[0], device=device)
+            epoch_loss, n_batches = 0.0, 0
             for i in range(0, x_train_d.shape[0], probe_batch_size):
-                idx = perm_epoch[i:i + probe_batch_size]
-                pred = probe(x_train_d[idx])
-                loss = torch.nn.functional.mse_loss(pred, y_train_d[idx])
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-                n_batches += 1
+                idx = perm_e[i:i+probe_batch_size]
+                loss = torch.nn.functional.mse_loss(probe(x_train_d[idx]), y_train_d[idx])
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                epoch_loss += loss.item(); n_batches += 1
             if (epoch + 1) % 50 == 0:
-                print(f"  Probe epoch {epoch+1}/200, train MSE: {epoch_loss/n_batches:.4f}")
+                print(f"    Probe epoch {epoch+1}/200, train MSE: {epoch_loss/n_batches:.4f}")
 
         probe.eval()
         with torch.no_grad():
             y_pred = probe(x_test_d).cpu()
-        y_true = y_test.cpu()
-
-        mse = torch.mean((y_pred - y_true) ** 2).item()
-        y_var = torch.var(y_true).item()
+        mse = torch.mean((y_pred - y_test) ** 2).item()
+        y_var = torch.var(y_test).item()
         r2 = 1 - mse / y_var if y_var > 0 else 0.0
-        print(f"\nLinear Probe Results ({corr_name}, continuous severity):")
-        print(f"  MSE: {mse:.4f}")
-        print(f"  R^2: {r2:.4f}")
-
+        print(f"    MSE: {mse:.4f} | R²: {r2:.4f}")
         results[corr_name] = {"mse": mse, "r2": r2}
         scatters[corr_name] = {
-            "y_true": y_true.numpy().flatten(),
+            "y_true": y_test.numpy().flatten(),
             "y_pred": y_pred.numpy().flatten(),
         }
 
     return results, scatters, corruption_fns
 
+
+def plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
+                    corruption_fns, plots_dir, run_tag):
+    import matplotlib.pyplot as plt
+
+    corr_names = list(corruption_fns.keys())
+    x = np.arange(len(corr_names))
+    width = 0.35
+    labels = [f"{m.upper()} ({model_sizes[m]})" for m in models_to_run]
+    colors = ["steelblue", "darkorange"]
+
+    # R² bar chart + delta
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    r2_values = [[all_results[m][c]["r2"] for c in corr_names] for m in models_to_run]
+    for i, (r2s, label, color) in enumerate(zip(r2_values, labels, colors)):
+        offset = (i - 0.5) * width
+        axes[0].bar(x + offset, r2s, width=width, label=label, color=color)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(corr_names, rotation=30, ha="right")
+    axes[0].set_ylabel("$R^2$")
+    axes[0].set_title(f"Linear Probe Severity Prediction ({' vs '.join(labels)})")
+    axes[0].legend(); axes[0].grid(True, axis="y", alpha=0.3)
+
+    if len(models_to_run) == 2:
+        m0, m1 = models_to_run
+        improvement = np.array(r2_values[1]) - np.array(r2_values[0])
+        axes[1].bar(x, improvement,
+                    color=["darkorange" if v >= 0 else "firebrick" for v in improvement])
+        axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1)
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(corr_names, rotation=30, ha="right")
+        axes[1].set_ylabel(f"{labels[1]} $R^2$ − {labels[0]} $R^2$")
+        axes[1].set_title("Probe Comparison Delta"); axes[1].grid(True, axis="y", alpha=0.3)
+    else:
+        axes[1].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(plots_dir / f"probe_comparison_{run_tag}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Scatter plots
+    fig, axes = plt.subplots(
+        len(models_to_run), len(corr_names),
+        figsize=(7 * len(corr_names), 6 * len(models_to_run))
+    )
+    if len(models_to_run) == 1:
+        axes = np.expand_dims(axes, axis=0)
+    if len(corr_names) == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    for row_idx, m in enumerate(models_to_run):
+        for col_idx, corr_name in enumerate(corr_names):
+            ax = axes[row_idx, col_idx]
+            y_true = all_scatters[m][corr_name]["y_true"]
+            y_pred = all_scatters[m][corr_name]["y_pred"]
+            r2 = all_results[m][corr_name]["r2"]
+            ax.scatter(y_true, y_pred, alpha=0.3, s=10, color=colors[row_idx])
+            lims = [0, MAX_SEVERITY]
+            ax.plot(lims, lims, "k--", alpha=0.5, label="Perfect")
+            fit = np.polyfit(y_true, y_pred, 1)
+            fit_x = np.linspace(0, MAX_SEVERITY, 100)
+            ax.plot(fit_x, np.polyval(fit, fit_x), "r-", lw=2,
+                    label=f"slope={fit[0]:.2f}")
+            ax.set_xlim(lims); ax.set_ylim(lims)
+            ax.set_title(f"{labels[row_idx]} | {corr_name}\n$R^2$={r2:.4f}")
+            ax.set_xlabel("True Severity"); ax.set_ylabel("Predicted Severity")
+            ax.grid(True, alpha=0.3)
+            if col_idx == 0:
+                ax.legend(loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(plots_dir / f"probe_scatter_{run_tag}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plots with tag '{run_tag}' to {plots_dir}")
+
+
+def print_summary(all_results, models_to_run, model_sizes, corruption_fns):
+    labels = [f"{m.upper()} ({model_sizes[m]})" for m in models_to_run]
+    col_w = 12
+    print("\n" + "=" * 80)
+    print("PROBE EVALUATION SUMMARY")
+    print("=" * 80)
+    header = f"  {'Corruption':<30}" + "".join(f"{l:>{col_w}}" for l in labels)
+    if len(models_to_run) == 2:
+        header += f"  {'Delta':>{col_w}}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for corr_name in corruption_fns.keys():
+        r2s = [all_results[m][corr_name]["r2"] for m in models_to_run]
+        row = f"  {corr_name:<30}" + "".join(f"{r:>{col_w}.4f}" for r in r2s)
+        if len(models_to_run) == 2:
+            row += f"  {r2s[1] - r2s[0]:>+{col_w}.4f}"
+        print(row)
+    print("=" * 80)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa", "both"], default="mae")
-    parser.add_argument("--ijepa-size", choices=["tiny", "small"], default="tiny")
+    # Per-model size flags for the mixed comparison (mae default vs ijepa small)
+    parser.add_argument("--mae-size", choices=["default", "twin"], default="default")
+    parser.add_argument("--ijepa-size", choices=["tiny", "small", "twin"], default="tiny")
+    # Convenience flag: sets both to twin
+    parser.add_argument("--twin", action="store_true",
+                        help="Shorthand for --mae-size twin --ijepa-size twin")
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--large-local", action="store_true")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
-    parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
+    parser.add_argument("--lazy", dest="lazy", action="store_true")
+    parser.add_argument("--eager", dest="lazy", action="store_false")
     parser.set_defaults(lazy=None)
     parser.add_argument("--n-probe-samples", type=int, default=None)
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if torch.backends.mps.is_available() and device.type != 'cuda':
-        device = torch.device('cpu')
+    if args.twin:
+        args.mae_size = "twin"
+        args.ijepa_size = "twin"
+
+    # Map model name -> size for easy lookup
+    model_sizes = {"mae": args.mae_size, "ijepa": args.ijepa_size}
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available() and device.type != "cuda":
+        device = torch.device("cpu")
 
     if args.local and args.large_local:
         raise ValueError("Use only one of --local or --large-local.")
-
-    if args.local:
-        data_path = LOCAL_DATA_PATH
-    elif args.large_local:
-        data_path = LARGE_LOCAL_DATA_PATH
-    else:
-        data_path = CLUSTER_DATA_PATH
-
+    data_path = LOCAL_DATA_PATH if args.local else (
+        LARGE_LOCAL_DATA_PATH if args.large_local else CLUSTER_DATA_PATH)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
 
-    print("Loading data stats...")
     stats_dir = Path("checkpoints")
-    mean = np.load(stats_dir / "data_mean.npy")
-    std = np.load(stats_dir / "data_std.npy")
-    stats = (mean, std)
-
+    stats = (np.load(stats_dir / "data_mean.npy"), np.load(stats_dir / "data_std.npy"))
     lazy_load = (not args.local) if args.lazy is None else args.lazy
     num_workers = 0 if args.num_workers is None else args.num_workers
     dataset = AtmosphereDataset(data_path, split="val", stats=stats, lazy=lazy_load)
 
-    import matplotlib.pyplot as plt
-    plots_dir = Path("plots") if (args.local or args.large_local) else Path("/work/scratch/ddemler/plots")
+    plots_dir = Path("plots") if (args.local or args.large_local) else Path(f"/work/scratch/{os.environ['USER']}/plots")
     plots_dir.mkdir(parents=True, exist_ok=True)
+
     models_to_run = ["mae", "ijepa"] if args.model == "both" else [args.model]
-    all_results = {}
-    all_scatters = {}
-    corruption_fns = None
+    all_results, all_scatters, corruption_fns = {}, {}, None
+
     for model_name in models_to_run:
         results, scatters, corruption_fns = evaluate_model(
             model_name=model_name,
-            ijepa_size=args.ijepa_size,
+            model_size=model_sizes[model_name],
             device=device,
             stats_dir=stats_dir,
             dataset=dataset,
@@ -200,131 +277,16 @@ def main():
         all_results[model_name] = results
         all_scatters[model_name] = scatters
 
+    # Build a tag for filenames, e.g. "both_mae-default_ijepa-twin" or "mae_default"
     if args.model == "both":
-        fig, axes = plt.subplots(1, 2, figsize=(18, 6))
-        corr_names = list(corruption_fns.keys())
-        x = np.arange(len(corr_names))
-        width = 0.35
-        mae_r2 = [all_results["mae"][name]["r2"] for name in corr_names]
-        ijepa_r2 = [all_results["ijepa"][name]["r2"] for name in corr_names]
-        axes[0].bar(x - width / 2, mae_r2, width=width, label="MAE", color="steelblue")
-        axes[0].bar(x + width / 2, ijepa_r2, width=width, label="IJEPA", color="darkorange")
-        axes[0].set_xticks(x)
-        axes[0].set_xticklabels(corr_names, rotation=30, ha="right")
-        axes[0].set_ylabel("$R^2$")
-        axes[0].set_title("Linear Probe Severity Prediction (MAE vs IJEPA)")
-        axes[0].legend()
-        axes[0].grid(True, axis="y", alpha=0.3)
-
-        improvement = np.array(ijepa_r2) - np.array(mae_r2)
-        axes[1].bar(x, improvement, color=["darkorange" if val >= 0 else "firebrick" for val in improvement])
-        axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1)
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(corr_names, rotation=30, ha="right")
-        axes[1].set_ylabel("IJEPA $R^2$ - MAE $R^2$")
-        axes[1].set_title("Probe Comparison Delta by Corruption")
-        axes[1].grid(True, axis="y", alpha=0.3)
-
-        fig.tight_layout()
-        plot_path = plots_dir / "probe_comparison_both.png"
-        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved comparison plot to {plot_path}")
-
-        fig, axes = plt.subplots(len(models_to_run), len(corruption_fns), figsize=(7 * len(corruption_fns), 6 * len(models_to_run)))
-        if len(models_to_run) == 1:
-            axes = np.expand_dims(axes, axis=0)
-        if len(corruption_fns) == 1:
-            axes = np.expand_dims(axes, axis=1)
-
-        for row_idx, model_name in enumerate(models_to_run):
-            for col_idx, corr_name in enumerate(corruption_fns.keys()):
-                ax = axes[row_idx, col_idx]
-                y_true_np = all_scatters[model_name][corr_name]["y_true"]
-                y_pred_np = all_scatters[model_name][corr_name]["y_pred"]
-                r2 = all_results[model_name][corr_name]["r2"]
-
-                ax.scatter(y_true_np, y_pred_np, alpha=0.3, s=10, color="steelblue")
-                lims = [0, MAX_SEVERITY]
-                ax.plot(lims, lims, 'k--', alpha=0.5, label='Perfect prediction')
-
-                fit = np.polyfit(y_true_np, y_pred_np, 1)
-                fit_x = np.linspace(0, MAX_SEVERITY, 100)
-                ax.plot(fit_x, np.polyval(fit, fit_x), 'r-', linewidth=2, label=f'Best fit (slope={fit[0]:.2f})')
-
-                ax.set_xlim(lims)
-                ax.set_ylim(lims)
-                ax.set_title(f"{model_name.upper()} | {corr_name}\n$R^2$ = {r2:.4f} (linear probe)")
-                ax.set_xlabel("True Severity")
-                ax.set_ylabel("Predicted Severity")
-                ax.grid(True, alpha=0.3)
-                if col_idx == 0:
-                    ax.legend(loc="upper left")
-
-        fig.tight_layout()
-        scatter_path = plots_dir / "probe_scatter_combined_both.png"
-        fig.savefig(scatter_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved combined scatter plot to {scatter_path}")
-
-        # ── Summary table ──
-        print("\n" + "=" * 80)
-        print("PROBE EVALUATION SUMMARY")
-        print("=" * 80)
-        header = f"  {'Corruption':<30} {'MAE R²':>10} {'IJEPA R²':>10} {'Delta':>10}"
-        print(header)
-        print("  " + "-" * (len(header) - 2))
-        for corr_name in corruption_fns.keys():
-            mae_r2 = all_results["mae"][corr_name]["r2"]
-            ij_r2 = all_results["ijepa"][corr_name]["r2"]
-            print(f"  {corr_name:<30} {mae_r2:10.4f} {ij_r2:10.4f} {ij_r2 - mae_r2:+10.4f}")
-        print("=" * 80)
+        run_tag = f"both_mae-{args.mae_size}_ijepa-{args.ijepa_size}"
     else:
-        fig, axes = plt.subplots(1, len(corruption_fns), figsize=(7 * len(corruption_fns), 6))
-        if len(corruption_fns) == 1:
-            axes = [axes]
+        run_tag = f"{args.model}_{model_sizes[args.model]}"
 
-        model_name = models_to_run[0]
-        for ax, corr_name in zip(axes, corruption_fns.keys()):
-            y_true_np = all_scatters[model_name][corr_name]["y_true"]
-            y_pred_np = all_scatters[model_name][corr_name]["y_pred"]
-            r2 = all_results[model_name][corr_name]["r2"]
+    plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
+                    corruption_fns, plots_dir, run_tag)
+    print_summary(all_results, models_to_run, model_sizes, corruption_fns)
 
-            ax.scatter(y_true_np, y_pred_np, alpha=0.3, s=10, color="steelblue")
-            lims = [0, MAX_SEVERITY]
-            ax.plot(lims, lims, 'k--', alpha=0.5, label='Perfect prediction')
-
-            fit = np.polyfit(y_true_np, y_pred_np, 1)
-            fit_x = np.linspace(0, MAX_SEVERITY, 100)
-            ax.plot(fit_x, np.polyval(fit, fit_x), 'r-', linewidth=2, label=f'Best fit (slope={fit[0]:.2f})')
-
-            ax.set_xlim(lims)
-            ax.set_ylim(lims)
-            ax.set_title(f"Linear Probe ({model_name.upper()}): {corr_name}\n$R^2$ = {r2:.4f}")
-            ax.set_xlabel("True Severity")
-            ax.set_ylabel("Predicted Severity")
-            ax.legend(loc="upper left")
-            ax.grid(True, alpha=0.3)
-
-        fig.tight_layout()
-        plot_path = plots_dir / f"probe_scatter_combined_{args.model}.png"
-        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved combined scatter plot to {plot_path}")
-
-        # ── Summary table ──
-        print("\n" + "=" * 80)
-        print("PROBE EVALUATION SUMMARY")
-        print("=" * 80)
-        print(f"\nModel: {model_name.upper()}")
-        header = f"  {'Corruption':<30} {'R²':>10} {'MSE':>10}"
-        print(header)
-        print("  " + "-" * (len(header) - 2))
-        for corr_name in corruption_fns.keys():
-            r2 = all_results[model_name][corr_name]["r2"]
-            mse = all_results[model_name][corr_name]["mse"]
-            print(f"  {corr_name:<30} {r2:10.4f} {mse:10.4f}")
-        print("=" * 80)
 
 if __name__ == "__main__":
     main()

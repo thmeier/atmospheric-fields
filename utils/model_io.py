@@ -1,34 +1,34 @@
-from pathlib import Path
-
 import torch
+from pathlib import Path
+from .models import build_mae, build_ijepa
 
-from .models import MaskedAutoencoderViT, build_ijepa
 
-
-def build_model(model_name, device, ijepa_size="tiny"):
+def build_model(model_name, device, model_size):
     if model_name == "mae":
-        model = MaskedAutoencoderViT(
-            embed_dim=256,
-            depth=6,
-            num_heads=8,
-            decoder_embed_dim=128,
-            decoder_depth=2,
-            decoder_num_heads=4,
-        )
+        model = build_mae(model_size=model_size)
     elif model_name == "ijepa":
-        model = build_ijepa(model_size=ijepa_size)
+        model = build_ijepa(model_size=model_size)
     else:
         raise ValueError(f"Unknown model: {model_name}")
     return model.to(device)
 
 
-def checkpoint_path(model_name, checkpoint_dir=Path("checkpoints")):
-    if model_name == "mae":
-        return checkpoint_dir / "best_mae_model.pth"
-    if model_name == "ijepa":
-        return checkpoint_dir / "best_ijepa_model.pth"
+def checkpoint_path(model_name, model_size, checkpoint_dir=Path("checkpoints")):
+    if model_name in ("mae", "ijepa"):
+        return checkpoint_dir / f"best_{model_name}_model_{model_size}.pth"
     raise ValueError(f"Unknown model: {model_name}")
 
+def save_mae_checkpoint(path, model, optimizer, epoch, val_loss, args):
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "config": vars(args),
+        },
+        path,
+    )
 
 def save_ijepa_checkpoint(path, model, optimizer, epoch, val_loss, args):
     torch.save(
@@ -46,10 +46,15 @@ def save_ijepa_checkpoint(path, model, optimizer, epoch, val_loss, args):
 
 
 def load_model_checkpoint(model_name, model, path, device):
+    checkpoint = torch.load(path, map_location=device)
+    print(f"loading path {path}")
     if model_name == "mae":
-        model.load_state_dict(torch.load(path, map_location=device))
+        # Support both old format (raw state dict) and new format (dict with "model" key)
+        state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
         return model
 
+    # IJEPA
     checkpoint = torch.load(path, map_location=device)
     model.context_encoder.load_state_dict(checkpoint["context_encoder"])
     model.target_encoder.load_state_dict(checkpoint["target_encoder"])
