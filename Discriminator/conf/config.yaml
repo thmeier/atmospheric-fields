@@ -12,7 +12,9 @@ variables:
   - "u_component_of_wind"
   - "v_component_of_wind"
   - "specific_humidity"
-selected_variable: "temperature"
+selected_variable: "u_component_of_wind"
+#selected_variable: "temperature"
+#selected_variable: "specific_humidity"
 level: 850
 
 # Training Time Ranges
@@ -39,6 +41,11 @@ learning_rate: 1e-4
 #model_name: "resnet18"
 model_name: "squeezenet"
 num_workers: 4
+#augment: false
+augment: true
+augment_prob: 0.5
+disturb_type: null
+disturb_level: 0.0
 precision: "16-mixed"
 project_name: "weather-discriminator"
 output_dir: "results"
@@ -46,10 +53,10 @@ output_dir: "results"
 # For comparative analysis
 comparison_files:
   "GraphCast": "${data_dir}/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  #"PanguWeather": "${data_dir}/pangu_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "PanguWeather": "${data_dir}/pangu_6steps_1.5deg_2020-01-01_2020-12-31.nc"
   "IFS HRES": "${data_dir}/ifs-hres_6steps_1.5deg_2020-01-01_2020-12-31.nc"
   "FuXi": "${data_dir}/fuxi_6steps_1.5deg_2020-01-01_2020-12-31.nc"
   "NeuralGCM": "${data_dir}/neuralgcm_6steps_1.5deg_2020-01-01_2020-12-31.nc"
   "SphericalCNN": "${data_dir}/spherical-cnn_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "Kesler": "${data_dir}/kesler_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "Keisler": "${data_dir}/keisler_6steps_1.5deg_2020-01-01_2020-12-31.nc"
   "ERA5 Forecast": "${data_dir}/era5-forecast_6steps_1.5deg_2020-01-01_2020-12-31.nc"

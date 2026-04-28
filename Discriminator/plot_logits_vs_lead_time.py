@@ -81,7 +81,7 @@ def run_inference(dataset, model, cfg, device, desc="Inference"):
 def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     real_ds_global = xr.open_dataset(cfg.test_real_nc_file)
-    model_vars = list(cfg.variables)
+    model_vars = [cfg.selected_variable]
     
     # Slice ERA5 to test ranges
     combined_real = []
@@ -102,7 +102,7 @@ def main(cfg: DictConfig):
             stds[v] = 1.0
     
     model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
-    model.model.load_state_dict(torch.load(os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_lightning.pth"), map_location=device))
+    model.model.load_state_dict(torch.load(os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{cfg.selected_variable}_lightning.pth"), map_location=device))
     model.eval()
 
     plt.figure(figsize=(10, 6))
@@ -118,6 +118,12 @@ def main(cfg: DictConfig):
             continue
         fake_ds = xr.open_dataset(path)
         
+        # Check if selected variable is in dataset
+        if cfg.selected_variable not in fake_ds.data_vars:
+            print(f"Skipping {label}: Variable {cfg.selected_variable} not found.")
+            fake_ds.close()
+            continue
+            
         # Slice fake to test range
         curr_fake = fake_ds.sel(time=slice(cfg.test_fake_range[0], cfg.test_fake_range[1]))
         if len(curr_fake.time) == 0:

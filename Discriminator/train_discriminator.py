@@ -12,9 +12,49 @@ import pytorch_lightning as L
 from pytorch_lightning.loggers import WandbLogger
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from scipy.ndimage import gaussian_filter
 
 # Load environment variables from .env file
 load_dotenv("../wandb_info.env")
+
+# ==========================================
+# 0. Disturbance Functions (Data Augmentation)
+# ==========================================
+
+def apply_gaussian_blur(data, sigma):
+    if sigma <= 0: return data
+    return gaussian_filter(data, sigma=sigma)
+
+def apply_hf_noise(data, std_dev):
+    if std_dev <= 0: return data
+    noise = np.random.normal(0, std_dev, data.shape)
+    return data + noise
+
+def apply_grf_noise(data, amplitude, length_scale=2.0):
+    if amplitude <= 0: return data
+    white_noise = np.random.normal(0, 1, data.shape)
+    grf = gaussian_filter(white_noise, sigma=length_scale)
+    grf = (grf - grf.mean()) / (grf.std() + 1e-8)
+    return data + amplitude * grf
+
+def apply_pixel_replace(data, fraction):
+    if fraction <= 0: return data
+    flat_data = data.flatten()
+    n_replace = int(fraction * len(flat_data))
+    indices = np.random.choice(len(flat_data), n_replace, replace=False)
+    flat_data[indices] = np.random.normal(np.mean(data), np.std(data), n_replace)
+    return flat_data.reshape(data.shape)
+
+def apply_disturbance(data, dtype, level, data_std=1.0):
+    if dtype == "blur":
+        return apply_gaussian_blur(data, level)
+    elif dtype == "noise":
+        return apply_hf_noise(data, level * data_std)
+    elif dtype == "grf":
+        return apply_grf_noise(data, level * data_std)
+    elif dtype == "replace":
+        return apply_pixel_replace(data, level)
+    return data
 
 # ==========================================
 # 1. Dataset Definition
@@ -22,9 +62,15 @@ load_dotenv("../wandb_info.env")
 class WeatherDiscriminatorDataset(Dataset):
     def __init__(self, real_nc_path, fake_nc_path, variables, 
                  real_range=None, fake_range=None, lead_times=None, level=None, 
-                 means=None, stds=None, balanced=True):
+                 means=None, stds=None, balanced=True,
+                 augment=False, augment_prob=0.5, disturb_type=None, disturb_level=0.0):
         self.variables = variables
         self.balanced = balanced
+        self.augment = augment
+        self.augment_prob = augment_prob
+        self.disturb_type = disturb_type
+        self.disturb_level = disturb_level
+        
         self.real_ds = xr.open_dataset(real_nc_path)
         self.fake_ds = xr.open_dataset(fake_nc_path)
         
@@ -131,10 +177,33 @@ class WeatherDiscriminatorDataset(Dataset):
             ds_slice = ds_slice.isel(prediction_timedelta=l_idx)
 
         channels = []
+        any_disturbed = False
         for v in self.variables:
             if v in ds_slice.data_vars:
-                val = ds_slice[v].values.astype(np.float32)
-                norm = (val - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0)
+                raw_val = ds_slice[v].values.astype(np.float32)
+                
+                # Apply Disturbance/Augmentation
+                applied = False
+                if self.disturb_type is not None and self.disturb_level > 0:
+                    raw_val = apply_disturbance(raw_val, self.disturb_type, self.disturb_level, self.stds[v])
+                    applied = True
+                elif self.augment and np.random.random() < self.augment_prob:
+                    dtype = np.random.choice(["blur", "noise", "grf", "replace"])
+                    # Define max ranges (matching severities from plot_logits_vs_disturbance.py)
+                    max_ranges = {"blur": 3.0, "noise": 0.5, "grf": 0.5, "replace": 0.2}
+                    # Sample intensity using a power law (u^2) to bias towards mild augmentations
+                    # This ensures most augmentations are mild, but some are more severe.
+                    u = np.random.random()
+                    level = max_ranges[dtype] * (u ** 2)
+                    
+                    if level > 0:
+                        raw_val = apply_disturbance(raw_val, dtype, level, self.stds[v])
+                        applied = True
+                
+                if applied:
+                    any_disturbed = True
+
+                norm = (raw_val - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0)
                 channels.append(np.nan_to_num(norm, nan=0.0))
             else:
                 # Zero-fill missing variables to maintain channel count
@@ -142,6 +211,9 @@ class WeatherDiscriminatorDataset(Dataset):
                 ref_shape = ds_slice.temperature.shape if 'temperature' in ds_slice.data_vars else list(ds_slice.data_vars.values())[0].shape
                 channels.append(np.zeros(ref_shape, dtype=np.float32))
             
+        if any_disturbed:
+            label = torch.tensor([0.0], dtype=torch.float32)
+
         return torch.tensor(np.stack(channels), dtype=torch.float32), label
 
 # ==========================================
@@ -208,7 +280,7 @@ class WeatherDiscriminator(L.LightningModule):
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    vars_to_use = list(cfg.variables)
+    vars_to_use = [cfg.selected_variable]
     real_path, fake_path = cfg.real_nc_file, cfg.fake_nc_file
     
     dataset = WeatherDiscriminatorDataset(
@@ -217,7 +289,9 @@ def main(cfg: DictConfig):
         fake_range=cfg.train_fake_range,
         lead_times=cfg.lead_times,
         level=cfg.get("level"),
-        balanced=True
+        balanced=True,
+        augment=cfg.get("augment", False),
+        augment_prob=cfg.get("augment_prob", 0.5)
     )
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     
@@ -233,7 +307,7 @@ def main(cfg: DictConfig):
     trainer.fit(model, dataloader)
 
     os.makedirs(cfg.output_dir, exist_ok=True)
-    save_path = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_lightning.pth")
+    save_path = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{cfg.selected_variable}_lightning.pth")
     torch.save(model.model.state_dict(), save_path)
     print(f"Weights saved to {save_path}")
 

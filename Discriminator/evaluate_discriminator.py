@@ -21,20 +21,27 @@ def evaluate_and_visualize(cfg: DictConfig):
     real_nc_file = cfg.test_real_nc_file
     fake_nc_file = cfg.test_fake_nc_file
     
-    model_weights = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_lightning.pth")
-    model_vars = list(cfg.variables)
+    model_weights = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{cfg.selected_variable}_lightning.pth")
+    model_vars = [cfg.selected_variable]
     
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Evaluating on device: {device}")
 
     # --- Setup Data and Model ---
+    with xr.open_dataset(real_nc_file) as r_ds, xr.open_dataset(fake_nc_file) as f_ds:
+        if cfg.selected_variable not in r_ds.data_vars or cfg.selected_variable not in f_ds.data_vars:
+            print(f"Skipping evaluation: {cfg.selected_variable} not found in both datasets.")
+            return
+
     test_dataset = WeatherDiscriminatorDataset(
         real_nc_file, fake_nc_file, model_vars,
         real_range=cfg.test_real_ranges,
         fake_range=cfg.test_fake_range,
         lead_times=cfg.lead_times,
         level=cfg.get("level"),
-        balanced=False
+        balanced=False,
+        disturb_type=cfg.get("disturb_type", None),
+        disturb_level=cfg.get("disturb_level", 0.0)
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
