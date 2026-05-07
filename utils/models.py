@@ -1,10 +1,27 @@
 import math
+import os
 from functools import partial
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
+
+
+def _pool_patch_tokens(x):
+    """Reduce patch-token sequence (B, N, D) to image vector (B, D).
+
+    Mode is read from the EXTRACT_FEATURES_POOLING env var per call so eval
+    scripts can toggle without rebuilding the model. Defaults to "mean".
+    """
+    mode = os.environ.get("EXTRACT_FEATURES_POOLING", "mean").lower()
+    if mode == "mean":
+        return x.mean(dim=1)
+    if mode == "max":
+        return x.amax(dim=1)
+    raise ValueError(
+        f"EXTRACT_FEATURES_POOLING={mode!r} not understood; expected 'mean' or 'max'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +256,7 @@ class MaskedAutoencoderViT(nn.Module):
         for blk in self.encoder_blocks:
             x = blk(x)
         x = self.encoder_norm(x)
-        return x[:, 1:, :].mean(dim=1)
+        return _pool_patch_tokens(x[:, 1:, :])
 
 
 # ===========================================================================
@@ -701,7 +718,7 @@ class VisionTransformer(nn.Module):
         return x
 
     def extract_features(self, x):
-        return self.forward(x).mean(dim=1)
+        return _pool_patch_tokens(self.forward(x))
 
 
 # Alias used elsewhere

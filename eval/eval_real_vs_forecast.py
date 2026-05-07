@@ -13,6 +13,7 @@ Usage (local, full):
     /opt/miniconda3/envs/pmlr/bin/python eval/eval_real_vs_forecast.py --local --n-samples 500
 """
 
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -402,6 +403,7 @@ def main():
     if args.variant:
         tag_parts.append(args.variant)
     tag_parts.append(f"n{n_pangu}_seed{args.seed}")
+    tag_parts.append(f"pool-{os.environ.get('EXTRACT_FEATURES_POOLING', 'mean').lower()}")
     run_tag = "_".join(tag_parts)
 
     if args.output_dir:

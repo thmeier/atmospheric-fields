@@ -338,6 +338,7 @@ def main():
     else:
         variant = model_variants[args.model]
         run_tag = f"{args.model}_{model_sizes[args.model]}" if not variant else f"{args.model}_{model_sizes[args.model]}-{variant}"
+    run_tag += f"_pool-{os.environ.get('EXTRACT_FEATURES_POOLING', 'mean').lower()}"
 
     plot_distances(all_results, models_to_run, model_sizes, model_variants, ladders, plots_dir, run_tag)
     print_summary(all_results, models_to_run, model_sizes)
