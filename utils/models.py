@@ -787,7 +787,24 @@ class IJEPA(nn.Module):
         return self.context_encoder
 
 
-def build_ijepa(model_size="tiny", img_size=(128, 256), patch_size=16, in_chans=4):
+def _auto_num_heads(embed_dim, target_head_dim=64):
+    """Pick num_heads so head_dim is close to `target_head_dim` and divides embed_dim."""
+    n = max(1, embed_dim // target_head_dim)
+    while n > 1 and embed_dim % n != 0:
+        n -= 1
+    return n
+
+
+def build_ijepa(
+    model_size="tiny",
+    img_size=(128, 256),
+    patch_size=16,
+    in_chans=4,
+    embed_dim=None,
+    num_heads=None,
+    depth=None,
+    predictor_embed_dim=None,
+):
     configs = {
         "tiny": {
             "embed_dim": 192,
@@ -817,9 +834,34 @@ def build_ijepa(model_size="tiny", img_size=(128, 256), patch_size=16, in_chans=
     }
     if model_size not in configs:
         raise ValueError(f"Unknown I-JEPA model size: {model_size}")
-    return IJEPA(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **configs[model_size])
+    cfg = dict(configs[model_size])
+    if embed_dim is not None:
+        cfg["embed_dim"] = embed_dim
+        if num_heads is None:
+            cfg["num_heads"] = _auto_num_heads(embed_dim)
+    if num_heads is not None:
+        cfg["num_heads"] = num_heads
+    if depth is not None:
+        cfg["depth"] = depth
+    if predictor_embed_dim is not None:
+        cfg["predictor_embed_dim"] = predictor_embed_dim
+    if cfg["embed_dim"] % cfg["num_heads"] != 0:
+        raise ValueError(
+            f"embed_dim ({cfg['embed_dim']}) must be divisible by num_heads ({cfg['num_heads']})"
+        )
+    return IJEPA(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **cfg)
 
-def build_mae(model_size="twin", img_size=(128, 256), patch_size=16, in_chans=4):
+
+def build_mae(
+    model_size="twin",
+    img_size=(128, 256),
+    patch_size=16,
+    in_chans=4,
+    embed_dim=None,
+    num_heads=None,
+    depth=None,
+    decoder_embed_dim=None,
+):
     configs = {
         "default": {
             "embed_dim": 256,
@@ -841,7 +883,31 @@ def build_mae(model_size="twin", img_size=(128, 256), patch_size=16, in_chans=4)
     }
     if model_size not in configs:
         raise ValueError(f"Unknown MAE model size: {model_size}")
-    return MaskedAutoencoderViT(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **configs[model_size])
+    cfg = dict(configs[model_size])
+    if embed_dim is not None:
+        cfg["embed_dim"] = embed_dim
+        if num_heads is None:
+            cfg["num_heads"] = _auto_num_heads(embed_dim)
+        if decoder_embed_dim is None:
+            cfg["decoder_embed_dim"] = max(64, embed_dim // 2)
+            cfg["decoder_num_heads"] = _auto_num_heads(cfg["decoder_embed_dim"], target_head_dim=32)
+    if num_heads is not None:
+        cfg["num_heads"] = num_heads
+    if depth is not None:
+        cfg["depth"] = depth
+    if decoder_embed_dim is not None:
+        cfg["decoder_embed_dim"] = decoder_embed_dim
+        cfg["decoder_num_heads"] = _auto_num_heads(decoder_embed_dim, target_head_dim=32)
+    if cfg["embed_dim"] % cfg["num_heads"] != 0:
+        raise ValueError(
+            f"embed_dim ({cfg['embed_dim']}) must be divisible by num_heads ({cfg['num_heads']})"
+        )
+    if cfg["decoder_embed_dim"] % cfg["decoder_num_heads"] != 0:
+        raise ValueError(
+            f"decoder_embed_dim ({cfg['decoder_embed_dim']}) must be divisible by "
+            f"decoder_num_heads ({cfg['decoder_num_heads']})"
+        )
+    return MaskedAutoencoderViT(img_size=img_size, patch_size=patch_size, in_chans=in_chans, **cfg)
 
 if __name__ == "__main__":
     model = MaskedAutoencoderViT()

@@ -11,6 +11,7 @@ import scipy.linalg
 from torch.utils.data import DataLoader, Subset
 
 from utils.dataset import AtmosphereDataset
+from utils.features import extract_features_for_loader
 from utils.model_io import build_model, checkpoint_path, load_model_checkpoint
 from utils.corruptions import (
     apply_gaussian_blur,
@@ -67,10 +68,10 @@ def mmd_rbf(X, Y, gamma=None):
 
 
 def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dataset, batch_size,
-                   num_workers, local_flags, n_severity_steps=5):
+                   num_workers, local_flags, n_severity_steps=5, embed_dim=None):
     print(f"Loading {format_model_label(model_name, model_size, model_variant)} model...")
-    model = build_model(model_name, device=device, model_size=model_size)
-    ckpt_path = checkpoint_path(model_name, model_size, stats_dir, variant=model_variant)
+    model = build_model(model_name, device=device, model_size=model_size, embed_dim=embed_dim)
+    ckpt_path = checkpoint_path(model_name, model_size, stats_dir, variant=model_variant, embed_dim=embed_dim)
     model = load_model_checkpoint(model_name, model, ckpt_path, device)
     model.eval()
 
@@ -99,12 +100,7 @@ def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dat
     print(f"\n--- Fréchet & MMD Distances ({model_name.upper()}, {model_size}) ---")
     print(f"Reference distribution: {len(indices)} samples.")
 
-    z_ref = []
-    with torch.no_grad():
-        for img in subset_loader:
-            img = img.to(device, non_blocking=device.type == "cuda")
-            z_ref.append(model.extract_features(img).cpu())
-    z_ref = torch.cat(z_ref, dim=0)
+    z_ref = extract_features_for_loader(model, subset_loader, device)
     z_ref_np = z_ref.numpy()
     mu_ref = np.mean(z_ref_np, axis=0)
     sigma_ref = np.cov(z_ref_np, rowvar=False)
@@ -114,12 +110,10 @@ def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dat
         print(f"\n  Corruption: {cond_name}")
         results[cond_name] = {"severities": severities, "fid": [], "mmd": []}
         for sev in severities:
-            z_cor = []
-            with torch.no_grad():
-                for img in subset_loader:
-                    img = img.to(device, non_blocking=device.type == "cuda")
-                    z_cor.append(model.extract_features(apply_fn(img, sev)).cpu())
-            z_cor = torch.cat(z_cor, dim=0)
+            z_cor = extract_features_for_loader(
+                model, subset_loader, device,
+                transform_fn=lambda img, s=sev: apply_fn(img, s),
+            )
             z_cor_np = z_cor.numpy()
             mu_cor = np.mean(z_cor_np, axis=0)
             sigma_cor = np.cov(z_cor_np, rowvar=False)
@@ -268,6 +262,10 @@ def main():
     parser.add_argument("--ijepa-size", choices=["tiny", "small", "twin"], default="twin")
     parser.add_argument("--mae-variant", type=str, default=None)
     parser.add_argument("--ijepa-variant", type=str, default=None)
+    parser.add_argument("--mae-embed-dim", type=int, default=None,
+                        help="Override MAE embed_dim (matches the train flag).")
+    parser.add_argument("--ijepa-embed-dim", type=int, default=None,
+                        help="Override IJEPA embed_dim (matches the train flag).")
     parser.add_argument("--twin", action="store_true",
                         help="Shorthand for --mae-size twin --ijepa-size twin")
     parser.add_argument("--local", action="store_true")
@@ -277,6 +275,9 @@ def main():
     parser.add_argument("--lazy", dest="lazy", action="store_true")
     parser.add_argument("--eager", dest="lazy", action="store_false")
     parser.add_argument("--n-severity-steps", type=int, default=9)
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory holding checkpoints + stats; plots saved under <dir>/plots. "
+                             "If unset, falls back to checkpoints/ + plots/ (or /work/scratch/$USER/plots on cluster).")
     parser.set_defaults(lazy=None)
     args = parser.parse_args()
 
@@ -286,6 +287,7 @@ def main():
 
     model_sizes = {"mae": args.mae_size, "ijepa": args.ijepa_size}
     model_variants = {"mae": args.mae_variant, "ijepa": args.ijepa_variant}
+    model_embed_dims = {"mae": args.mae_embed_dim, "ijepa": args.ijepa_embed_dim}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.backends.mps.is_available() and device.type != "cuda":
@@ -298,13 +300,16 @@ def main():
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
 
-    stats_dir = Path("checkpoints")
+    stats_dir = Path(args.output_dir) if args.output_dir else Path("checkpoints")
     stats = (np.load(stats_dir / "data_mean.npy"), np.load(stats_dir / "data_std.npy"))
     lazy_load = (not args.local) if args.lazy is None else args.lazy
     num_workers = 0 if args.num_workers is None else args.num_workers
     dataset = AtmosphereDataset(data_path, split="val", stats=stats, lazy=lazy_load)
 
-    plots_dir = Path("plots") if (args.local or args.large_local) else Path(f"/work/scratch/{os.environ['USER']}/plots")
+    if args.output_dir:
+        plots_dir = Path(args.output_dir) / "plots"
+    else:
+        plots_dir = Path("plots") if (args.local or args.large_local) else Path(f"/work/scratch/{os.environ['USER']}/plots")
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     models_to_run = ["mae", "ijepa"] if args.model == "both" else [args.model]
@@ -322,6 +327,7 @@ def main():
             num_workers=num_workers,
             local_flags={"local": args.local, "large_local": args.large_local},
             n_severity_steps=args.n_severity_steps,
+            embed_dim=model_embed_dims[model_name],
         )
         all_results[model_name] = results
 

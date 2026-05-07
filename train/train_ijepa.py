@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Subset
 
 from utils.dataset import AtmosphereDataset
 from utils.ijepa_masking import MultiBlockMaskGenerator
-from utils.model_io import build_model, save_ijepa_checkpoint
+from utils.model_io import build_model, checkpoint_path, save_ijepa_checkpoint
 
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
@@ -220,7 +220,11 @@ def main():
     parser.add_argument("--lazy", dest="lazy", action="store_true")
     parser.add_argument("--eager", dest="lazy", action="store_false")
     parser.set_defaults(lazy=None)
-    parser.add_argument("--model-size", choices=["tiny", "small"], default="tiny")
+    parser.add_argument("--model-size", choices=["tiny", "small", "twin"], default="tiny")
+    parser.add_argument("--embed-dim", type=int, default=None,
+                        help="Override encoder embed_dim (latent dim). Auto-derives num_heads as embed_dim//64.")
+    parser.add_argument("--num-heads", type=int, default=None, help="Override encoder num_heads.")
+    parser.add_argument("--depth", type=int, default=None, help="Override encoder depth.")
     parser.add_argument("--start-lr", type=float, default=2e-4)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--final-lr", type=float, default=1e-6)
@@ -234,6 +238,8 @@ def main():
     parser.add_argument("--smoke-samples", type=int, default=64)
     parser.add_argument("--early-stopping-patience", type=int, default=0,
                         help="Stop if val loss doesn't improve for this many epochs. 0 = disabled.")
+    parser.add_argument("--output-dir", type=str, default="checkpoints",
+                        help="Directory for checkpoint + normalization stats output (default: checkpoints).")
     args = parser.parse_args()
 
     if args.model_size == "small":
@@ -251,8 +257,8 @@ def main():
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
 
-    checkpoint_dir = Path("checkpoints")
-    checkpoint_dir.mkdir(exist_ok=True)
+    checkpoint_dir = Path(args.output_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     stats = load_stats(checkpoint_dir, args.recompute_stats)
 
     lazy_load = (not args.local) if args.lazy is None else args.lazy
@@ -288,7 +294,14 @@ def main():
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
-    model = build_model("ijepa", device=device, model_size=args.model_size)
+    model = build_model(
+        "ijepa",
+        device=device,
+        model_size=args.model_size,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        depth=args.depth,
+    )
     optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
 
     mask_generator = MultiBlockMaskGenerator(
@@ -324,7 +337,7 @@ def main():
     )
 
     best_val_loss = float("inf")
-    best_path = checkpoint_dir / "best_ijepa_model.pth"
+    best_path = checkpoint_path("ijepa", args.model_size, checkpoint_dir, embed_dim=args.embed_dim)
     epochs_no_improve = 0
 
     print(

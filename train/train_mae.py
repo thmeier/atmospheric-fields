@@ -55,7 +55,13 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--stats-chunk-size", type=int, default=64)
     parser.add_argument("--model-size", choices=["default", "twin"], default="twin")
+    parser.add_argument("--embed-dim", type=int, default=None,
+                        help="Override encoder embed_dim (latent dim). Auto-derives num_heads as embed_dim//64.")
+    parser.add_argument("--num-heads", type=int, default=None, help="Override encoder num_heads.")
+    parser.add_argument("--depth", type=int, default=None, help="Override encoder depth.")
     parser.add_argument("--recompute-stats", action="store_true", help="Ignore saved normalization stats and recompute them")
+    parser.add_argument("--output-dir", type=str, default="checkpoints",
+                        help="Directory for checkpoint + normalization stats output (default: checkpoints).")
     parser.add_argument("--lazy", dest="lazy", action="store_true", help="Enable lazy dataloading")
     parser.add_argument("--eager", dest="lazy", action="store_false", help="Force eager dataloading")
     parser.set_defaults(lazy=None)
@@ -97,8 +103,8 @@ def main():
 
     print(f"Loading data from {data_path}...")
 
-    stats_dir = Path("checkpoints")
-    stats_dir.mkdir(exist_ok=True)
+    stats_dir = Path(args.output_dir)
+    stats_dir.mkdir(parents=True, exist_ok=True)
     mean_path = stats_dir / "data_mean.npy"
     std_path = stats_dir / "data_std.npy"
 
@@ -156,7 +162,16 @@ def main():
 
     # Initialize Model
     # Small ViT for v1
-    model = build_mae(model_size=args.model_size).to(device)
+    model = build_mae(
+        model_size=args.model_size,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        depth=args.depth,
+    ).to(device)
+    print(
+        f"MAE setup: embed_dim={model.patch_embed.proj.out_channels}, "
+        f"depth={len(model.encoder_blocks)}, num_heads={model.encoder_blocks[0].attn.num_heads}"
+    )
 
     # Optimizer and Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
@@ -178,7 +193,7 @@ def main():
         # Checkpointing
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            ckpt_path = checkpoint_path("mae", args.model_size, stats_dir)
+            ckpt_path = checkpoint_path("mae", args.model_size, stats_dir, embed_dim=args.embed_dim)
             save_mae_checkpoint(ckpt_path, model, optimizer, epoch + 1, val_loss, args)
             print(f"  -> Saved best model to {ckpt_path}")
 
