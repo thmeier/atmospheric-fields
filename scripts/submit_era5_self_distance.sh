@@ -36,8 +36,7 @@ python eval/eval_era5_self_distance.py \
     --model both \
     --n-trials 20 \
     --n-per-split 250 \
-    --batch-size 64 \
-    --lazy
+    --batch-size 64
 
 # ------ Phase 2: ERA5 vs Pangu / GraphCast -----------------------------------
 # Compares the ERA5 self-distance baseline against the distance to 24 h
@@ -48,7 +47,6 @@ python eval/eval_era5_self_distance.py \
     --n-trials 20 \
     --n-per-split 250 \
     --batch-size 64 \
-    --lazy \
     --pangu-path "$PANGU_PATH" \
     --graphcast-path "$GRAPHCAST_PATH"
 
@@ -60,8 +58,7 @@ EXTRACT_FEATURES_POOLING=max python eval/eval_era5_self_distance.py \
     --model both \
     --n-trials 20 \
     --n-per-split 250 \
-    --batch-size 64 \
-    --lazy
+    --batch-size 64
 
 echo -e "\n--- Phase 4: ERA5 vs forecasts comparison (max pooling) ---"
 EXTRACT_FEATURES_POOLING=max python eval/eval_era5_self_distance.py \
@@ -69,7 +66,6 @@ EXTRACT_FEATURES_POOLING=max python eval/eval_era5_self_distance.py \
     --n-trials 20 \
     --n-per-split 250 \
     --batch-size 64 \
-    --lazy \
     --pangu-path "$PANGU_PATH" \
     --graphcast-path "$GRAPHCAST_PATH"
 
