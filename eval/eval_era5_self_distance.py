@@ -382,11 +382,23 @@ def main():
 
     phase2_sources = []
     for name, path in [("pangu", pangu_path), ("graphcast", graphcast_path)]:
-        if path is not None:
-            if path.exists():
-                phase2_sources.append(name)
-            else:
-                print(f"Warning: --{name}-path {path} does not exist; skipping {name}.")
+        if path is None:
+            continue
+        try:
+            accessible = path.exists()
+        except PermissionError:
+            print(
+                f"Warning: permission denied when checking {path}.\n"
+                f"  Ask the file owner to run:\n"
+                f"    setfacl -m u:{os.environ.get('USER', '<your-username>')}:rx {path.parent}\n"
+                f"    setfacl -m u:{os.environ.get('USER', '<your-username>')}:r {path}\n"
+                f"  Skipping {name} for now."
+            )
+            continue
+        if accessible:
+            phase2_sources.append(name)
+        else:
+            print(f"Warning: --{name}-path {path} does not exist; skipping {name}.")
 
     models_to_run = ["mae", "ijepa"] if args.model == "both" else [args.model]
     bootstrap_results: dict = {}
