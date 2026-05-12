@@ -357,6 +357,30 @@ def main():
     if args.local and args.large_local:
         raise ValueError("Use only one of --local or --large-local.")
 
+    # Check forecast file accessibility before any expensive work.
+    pangu_path     = Path(args.pangu_path)     if args.pangu_path     else None
+    graphcast_path = Path(args.graphcast_path) if args.graphcast_path else None
+
+    phase2_sources = []
+    for name, path in [("pangu", pangu_path), ("graphcast", graphcast_path)]:
+        if path is None:
+            continue
+        try:
+            accessible = path.exists()
+        except PermissionError:
+            print(
+                f"Warning: permission denied when checking {path}.\n"
+                f"  Ask the file owner to run:\n"
+                f"    setfacl -m u:{os.environ.get('USER', '<your-username>')}:rx {path.parent}\n"
+                f"    setfacl -m u:{os.environ.get('USER', '<your-username>')}:r {path}\n"
+                f"  Skipping {name}."
+            )
+            continue
+        if accessible:
+            phase2_sources.append(name)
+        else:
+            print(f"Warning: --{name}-path {path} does not exist; skipping {name}.")
+
     era5_path = (LOCAL_ERA5_PATH if args.local
                  else LARGE_LOCAL_ERA5_PATH if args.large_local
                  else CLUSTER_ERA5_PATH)
@@ -375,30 +399,6 @@ def main():
     lazy_load = not (args.local or args.large_local)
     era5_ds = AtmosphereDataset(era5_path, split="all", stats=stats, lazy=lazy_load)
     print(f"ERA5 dataset: {len(era5_ds)} samples (split='all')")
-
-    # Resolve optional forecast paths
-    pangu_path     = Path(args.pangu_path)     if args.pangu_path     else None
-    graphcast_path = Path(args.graphcast_path) if args.graphcast_path else None
-
-    phase2_sources = []
-    for name, path in [("pangu", pangu_path), ("graphcast", graphcast_path)]:
-        if path is None:
-            continue
-        try:
-            accessible = path.exists()
-        except PermissionError:
-            print(
-                f"Warning: permission denied when checking {path}.\n"
-                f"  Ask the file owner to run:\n"
-                f"    setfacl -m u:{os.environ.get('USER', '<your-username>')}:rx {path.parent}\n"
-                f"    setfacl -m u:{os.environ.get('USER', '<your-username>')}:r {path}\n"
-                f"  Skipping {name} for now."
-            )
-            continue
-        if accessible:
-            phase2_sources.append(name)
-        else:
-            print(f"Warning: --{name}-path {path} does not exist; skipping {name}.")
 
     models_to_run = ["mae", "ijepa"] if args.model == "both" else [args.model]
     bootstrap_results: dict = {}
