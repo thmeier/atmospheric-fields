@@ -243,7 +243,7 @@ def plot_bootstrap_distribution(bootstrap_results, models_to_run, plots_dir, run
         (ax_mmd, "mmd", "MMD"),
     ]:
         all_vals = [np.array(bootstrap_results[m][metric_key]) for m in models_to_run]
-        y_max = max(v.max() for v in all_vals)
+        tick_labels = []
 
         for xi, model_name, vals in zip(x_positions, models_to_run, all_vals):
             color = MODEL_COLORS[model_name]
@@ -261,12 +261,10 @@ def plot_bootstrap_distribution(bootstrap_results, models_to_run, plots_dir, run
             ax.scatter(xi + jitter, vals, color=color, alpha=0.75, s=22, zorder=3)
 
             mean_val, std_val = vals.mean(), vals.std()
-            ax.text(xi, y_max * 1.04, f"μ={mean_val:.3f}\n±{std_val:.3f}",
-                    ha="center", va="bottom", fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+            tick_labels.append(f"{MODEL_LABELS[model_name]}\nμ={mean_val:.3f} ±{std_val:.3f}")
 
         ax.set_xticks(x_positions)
-        ax.set_xticklabels([MODEL_LABELS[m] for m in models_to_run])
+        ax.set_xticklabels(tick_labels, linespacing=1.4)
         ax.set_ylabel(metric_label)
         ax.set_title(f"ERA5 ↔ ERA5 Bootstrap ({metric_label})")
         ax.grid(True, axis="y", alpha=0.3)
