@@ -69,4 +69,30 @@ EXTRACT_FEATURES_POOLING=max python eval/eval_era5_self_distance.py \
     --pangu-path "$PANGU_PATH" \
     --graphcast-path "$GRAPHCAST_PATH"
 
+# ------ Phase 4: Year-matched bootstrap + forecast comparison (mean pooling) -
+# Restricts the ERA5 bootstrap pool to 2020 only, matching the temporal
+# coverage of the forecast data.  This disentangles the inter-annual
+# variability confound: both sides of every comparison now draw from the
+# same single-year climate distribution.
+echo -e "\n--- Phase 4: Year-matched ERA5 self-distance + forecasts (mean pooling, 2020) ---"
+python eval/eval_era5_self_distance.py \
+    --model both \
+    --n-trials 20 \
+    --n-per-split 250 \
+    --batch-size 64 \
+    --restrict-era5-year 2020 \
+    --pangu-path "$PANGU_PATH" \
+    --graphcast-path "$GRAPHCAST_PATH"
+
+# ------ Phase 5: same with max pooling ----------------------------------------
+echo -e "\n--- Phase 5: Year-matched ERA5 self-distance + forecasts (max pooling, 2020) ---"
+EXTRACT_FEATURES_POOLING=max python eval/eval_era5_self_distance.py \
+    --model both \
+    --n-trials 20 \
+    --n-per-split 250 \
+    --batch-size 64 \
+    --restrict-era5-year 2020 \
+    --pangu-path "$PANGU_PATH" \
+    --graphcast-path "$GRAPHCAST_PATH"
+
 echo -e "\nERA5 self-distance evaluation finished successfully!"

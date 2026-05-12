@@ -351,6 +351,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--pangu-path", type=str, default=None)
     parser.add_argument("--graphcast-path", type=str, default=None)
+    parser.add_argument("--restrict-era5-year", type=int, default=None,
+                        help="Restrict the ERA5 bootstrap pool to a single calendar year "
+                             "(e.g. 2020) to match the temporal coverage of the forecast data. "
+                             "Forecast pairing always uses the full ERA5 archive.")
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -398,7 +402,25 @@ def main():
     stats = (np.load(stats_dir / "data_mean.npy"), np.load(stats_dir / "data_std.npy"))
     lazy_load = not (args.local or args.large_local)
     era5_ds = AtmosphereDataset(era5_path, split="all", stats=stats, lazy=lazy_load)
-    print(f"ERA5 dataset: {len(era5_ds)} samples (split='all')")
+
+    # Optionally restrict bootstrap pool to a single year to match forecast coverage.
+    # Forecast pairing always uses the full era5_ds so the paired indices stay valid.
+    if args.restrict_era5_year is not None:
+        era5_times = _read_times(era5_path)
+        year_indices = [i for i, t in enumerate(era5_times) if t.year == args.restrict_era5_year]
+        if not year_indices:
+            raise ValueError(f"No ERA5 samples found for year {args.restrict_era5_year}.")
+        if len(year_indices) < 2 * args.n_per_split:
+            raise ValueError(
+                f"Only {len(year_indices)} ERA5 samples in {args.restrict_era5_year}, "
+                f"need >= {2 * args.n_per_split}. Reduce --n-per-split."
+            )
+        bootstrap_pool = Subset(era5_ds, year_indices)
+        print(f"ERA5 dataset: {len(era5_ds)} samples total; "
+              f"bootstrap pool restricted to {args.restrict_era5_year}: {len(bootstrap_pool)} samples.")
+    else:
+        bootstrap_pool = era5_ds
+        print(f"ERA5 dataset: {len(era5_ds)} samples (split='all')")
 
     models_to_run = ["mae", "ijepa"] if args.model == "both" else [args.model]
     bootstrap_results: dict = {}
@@ -415,12 +437,12 @@ def main():
         model = load_model_checkpoint(model_name, model, ckpt, device)
         model.eval()
 
-        # Extract all ERA5 features in one pass
-        full_loader = DataLoader(era5_ds, batch_size=args.batch_size,
+        # Extract bootstrap pool features in one pass (may be year-restricted)
+        pool_loader = DataLoader(bootstrap_pool, batch_size=args.batch_size,
                                  shuffle=False, num_workers=0,
                                  pin_memory=device.type == "cuda")
-        print(f"Extracting ERA5 features ({len(era5_ds)} samples)...")
-        z_all = extract_features_for_loader(model, full_loader, device)
+        print(f"Extracting ERA5 features for bootstrap pool ({len(bootstrap_pool)} samples)...")
+        z_all = extract_features_for_loader(model, pool_loader, device)
         print(f"Feature shape: {z_all.shape}")
 
         # Phase 1: bootstrap
@@ -452,6 +474,8 @@ def main():
         tag_parts.append(f"d{args.embed_dim}")
     if args.variant:
         tag_parts.append(args.variant)
+    if args.restrict_era5_year is not None:
+        tag_parts.append(f"yr{args.restrict_era5_year}")
     tag_parts.append(f"t{args.n_trials}_n{args.n_per_split}_seed{args.seed}")
     tag_parts.append(f"pool-{os.environ.get('EXTRACT_FEATURES_POOLING', 'mean').lower()}")
     run_tag = "_".join(tag_parts)
