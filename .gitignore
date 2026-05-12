@@ -29,4 +29,5 @@ htmlcov/
 # Project-specific
 plots/
 data/
+results/
 checkpoints/

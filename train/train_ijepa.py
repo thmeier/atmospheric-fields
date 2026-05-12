@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from utils.dataset import AtmosphereDataset
 from utils.ijepa_masking import MultiBlockMaskGenerator
 from utils.model_io import build_model, checkpoint_path, save_ijepa_checkpoint
+from utils.temporal import IN_CHANS_BY_MODE, derive_delta_steps
 
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
@@ -104,13 +105,17 @@ def load_stats(checkpoint_dir, recompute_stats):
     return None
 
 
-def build_datasets(data_path, stats, lazy_load, stats_chunk_size):
+def build_datasets(data_path, stats, lazy_load, stats_chunk_size,
+                   temporal_mode="none", delta_steps=0, diff_stats=None):
     train_dataset = AtmosphereDataset(
         data_path,
         split="train",
         stats=stats,
         lazy=lazy_load,
         stats_chunk_size=stats_chunk_size,
+        temporal_mode=temporal_mode,
+        delta_steps=delta_steps,
+        diff_stats=diff_stats,
     )
     stats = train_dataset.get_stats()
     val_dataset = AtmosphereDataset(
@@ -119,6 +124,9 @@ def build_datasets(data_path, stats, lazy_load, stats_chunk_size):
         stats=stats,
         lazy=lazy_load,
         stats_chunk_size=stats_chunk_size,
+        temporal_mode=temporal_mode,
+        delta_steps=delta_steps,
+        diff_stats=diff_stats,
     )
     return train_dataset, val_dataset, stats
 
@@ -240,6 +248,11 @@ def main():
                         help="Stop if val loss doesn't improve for this many epochs. 0 = disabled.")
     parser.add_argument("--output-dir", type=str, default="checkpoints",
                         help="Directory for checkpoint + normalization stats output (default: checkpoints).")
+    parser.add_argument("--temporal-mode", choices=["none", "diff", "concat", "phase"], default="none",
+                        help="Temporal-pair input mode. 'none' is original single-timestep. "
+                             "'diff'=X_t-X_{t-Δt} (4ch); 'concat'=[X_{t-Δt},X_t] (8ch); 'phase'=[X_t, X_t-X_{t-Δt}] (8ch).")
+    parser.add_argument("--delta-hours", type=int, default=24,
+                        help="Δt in hours for temporal-pair construction (default 24, ignored when temporal-mode=none).")
     args = parser.parse_args()
 
     if args.model_size == "small":
@@ -261,6 +274,43 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     stats = load_stats(checkpoint_dir, args.recompute_stats)
 
+    # Derive Δt index step from file's time coordinate.
+    if args.temporal_mode == "none":
+        delta_steps = 0
+    else:
+        import xarray as xr
+        with xr.open_dataset(data_path, decode_times=True) as _ds:
+            time_coord = _ds.time.values
+        delta_steps = derive_delta_steps(time_coord, args.delta_hours)
+        print(f"Temporal mode '{args.temporal_mode}': Δt={args.delta_hours}h → {delta_steps} index steps.")
+
+    diff_stats = None
+    diff_mean_path = checkpoint_dir / f"diff_mean_dt{args.delta_hours}h.npy"
+    diff_std_path  = checkpoint_dir / f"diff_std_dt{args.delta_hours}h.npy"
+    if args.temporal_mode in ("diff", "phase"):
+        if not args.recompute_stats and diff_mean_path.exists() and diff_std_path.exists():
+            print(f"Loading cached diff stats from {checkpoint_dir} (Δt={args.delta_hours}h)...")
+            diff_stats = (np.load(diff_mean_path), np.load(diff_std_path))
+        else:
+            if stats is None:
+                bootstrap = AtmosphereDataset(
+                    data_path, split="train", lazy=True,
+                    stats_chunk_size=args.stats_chunk_size,
+                )
+                stats = bootstrap.get_stats()
+                np.save(checkpoint_dir / "data_mean.npy", stats[0])
+                np.save(checkpoint_dir / "data_std.npy", stats[1])
+            print(f"Computing diff stats (Δt={args.delta_hours}h = {delta_steps} steps)...")
+            bootstrap = AtmosphereDataset(
+                data_path, split="train", stats=stats, lazy=True,
+                stats_chunk_size=args.stats_chunk_size,
+            )
+            diff_mean_arr, diff_std_arr = bootstrap.compute_diff_stats(delta_steps=delta_steps)
+            np.save(diff_mean_path, diff_mean_arr)
+            np.save(diff_std_path,  diff_std_arr)
+            diff_stats = (diff_mean_arr, diff_std_arr)
+            print(f"  saved {diff_mean_path.name}, {diff_std_path.name}")
+
     lazy_load = (not args.local) if args.lazy is None else args.lazy
     num_workers = 0 if args.num_workers is None else args.num_workers
     train_dataset, val_dataset, stats = build_datasets(
@@ -268,6 +318,9 @@ def main():
         stats=stats,
         lazy_load=lazy_load,
         stats_chunk_size=args.stats_chunk_size,
+        temporal_mode=args.temporal_mode,
+        delta_steps=delta_steps,
+        diff_stats=diff_stats,
     )
     np.save(checkpoint_dir / "data_mean.npy", stats[0])
     np.save(checkpoint_dir / "data_std.npy", stats[1])
@@ -294,6 +347,7 @@ def main():
     train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
+    in_chans = IN_CHANS_BY_MODE[args.temporal_mode]
     model = build_model(
         "ijepa",
         device=device,
@@ -301,6 +355,7 @@ def main():
         embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         depth=args.depth,
+        in_chans=in_chans,
     )
     optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -337,11 +392,15 @@ def main():
     )
 
     best_val_loss = float("inf")
-    best_path = checkpoint_path("ijepa", args.model_size, checkpoint_dir, embed_dim=args.embed_dim)
+    variant = None if args.temporal_mode == "none" else f"tm-{args.temporal_mode}"
+    best_path = checkpoint_path(
+        "ijepa", args.model_size, checkpoint_dir,
+        embed_dim=args.embed_dim, variant=variant,
+    )
     epochs_no_improve = 0
 
     print(
-        f"JEPA setup: grid={model.grid_size}, embed_dim={model.embed_dim}, "
+        f"JEPA setup: in_chans={in_chans}, grid={model.grid_size}, embed_dim={model.embed_dim}, "
         f"batch_size={args.batch_size}, epochs={args.epochs}, warmup_steps={warmup_steps}"
     )
 
@@ -389,6 +448,26 @@ def main():
         if args.early_stopping_patience > 0 and epochs_no_improve >= args.early_stopping_patience:
             print(f"\nEarly stopping: val loss did not improve for {args.early_stopping_patience} epochs.")
             break
+
+    # End-of-training diagnostic: per-input-channel L2 norm of patch_embed.proj.weight
+    # for BOTH the context encoder (gradient-trained) and the target encoder (EMA).
+    # For concat/phase: if the prior half is being ignored the ratio will collapse.
+    with torch.no_grad():
+        for enc_name, enc in [
+            ("context_encoder", model.context_encoder),
+            ("target_encoder",  model.target_encoder),
+        ]:
+            w = enc.patch_embed.proj.weight.detach().cpu()  # (embed_dim, in_chans, 16, 16)
+            norms = w.pow(2).sum(dim=(0, 2, 3)).sqrt()
+            print(f"\n[{enc_name}] PatchEmbed per-input-channel L2 norms: {norms.tolist()}")
+            if args.temporal_mode == "concat":
+                ratio = (norms[0:4].mean() / norms[4:8].mean()).item()
+                print(f"  concat prior/present ratio = {ratio:.3f}  "
+                      f"({'OK' if ratio > 0.2 else 'WARN: prior may be ignored'})")
+            elif args.temporal_mode == "phase":
+                ratio = (norms[4:8].mean() / norms[0:4].mean()).item()
+                print(f"  phase diff/abs ratio = {ratio:.3f}  "
+                      f"({'OK' if ratio > 0.2 else 'WARN: diff half may be ignored'})")
 
 
 if __name__ == "__main__":

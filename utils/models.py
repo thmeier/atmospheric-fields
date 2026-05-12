@@ -9,18 +9,21 @@ from copy import deepcopy
 
 
 def _pool_patch_tokens(x):
-    """Reduce patch-token sequence (B, N, D) to image vector (B, D).
+    """Reduce patch-token sequence (B, N, D) to image vector (B, D) or (B, 2D).
 
     Mode is read from the EXTRACT_FEATURES_POOLING env var per call so eval
     scripts can toggle without rebuilding the model. Defaults to "mean".
+    'concat' concatenates mean and max → output dim is 2*D.
     """
     mode = os.environ.get("EXTRACT_FEATURES_POOLING", "mean").lower()
     if mode == "mean":
         return x.mean(dim=1)
     if mode == "max":
         return x.amax(dim=1)
+    if mode == "concat":
+        return torch.cat([x.mean(dim=1), x.amax(dim=1)], dim=-1)
     raise ValueError(
-        f"EXTRACT_FEATURES_POOLING={mode!r} not understood; expected 'mean' or 'max'."
+        f"EXTRACT_FEATURES_POOLING={mode!r} not understood; expected 'mean', 'max', or 'concat'."
     )
 
 

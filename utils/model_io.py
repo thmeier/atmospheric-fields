@@ -3,10 +3,11 @@ from pathlib import Path
 from .models import build_mae, build_ijepa
 
 
-def build_model(model_name, device, model_size, embed_dim=None, num_heads=None, depth=None):
+def build_model(model_name, device, model_size, embed_dim=None, num_heads=None, depth=None, in_chans=4):
     if model_name == "mae":
         model = build_mae(
             model_size=model_size,
+            in_chans=in_chans,
             embed_dim=embed_dim,
             num_heads=num_heads,
             depth=depth,
@@ -14,6 +15,7 @@ def build_model(model_name, device, model_size, embed_dim=None, num_heads=None, 
     elif model_name == "ijepa":
         model = build_ijepa(
             model_size=model_size,
+            in_chans=in_chans,
             embed_dim=embed_dim,
             num_heads=num_heads,
             depth=depth,
