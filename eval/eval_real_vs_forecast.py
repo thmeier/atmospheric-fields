@@ -113,104 +113,119 @@ def _read_times(nc_path):
         ])
 
 
-def build_paired_indices(era5_path, forecast_path, max_dt_hours=6, prior_hours=None):
-    """Return paired indices aligned by valid time.
+def build_era5_ref_pool(era5_path, forecast_path, max_dt_hours=6, prior_hours=None,
+                        restrict_date_range=True):
+    """Build an ERA5 pool decoupled from forecast valid-time pairing.
 
-    For each forecast valid time `ft`:
-      - locate the nearest ERA5 timestamp to `ft` (present, `era5_idx`).
-      - if `prior_hours` is given, also locate the nearest ERA5 timestamp to
-        `ft − prior_hours` (prior, `era5_prior_idx`). Drop the pair if either
-        match is > `max_dt_hours` away.
+    Returns ERA5 indices for ERA5 timestamps at the forecast's hours-of-day. If
+    `restrict_date_range` is True (default — used for the forecast-side reference),
+    the pool is further restricted to the forecast date range. If False (used for
+    the baseline when --baseline-pool=all-years), the pool spans every year in
+    the ERA5 file, giving a much larger sample for a tighter noise-floor estimate.
+
+    When `prior_hours` is set (temporal eval), each ref index t is also matched
+    to the nearest ERA5 index at t − prior_hours. Refs whose prior is > max_dt
+    from any ERA5 timestamp are dropped.
 
     Returns:
-        (era5_idx_list, fc_idx_list) when prior_hours is None.
-        (era5_idx_list, fc_idx_list, era5_prior_idx_list) when prior_hours is set.
+        (ref_idx, prior_idx)  — prior_idx is None when prior_hours is None.
     """
     era5_times = _read_times(era5_path)
     fc_times   = _read_times(forecast_path)
 
-    era5_idx_list, fc_idx_list, era5_prior_idx_list = [], [], []
-    skipped = 0
-    skipped_prior = 0
+    fc_hours   = sorted({int(t.hour) for t in fc_times})
+    hour_match = np.array([int(t.hour) in fc_hours for t in era5_times])
+
+    if restrict_date_range:
+        fc_start, fc_end = fc_times.min(), fc_times.max()
+        in_range = (era5_times >= fc_start) & (era5_times <= fc_end)
+        mask     = in_range & hour_match
+        scope    = f"{fc_times[0].date()}–{fc_times[-1].date()}"
+    else:
+        mask  = hour_match
+        scope = f"{era5_times[0].date()}–{era5_times[-1].date()} (all years)"
+
+    ref_idx = np.where(mask)[0].tolist()
+
+    if prior_hours is None:
+        print(f"  ERA5 pool: {len(ref_idx)} samples (range {scope}, hours {fc_hours})")
+        return ref_idx, None
+
     max_dt = pd.Timedelta(hours=max_dt_hours)
-    prior_offset = pd.Timedelta(hours=prior_hours) if prior_hours is not None else None
-
-    for fi, ft in enumerate(fc_times):
-        delta = np.abs(era5_times - ft)
-        ei = int(delta.argmin())
-        if delta[ei] > max_dt:
+    prior_offset = pd.Timedelta(hours=prior_hours)
+    keep_ref, keep_prior = [], []
+    skipped = 0
+    for i in ref_idx:
+        target = era5_times[i] - prior_offset
+        delta = np.abs(era5_times - target)
+        j = int(delta.argmin())
+        if delta[j] <= max_dt:
+            keep_ref.append(i)
+            keep_prior.append(j)
+        else:
             skipped += 1
-            continue
-
-        if prior_offset is not None:
-            target_prior = ft - prior_offset
-            delta_p = np.abs(era5_times - target_prior)
-            ei_p = int(delta_p.argmin())
-            if delta_p[ei_p] > max_dt:
-                skipped_prior += 1
-                continue
-            era5_prior_idx_list.append(ei_p)
-
-        era5_idx_list.append(ei)
-        fc_idx_list.append(fi)
-
-    if prior_offset is not None:
-        print(f"  {len(era5_idx_list)} paired samples "
-              f"({len(fc_times)} forecast times, {skipped} skipped on present, "
-              f"{skipped_prior} skipped on prior (Δt={prior_hours}h), tolerance ±{max_dt_hours}h)")
-        return era5_idx_list, fc_idx_list, era5_prior_idx_list
-
-    print(f"  {len(era5_idx_list)} paired samples "
-          f"({len(fc_times)} forecast times, {skipped} outside {max_dt_hours}h tolerance, "
-          f"range {fc_times[0].date()} – {fc_times[-1].date()})")
-    return era5_idx_list, fc_idx_list
+    print(f"  ERA5 pool: {len(keep_ref)} samples "
+          f"(range {scope}, hours {fc_hours}, Δt={prior_hours}h prior; {skipped} dropped)")
+    return keep_ref, keep_prior
 
 
-def cap_pairs(era5_idx, fc_idx, n, rng):
-    """Shuffle and cap paired index lists to min(n, len)."""
-    total = len(era5_idx)
-    if n >= total:
-        return era5_idx, fc_idx
-    perm = rng.permutation(total)[:n].tolist()
-    return [era5_idx[i] for i in perm], [fc_idx[i] for i in perm]
+def build_forecast_indices(era5_path, forecast_path, max_dt_hours=6, prior_hours=None):
+    """All forecast indices, with matched ERA5 prior indices for temporal mode.
 
-
-def split_pairs(era5_idx, fc_idx, n, rng, era5_prior_idx=None):
-    """Shuffle paired indices and split into two disjoint halves of size n each.
-
-    Half A's (ERA5, forecast) pairs drive the model comparison; half B's ERA5
-    indices act as the within-distribution baseline partner. Both halves come
-    from the same time-paired pool (00/12 UTC for Pangu/GraphCast), so the
-    baseline and forecast comparisons share the same diurnal/seasonal coverage.
-
-    If `era5_prior_idx` is provided (temporal-pair eval), the same shuffle/split
-    is applied to it, yielding both the present and prior ERA5 indices for each
-    half.
-
-    Returns:
-        Non-temporal: (era5_a, fc_a, era5_b)
-        Temporal:     (era5_a, fc_a, era5_b, era5_prior_a, era5_prior_b)
-                      where each *_prior_* gives the ERA5 t-Δt index for that
-                      half.
+    The forecast pool itself never depends on per-sample ERA5 pairing — it's
+    the full set of forecast samples. For temporal mode, the prior side is
+    still ERA5 at valid_time − Δt, since Pangu/GraphCast take ERA5 as input.
+    Forecasts whose prior is > max_dt from any ERA5 timestamp are dropped.
     """
-    total = len(era5_idx)
-    n_actual = min(n, total // 2)
-    perm = rng.permutation(total).tolist()
-    a_idx = perm[:n_actual]
-    b_idx = perm[n_actual:2 * n_actual]
-    if era5_prior_idx is None:
-        return (
-            [era5_idx[i] for i in a_idx],
-            [fc_idx[i]   for i in a_idx],
-            [era5_idx[i] for i in b_idx],
-        )
-    return (
-        [era5_idx[i] for i in a_idx],
-        [fc_idx[i]   for i in a_idx],
-        [era5_idx[i] for i in b_idx],
-        [era5_prior_idx[i] for i in a_idx],
-        [era5_prior_idx[i] for i in b_idx],
-    )
+    fc_times = _read_times(forecast_path)
+    if prior_hours is None:
+        print(f"  Forecast pool: {len(fc_times)} samples")
+        return list(range(len(fc_times))), None
+
+    era5_times = _read_times(era5_path)
+    max_dt = pd.Timedelta(hours=max_dt_hours)
+    prior_offset = pd.Timedelta(hours=prior_hours)
+    keep_fc, keep_prior = [], []
+    skipped = 0
+    for fi, ft in enumerate(fc_times):
+        target = ft - prior_offset
+        delta = np.abs(era5_times - target)
+        ei = int(delta.argmin())
+        if delta[ei] <= max_dt:
+            keep_fc.append(fi)
+            keep_prior.append(ei)
+        else:
+            skipped += 1
+    print(f"  Forecast pool: {len(keep_fc)} samples "
+          f"(Δt={prior_hours}h prior; {skipped} dropped)")
+    return keep_fc, keep_prior
+
+
+def cap_indices(idx, prior_idx, n, rng):
+    """Shuffle and cap an index list (plus optional matched prior list) to min(n, len)."""
+    total = len(idx)
+    if n >= total:
+        return idx, prior_idx
+    perm = rng.permutation(total)[:n].tolist()
+    capped_idx   = [idx[i] for i in perm]
+    capped_prior = [prior_idx[i] for i in perm] if prior_idx is not None else None
+    return capped_idx, capped_prior
+
+
+def split_indices(idx, prior_idx, rng):
+    """Random 50/50 disjoint split of an index list (plus optional matched prior list).
+
+    Returns ((a_idx, a_prior), (b_idx, b_prior)). Each half has size len(idx)//2.
+    """
+    total = len(idx)
+    half  = total // 2
+    perm  = rng.permutation(total).tolist()
+    a, b  = perm[:half], perm[half:2 * half]
+    a_idx = [idx[i] for i in a]
+    b_idx = [idx[i] for i in b]
+    if prior_idx is None:
+        return (a_idx, None), (b_idx, None)
+    return (a_idx, [prior_idx[i] for i in a]), (b_idx, [prior_idx[i] for i in b])
 
 
 class TemporalPairDataset(torch.utils.data.Dataset):
@@ -269,25 +284,19 @@ def compute_distances(z_real, z_fake):
     return {"fid": fid, "mmd": mmd}
 
 
-def compute_era5_self_baseline(z_era5_a, z_era5_b):
-    """FID/MMD between two independent ERA5 samples (same N as forecast comparison).
-
-    Gives the noise floor: what the metric reads when both sides come from the
-    ERA5 distribution. Must use matched sample size to be comparable — FID is
-    a biased estimator that grows with smaller N (rank-deficient covariance).
-    """
-    return compute_distances(z_era5_a, z_era5_b)
-
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def print_metrics_table(results, models, n_pangu, n_gc, device, label_suffix=""):
+def print_metrics_table(results, models, sizes, device, label_suffix=""):
+    """sizes: dict with n_ref_p, n_ref_g, n_pangu, n_gc, n_base."""
     hdr = "=" * 80
     print(f"\n{hdr}")
-    print("REAL vs 24h FORECAST — LATENT DISTANCES")
+    print("REAL vs 24h FORECAST — LATENT DISTANCES (un-paired)")
     print(hdr)
-    print(f"N pairs (Pangu): {n_pangu}    N pairs (GraphCast): {n_gc}    Device: {device}")
+    print(f"N ERA5 ref (Pangu/GraphCast): {sizes['n_ref_p']}/{sizes['n_ref_g']}    "
+          f"N forecast (Pangu/GraphCast): {sizes['n_pangu']}/{sizes['n_gc']}    "
+          f"N baseline halves: {sizes['n_base']}    Device: {device}")
     print()
     print(f"  {'Model':<40} {'Forecast':<14} {'FID':>10} {'MMD':>12}")
     print("  " + "-" * 78)
@@ -446,6 +455,16 @@ def main():
                         help="Temporal-pair eval mode. Must match the trained checkpoint's mode.")
     parser.add_argument("--delta-hours", type=int, default=24,
                         help="Δt in hours for the temporal pair (default 24).")
+    parser.add_argument("--baseline-pool", choices=["forecast-range", "all-years"],
+                        default="forecast-range",
+                        help="ERA5 pool used for the ERA5-vs-ERA5 baseline split. "
+                             "'forecast-range' = same year(s) as the forecast file. "
+                             "'all-years' = entire ERA5 file at the forecast hours-of-day "
+                             "(much larger pool → tighter noise-floor estimate; only "
+                             "useful on the cluster where ERA5 spans many years).")
+    parser.add_argument("--baseline-n-per-half", type=int, default=None,
+                        help="Override the per-half size of the baseline split. "
+                             "Default = --n-samples (matches forecast comparison N).")
     args = parser.parse_args()
 
     if args.pooling is not None:
@@ -484,38 +503,58 @@ def main():
     temporal = args.temporal_mode != "none"
     prior_hours = args.delta_hours if temporal else None
 
-    print("Building time-aligned index pairs...")
-    print("  Pangu:")
-    pangu_paired = build_paired_indices(era5_path, pangu_path, prior_hours=prior_hours)
-    print("  GraphCast:")
-    gc_paired    = build_paired_indices(era5_path, graphcast_path, prior_hours=prior_hours)
+    # Build pools without per-sample pairing between ERA5 and forecast.
+    # The ERA5 reference pool is "ERA5 in the forecast date range at the forecast
+    # hours-of-day" — same seasonal/diurnal coverage as forecasts, but treated
+    # as an independent distribution (no per-time matching).
+    print("Building ERA5 reference and forecast pools (no per-sample pairing)...")
+    print("  Pangu ERA5 ref:")
+    era5_p_ref_idx, era5_p_ref_prior = build_era5_ref_pool(
+        era5_path, pangu_path, prior_hours=prior_hours)
+    print("  GraphCast ERA5 ref:")
+    era5_g_ref_idx, era5_g_ref_prior = build_era5_ref_pool(
+        era5_path, graphcast_path, prior_hours=prior_hours)
+    print("  Pangu forecasts:")
+    pangu_idx, pangu_prior = build_forecast_indices(
+        era5_path, pangu_path, prior_hours=prior_hours)
+    print("  GraphCast forecasts:")
+    gc_idx, gc_prior = build_forecast_indices(
+        era5_path, graphcast_path, prior_hours=prior_hours)
 
-    if temporal:
-        era5_p_idx_all, pangu_idx_all, era5_p_prior_all = pangu_paired
-        era5_g_idx_all, gc_idx_all,    era5_g_prior_all = gc_paired
-        era5_p_idx, pangu_idx, era5_base_idx, era5_p_prior, era5_base_prior = split_pairs(
-            era5_p_idx_all, pangu_idx_all, args.n_samples, rng, era5_prior_idx=era5_p_prior_all)
-        era5_g_idx, gc_idx, _, era5_g_prior, _ = split_pairs(
-            era5_g_idx_all, gc_idx_all, args.n_samples, rng, era5_prior_idx=era5_g_prior_all)
+    era5_p_ref_idx, era5_p_ref_prior = cap_indices(
+        era5_p_ref_idx, era5_p_ref_prior, args.n_samples, rng)
+    era5_g_ref_idx, era5_g_ref_prior = cap_indices(
+        era5_g_ref_idx, era5_g_ref_prior, args.n_samples, rng)
+    pangu_idx, pangu_prior = cap_indices(pangu_idx, pangu_prior, args.n_samples, rng)
+    gc_idx,    gc_prior    = cap_indices(gc_idx,    gc_prior,    args.n_samples, rng)
+
+    # Baseline pool: either reuse the forecast-range Pangu ref pool, or build a
+    # larger pool that spans every year in the ERA5 file at the forecast hours.
+    if args.baseline_pool == "all-years":
+        print("  Baseline ERA5 pool (all-years):")
+        base_pool_idx, base_pool_prior = build_era5_ref_pool(
+            era5_path, pangu_path, prior_hours=prior_hours, restrict_date_range=False)
     else:
-        era5_p_idx_all, pangu_idx_all = pangu_paired
-        era5_g_idx_all, gc_idx_all    = gc_paired
-        era5_p_idx, pangu_idx, era5_base_idx = split_pairs(
-            era5_p_idx_all, pangu_idx_all, args.n_samples, rng)
-        era5_g_idx, gc_idx, _ = split_pairs(
-            era5_g_idx_all, gc_idx_all, args.n_samples, rng)
-        era5_p_prior = era5_g_prior = era5_base_prior = None
+        base_pool_idx, base_pool_prior = era5_p_ref_idx, era5_p_ref_prior
+
+    # Cap the baseline pool to 2 * baseline_n_per_half so each half can reach
+    # the requested size. Defaults to n_samples per half (matches forecast N).
+    half_n = args.baseline_n_per_half if args.baseline_n_per_half is not None else args.n_samples
+    base_pool_idx, base_pool_prior = cap_indices(
+        base_pool_idx, base_pool_prior, 2 * half_n, rng)
+
+    (base_a_idx, base_a_prior), (base_b_idx, base_b_prior) = split_indices(
+        base_pool_idx, base_pool_prior, rng)
 
     n_pangu = len(pangu_idx)
     n_gc    = len(gc_idx)
-    n_base  = len(era5_base_idx)
+    n_ref_p = len(era5_p_ref_idx)
+    n_ref_g = len(era5_g_ref_idx)
+    n_base  = len(base_a_idx)
 
-    if n_base < args.n_samples:
-        print(f"\nNote: requested n_samples={args.n_samples} but paired pool only "
-              f"supports {n_base} per half. Forecast and baseline both run at N={n_base}.")
-    print(f"\nUsing {n_pangu} Pangu pairs, {n_gc} GraphCast pairs, "
-          f"and {n_base} ERA5 baseline samples (disjoint Pangu-paired half, "
-          f"matched diurnal coverage).")
+    print(f"\nERA5 ref (Pangu pool): {n_ref_p}    ERA5 ref (GraphCast pool): {n_ref_g}")
+    print(f"Pangu forecasts: {n_pangu}    GraphCast forecasts: {n_gc}")
+    print(f"Baseline halves: {n_base} each (pool: {args.baseline_pool}).")
 
     stats = (
         np.load(stats_dir / "data_mean.npy"),
@@ -592,26 +631,28 @@ def main():
 
         if args.temporal_mode == "none":
             loaders = {
-                "era5_p":    DataLoader(Subset(era5_ds,  era5_p_idx),    **loader_kw),
-                "pangu":     DataLoader(Subset(pangu_ds, pangu_idx),     **loader_kw),
-                "era5_g":    DataLoader(Subset(era5_ds,  era5_g_idx),    **loader_kw),
-                "graphcast": DataLoader(Subset(gc_ds,    gc_idx),        **loader_kw),
-                "era5_base": DataLoader(Subset(era5_ds,  era5_base_idx), **loader_kw),
+                "era5_p_ref": DataLoader(Subset(era5_ds,  era5_p_ref_idx), **loader_kw),
+                "era5_g_ref": DataLoader(Subset(era5_ds,  era5_g_ref_idx), **loader_kw),
+                "pangu":      DataLoader(Subset(pangu_ds, pangu_idx),      **loader_kw),
+                "graphcast":  DataLoader(Subset(gc_ds,    gc_idx),         **loader_kw),
+                "base_a":     DataLoader(Subset(era5_ds,  base_a_idx),     **loader_kw),
+                "base_b":     DataLoader(Subset(era5_ds,  base_b_idx),     **loader_kw),
             }
         else:
             # Temporal eval: present-side may be ERA5 (real) or a forecast.
-            # Prior side is always ERA5 at the index t − Δt.
+            # Prior side is always ERA5 at the present timestamp − Δt.
             def _tpd(prior_ds, present_ds, prior_idx, present_idx):
                 return TemporalPairDataset(
                     prior_ds, present_ds, prior_idx, present_idx,
                     args.temporal_mode, abs_stats=stats, diff_stats=diff_stats,
                 )
             loaders = {
-                "era5_p":    DataLoader(_tpd(era5_ds, era5_ds,  era5_p_prior,    era5_p_idx),    **loader_kw),
-                "pangu":     DataLoader(_tpd(era5_ds, pangu_ds, era5_p_prior,    pangu_idx),     **loader_kw),
-                "era5_g":    DataLoader(_tpd(era5_ds, era5_ds,  era5_g_prior,    era5_g_idx),    **loader_kw),
-                "graphcast": DataLoader(_tpd(era5_ds, gc_ds,    era5_g_prior,    gc_idx),        **loader_kw),
-                "era5_base": DataLoader(_tpd(era5_ds, era5_ds,  era5_base_prior, era5_base_idx), **loader_kw),
+                "era5_p_ref": DataLoader(_tpd(era5_ds, era5_ds,  era5_p_ref_prior, era5_p_ref_idx), **loader_kw),
+                "era5_g_ref": DataLoader(_tpd(era5_ds, era5_ds,  era5_g_ref_prior, era5_g_ref_idx), **loader_kw),
+                "pangu":      DataLoader(_tpd(era5_ds, pangu_ds, pangu_prior,      pangu_idx),      **loader_kw),
+                "graphcast":  DataLoader(_tpd(era5_ds, gc_ds,    gc_prior,         gc_idx),         **loader_kw),
+                "base_a":     DataLoader(_tpd(era5_ds, era5_ds,  base_a_prior,     base_a_idx),     **loader_kw),
+                "base_b":     DataLoader(_tpd(era5_ds, era5_ds,  base_b_prior,     base_b_idx),     **loader_kw),
             }
 
         feats = {}
@@ -619,21 +660,25 @@ def main():
             print(f"  Extracting features: {name} ({len(loader.dataset)} samples)...")
             feats[name] = extract_features_for_loader(model, loader, device)
 
-        # Both baseline halves come from the same Pangu-paired time pool at matched N,
-        # so this is a true within-distribution noise floor.
-        print(f"  Computing ERA5 self-baseline (N={len(era5_base_idx)} vs N={n_pangu})...")
+        # Baseline = random 50/50 split of the (Pangu) ERA5 reference pool.
+        # The forecast comparison uses the full ref pool on the ERA5 side and
+        # the full forecast pool on the forecast side — no per-sample pairing.
+        print(f"  Computing FID/MMD: forecast (N_ref={n_ref_p}, N_fc={n_pangu}) and "
+              f"baseline (N={n_base} vs {n_base})...")
         results[model_name] = {
-            "era5_self": compute_era5_self_baseline(feats["era5_p"], feats["era5_base"]),
-            "pangu":     compute_distances(feats["era5_p"], feats["pangu"]),
-            "graphcast": compute_distances(feats["era5_g"], feats["graphcast"]),
+            "era5_self": compute_distances(feats["base_a"],     feats["base_b"]),
+            "pangu":     compute_distances(feats["era5_p_ref"], feats["pangu"]),
+            "graphcast": compute_distances(feats["era5_g_ref"], feats["graphcast"]),
         }
         all_feats[model_name] = {
-            "era5":      feats["era5_p"].numpy(),   # representative ERA5 distribution
+            "era5":      feats["era5_p_ref"].numpy(),   # representative ERA5 distribution
             "pangu":     feats["pangu"].numpy(),
             "graphcast": feats["graphcast"].numpy(),
         }
 
-    print_metrics_table(results, models_to_run, n_pangu, n_gc, device, label_suffix=label_suffix)
+    sizes = {"n_ref_p": n_ref_p, "n_ref_g": n_ref_g,
+             "n_pangu": n_pangu, "n_gc": n_gc, "n_base": n_base}
+    print_metrics_table(results, models_to_run, sizes, device, label_suffix=label_suffix)
 
     tag_parts = [args.model_size]
     if args.embed_dim is not None:
@@ -644,6 +689,7 @@ def main():
         tag_parts.append(args.variant)
     tag_parts.append(f"n{n_pangu}_seed{args.seed}")
     tag_parts.append(f"pool-{os.environ.get('EXTRACT_FEATURES_POOLING', 'mean').lower()}")
+    tag_parts.append(f"base-{args.baseline_pool}")
     run_tag = "_".join(tag_parts)
 
     if args.output_dir:
