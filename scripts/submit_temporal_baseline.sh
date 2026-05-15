@@ -86,6 +86,8 @@ python eval/eval_real_vs_forecast.py \
     --n-samples $N_SAMPLES \
     --batch-size 32 \
     --num-workers $WORKERS \
+    --baseline-pool all-years \
+    --baseline-n-per-half 1000 \
     --output-dir "$OUTPUT_DIR"
 
 echo -e "\nDone. Results: $OUTPUT_DIR/plots/real_vs_forecast/"

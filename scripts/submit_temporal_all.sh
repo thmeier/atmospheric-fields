@@ -121,6 +121,8 @@ run_phase () {
         --n-samples $N_SAMPLES \
         --batch-size 32 \
         --num-workers $WORKERS \
+        --baseline-pool all-years \
+        --baseline-n-per-half 1000 \
         --output-dir "$out_dir"
     local eval_rc=$?
 
