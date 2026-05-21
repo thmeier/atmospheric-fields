@@ -1,7 +1,7 @@
 """Compute latent-FID(ERA5-GT, forecast_at_lead) for the poster's bottom panel.
 
-For each forecast model (IFS HRES, GraphCast) and each lead time
-{6, 12, 24, 48, 96, 192} hours, this script computes FID in two modes:
+For each forecast model (IFS HRES, GraphCast, Pangu-Weather) and each lead
+time {6, 12, 24, 48, 96, 192} hours, this script computes FID in two modes:
 
 Non-temporal (default):
   Uses the standard 4-channel I-JEPA from results/may_07_512_encoder/.
@@ -14,7 +14,7 @@ Temporal (--temporal flag):
   Builds a temporal pair (X_t = forecast, X_{t-24h} = ERA5-GT ground truth)
   and feeds the phase-composed 8-channel tensor to the target encoder.
 
-Output: plots/poster_fid_leadtime_data.npz (non-temporal) or
+Output: plots/poster_fid_leadtime_data_nontemporal.npz (non-temporal) or
         plots/poster_fid_leadtime_data_temporal.npz (--temporal).
 Override with --output.
 
@@ -198,6 +198,10 @@ def parse_args():
         default=Path("data/forecasts_2020/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"),
     )
     parser.add_argument(
+        "--pangu", type=Path,
+        default=Path("data/forecasts_2020/pangu_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"),
+    )
+    parser.add_argument(
         "--era5-gt", type=Path,
         default=Path("data/forecasts_2020/era5-gt_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"),
     )
@@ -224,7 +228,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--output", type=Path, default=None,
-                        help="Output .npz path. Defaults to plots/poster_fid_leadtime_data.npz "
+                        help="Output .npz path. Defaults to plots/poster_fid_leadtime_data_nontemporal.npz "
                              "(non-temporal) or plots/poster_fid_leadtime_data_temporal.npz "
                              "(--temporal).")
     return parser.parse_args()
@@ -246,7 +250,7 @@ def main():
         if args.temporal:
             args.output = Path("plots/poster_fid_leadtime_data_temporal.npz")
         else:
-            args.output = Path("plots/poster_fid_leadtime_data.npz")
+            args.output = Path("plots/poster_fid_leadtime_data_nontemporal.npz")
 
     # -----------------------------------------------------------------------
     # Load model and stats
@@ -321,7 +325,11 @@ def main():
     # -----------------------------------------------------------------------
     # Loop over (forecast model, lead time)
     # -----------------------------------------------------------------------
-    forecast_paths = {"ifs_hres": args.ifs, "graphcast": args.graphcast}
+    forecast_paths = {
+        "ifs_hres": args.ifs,
+        "graphcast": args.graphcast,
+        "pangu": args.pangu,
+    }
     fid_results = {k: [] for k in forecast_paths}
     n_used_results = {k: [] for k in forecast_paths}
 
@@ -374,8 +382,10 @@ def main():
         lead_times_hours=np.array(LEAD_HOURS, dtype=np.int64),
         fid_ifs_hres=np.array(fid_results["ifs_hres"], dtype=np.float64),
         fid_graphcast=np.array(fid_results["graphcast"], dtype=np.float64),
+        fid_pangu=np.array(fid_results["pangu"], dtype=np.float64),
         n_used_ifs_hres=np.array(n_used_results["ifs_hres"], dtype=np.int64),
         n_used_graphcast=np.array(n_used_results["graphcast"], dtype=np.int64),
+        n_used_pangu=np.array(n_used_results["pangu"], dtype=np.int64),
         n_ref=np.int64(n_ref),
         n_samples_cap=np.int64(args.n_samples),
         seed=np.int64(args.seed),
@@ -384,12 +394,14 @@ def main():
         era5_gt_path=str(args.era5_gt),
         ifs_path=str(args.ifs),
         graphcast_path=str(args.graphcast),
+        pangu_path=str(args.pangu),
     )
     print(f"\nSaved: {args.output}")
     print("\nSummary (FID vs ERA5 reference):")
-    print(f"  {'lead (h)':>8}  {'IFS HRES':>10}  {'GraphCast':>10}")
+    print(f"  {'lead (h)':>8}  {'IFS HRES':>10}  {'GraphCast':>10}  {'Pangu':>10}")
     for i, lh in enumerate(LEAD_HOURS):
-        print(f"  {lh:>8d}  {fid_results['ifs_hres'][i]:>10.4f}  {fid_results['graphcast'][i]:>10.4f}")
+        print(f"  {lh:>8d}  {fid_results['ifs_hres'][i]:>10.4f}  "
+              f"{fid_results['graphcast'][i]:>10.4f}  {fid_results['pangu'][i]:>10.4f}")
 
 
 if __name__ == "__main__":

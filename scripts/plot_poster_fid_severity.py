@@ -101,7 +101,7 @@ def fid_curve(model, loader, device, apply_fn, severities, label):
 # -- Plotting ---------------------------------------------------------------
 def style_axis(ax):
     ax.set_facecolor("white")
-    ax.tick_params(colors=INK_BLACK, labelsize=12, width=1.0)
+    ax.tick_params(colors=INK_BLACK, labelsize=18, width=1.0)
     for spine in ax.spines.values():
         spine.set_edgecolor(INK_BLACK)
         spine.set_linewidth(1.2)
@@ -126,7 +126,7 @@ def plot_figure(severities, fid_noise, fid_rotation, output_path):
     ax_top.plot(
         severities, fid_rotation,
         marker="s", markersize=11, lw=3.0,
-        color=BLUSH_PINK, label="Channel Rotation",
+        color=BLUSH_PINK, label="Wind-Vector Rotation",
         markeredgecolor=INK_BLACK, markeredgewidth=0.8,
     )
 
@@ -134,17 +134,18 @@ def plot_figure(severities, fid_noise, fid_rotation, output_path):
     # below `linthresh`, log scale above. Picked just below the smallest
     # positive FID so the linear band is barely visible.
     ax_top.set_yscale("symlog", linthresh=1e-4, linscale=0.5)
-    ax_top.set_ylim(bottom=0)  # no negative region — FID is non-negative
+    ax_top.set_ylim(bottom=0)
+    ax_top.tick_params(axis="y", labelleft=False)  # no negative region — FID is non-negative
     ax_top.set_xlim(0.0, 1.05)
     ax_top.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
-    ax_top.set_xlabel("Corruption Severity", fontsize=15, color=INK_BLACK, labelpad=8)
-    ax_top.set_ylabel("Latent FID (symlog)", fontsize=15, color=INK_BLACK, labelpad=8)
+    ax_top.set_xlabel("Corruption Severity", fontsize=22, color=INK_BLACK, labelpad=10)
+    ax_top.set_ylabel("Latent FID (symlog)", fontsize=22, color=INK_BLACK, labelpad=10)
     ax_top.set_title(
         "I-JEPA Sensitivity to Synthetic Corruptions",
-        fontsize=17, color=INK_BLACK, fontweight="bold", pad=12,
+        fontsize=26, color=INK_BLACK, fontweight="bold", pad=14,
     )
     legend = ax_top.legend(
-        fontsize=13, loc="lower right",
+        fontsize=20, loc="lower right",
         frameon=True, facecolor="white", edgecolor=INK_BLACK,
         labelcolor=INK_BLACK,
     )
@@ -156,17 +157,17 @@ def plot_figure(severities, fid_noise, fid_rotation, output_path):
     ax_bot.set_ylim(1e-1, 1e3)
     ax_bot.set_yscale("log")
     ax_bot.set_xticks([0, 24, 48, 72, 120, 168, 240])
-    ax_bot.set_xlabel("Forecast Lead Time (hours)", fontsize=15, color=INK_BLACK, labelpad=8)
-    ax_bot.set_ylabel("Latent FID (log scale)", fontsize=15, color=INK_BLACK, labelpad=8)
+    ax_bot.set_xlabel("Forecast Lead Time (hours)", fontsize=22, color=INK_BLACK, labelpad=10)
+    ax_bot.set_ylabel("Latent FID (log scale)", fontsize=22, color=INK_BLACK, labelpad=10)
     ax_bot.set_title(
         "I-JEPA: Forecast Realism vs Lead Time",
-        fontsize=17, color=INK_BLACK, fontweight="bold", pad=12,
+        fontsize=26, color=INK_BLACK, fontweight="bold", pad=14,
     )
     ax_bot.text(
         0.5, 0.5,
         "Work in Progress",
         ha="center", va="center",
-        fontsize=28, color=INK_BLACK, fontweight="bold",
+        fontsize=36, color=INK_BLACK, fontweight="bold",
         transform=ax_bot.transAxes,
         bbox=dict(
             boxstyle="round,pad=0.8",
@@ -264,8 +265,8 @@ def main():
     parser.add_argument("--cluster", action="store_true",
                         help="Use the cluster ERA5 path.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", default=str(REPO / "plots" / "poster_fid_severity.pdf"))
-    parser.add_argument("--cache", default=str(REPO / "plots" / "poster_fid_severity_data.npz"),
+    parser.add_argument("--output", default=str(REPO / "plots" / "poster_fid_severity_nontemporal.pdf"))
+    parser.add_argument("--cache", default=str(REPO / "plots" / "poster_fid_severity_data_nontemporal.npz"),
                         help="Path to .npz cache for the computed FID curves.")
     parser.add_argument("--recompute", action="store_true",
                         help="Force re-evaluation; overwrite the cache if present.")

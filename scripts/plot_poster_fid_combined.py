@@ -22,6 +22,7 @@ INK_BLACK = "#0D1821"
 YALE_BLUE = "#344966"
 BLUSH_PINK = "#E6AACE"
 PORCELAIN = "#F0F4EF"
+AMBER = "#C28F2C"  # third forecast line (Pangu)
 
 mpl.rcParams["font.family"] = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
 mpl.rcParams["pdf.fonttype"] = 42
@@ -79,6 +80,7 @@ def draw_leadtime_panel(ax, lt_npz_path):
     leads          = d["lead_times_hours"]
     fid_ifs_hres   = np.maximum(d["fid_ifs_hres"], 0.0)
     fid_graphcast  = np.maximum(d["fid_graphcast"], 0.0)
+    fid_pangu      = np.maximum(d["fid_pangu"], 0.0) if "fid_pangu" in d.files else None
 
     style_axis(ax)
     ax.plot(
@@ -93,6 +95,13 @@ def draw_leadtime_panel(ax, lt_npz_path):
         color=BLUSH_PINK, label="GraphCast",
         markeredgecolor=INK_BLACK, markeredgewidth=0.8,
     )
+    if fid_pangu is not None:
+        ax.plot(
+            leads, fid_pangu,
+            marker="v", markersize=11, lw=3.0,
+            color=AMBER, label="Pangu-Weather",
+            markeredgecolor=INK_BLACK, markeredgewidth=0.8,
+        )
     ax.set_yscale("symlog", linthresh=1e-4, linscale=0.5)
     ax.set_ylim(bottom=0)
     ax.tick_params(axis="y", labelcolor="#999999", labelsize=14)
@@ -123,7 +132,7 @@ def parse_args():
     )
     parser.add_argument(
         "--leadtime-npz", type=Path,
-        default=Path("plots/poster_fid_leadtime_data.npz"),
+        default=Path("plots/poster_fid_leadtime_data_nontemporal.npz"),
     )
     parser.add_argument(
         "--output", type=Path,
@@ -146,6 +155,10 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, bbox_inches="tight", facecolor="white")
     print(f"Saved: {args.output}")
+    if args.output.suffix.lower() == ".pdf":
+        png_path = args.output.with_suffix(".png")
+        fig.savefig(png_path, dpi=200, bbox_inches="tight", facecolor="white")
+        print(f"Saved: {png_path}")
 
 
 if __name__ == "__main__":
