@@ -1,4 +1,4 @@
-"""Side-by-side temperature comparison for poster: GraphCast | ERA5 | Pangu.
+"""Side-by-side temperature comparison for poster: GraphCast | ERA5.
 
 Renders the same valid day from each source with continent overlays. Big
 captions sit directly below each subplot so a sticky note can cover them for
@@ -27,7 +27,6 @@ DATA = REPO / "data"
 SOURCES = [
     ("(A) GraphCast", DATA / "graphcast_surface_2020_lead24h.nc"),
     ("(B) ERA5",      DATA / "test_data_local.nc"),
-    ("(C) Pangu",     DATA / "pangu_surface_2020_lead24h.nc"),
 ]
 
 
@@ -44,7 +43,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default="2020-07-15T12:00:00",
                         help="ISO timestamp present in all three datasets")
-    parser.add_argument("--output", default=str(REPO / "plots" / "forecast_comparison_triple.pdf"))
+    parser.add_argument("--output", default=str(REPO / "plots" / "forecast_comparison_pair.pdf"))
     parser.add_argument("--cmap", default="RdBu_r",
                         help="Matplotlib colormap (blue=cold, red=hot)")
     args = parser.parse_args()
@@ -53,7 +52,7 @@ def main():
 
     fields = [(name, load_temperature(path, target)) for name, path in SOURCES]
 
-    # Shared color limits across all three so they are directly comparable.
+    # Shared color limits across both so they are directly comparable.
     stacked = np.concatenate([f.values.ravel() for _, f in fields])
     vmin, vmax = np.percentile(stacked, [1, 99])
 
@@ -61,8 +60,8 @@ def main():
     data_crs = ccrs.PlateCarree()
 
     fig, axes = plt.subplots(
-        1, 3,
-        figsize=(18, 4.2),
+        1, 2,
+        figsize=(18, 5.5),
         subplot_kw={"projection": proj},
         constrained_layout=False,
     )
