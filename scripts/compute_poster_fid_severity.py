@@ -1,19 +1,28 @@
-"""Compute latent-FID(clean ERA5, corrupted ERA5) for the poster's top panel,
-using the temporal-exp3 I-JEPA (8-channel phase input).
+"""Compute latent-FID(clean ERA5, corrupted ERA5) for the poster's top panel.
 
-Difference from the original scripts/plot_poster_fid_severity.py:
-  * Uses the temporal exp3 checkpoint (results/may_13_temporal_exp3_phase_d512_maxpool/).
-  * Corruption is applied to the RAW present frame, then the 8-channel temporal
-    input is re-composed via utils/temporal.compose_temporal_input — so the
-    absolute (X_t) and diff (X_t - X_{t-24h}) halves of the model input stay
-    consistent. Applying the corruption to the already-composed 8-channel
-    tensor would leave the diff channels reflecting the clean past, which
-    pushes the model far out-of-distribution for reasons unrelated to the
-    corruption itself.
+Mirrors scripts/compute_poster_fid_leadtime.py: runs in two modes.
 
-Writes plots/poster_fid_severity_data.npz with the same key schema the
-original script used (severities, fid_noise, fid_rotation), so the existing
-scripts/plot_poster_fid_combined.py consumes it unchanged.
+Non-temporal (default):
+  Uses the standard 4-channel I-JEPA from results/may_07_512_encoder/.
+  Each (corrupted) snapshot is normalized with abs_mean/abs_std and fed
+  directly to the encoder — no prior frame needed.
+
+Temporal (--temporal flag):
+  Uses the 8-channel temporal-exp3 I-JEPA from
+  results/may_13_temporal_exp3_phase_d512_maxpool/.
+  Corruption is applied to the RAW present frame, then the 8-channel temporal
+  input is re-composed via utils/temporal.compose_temporal_input — so the
+  absolute (X_t) and diff (X_t - X_{t-24h}) halves of the model input stay
+  consistent. Applying the corruption to the already-composed 8-channel
+  tensor would leave the diff channels reflecting the clean past, which
+  pushes the model far out-of-distribution for reasons unrelated to the
+  corruption itself.
+
+Output: plots/poster_fid_severity_data_nontemporal.npz (non-temporal) or
+        plots/poster_fid_severity_data_temporal.npz (--temporal).
+Override with --output. The key schema (severities, fid_noise, fid_rotation)
+is identical in both modes, so scripts/plot_poster_fid_combined.py consumes
+either unchanged.
 """
 
 import sys
@@ -86,43 +95,52 @@ def corrupt_raw_present(present_raw, severity, apply_fn, abs_mean, abs_std):
     return present_norm_corrupted * s + m
 
 
-class CorruptedTemporalPairDataset(Dataset):
-    """Yields 8-channel temporal-phase input where the present frame has been
-    corrupted in raw space before composition.
+class CorruptedSeverityDataset(Dataset):
+    """Yields model input where the present frame has been corrupted in raw
+    space before composition.
+
+    temporal=True  -> 8-channel temporal-phase input (needs prior_idx).
+    temporal=False -> 4-channel "none" input (prior_idx ignored).
 
     severity=0 (and apply_fn=None) yields the clean reference distribution.
     """
 
     def __init__(self, source, present_idx, prior_idx,
                  severity, apply_fn,
-                 abs_mean, abs_std, diff_mean, diff_std):
-        if len(present_idx) != len(prior_idx):
+                 abs_mean, abs_std, diff_mean, diff_std, temporal):
+        if temporal and len(present_idx) != len(prior_idx):
             raise ValueError("present_idx and prior_idx must match in length")
         self.source = source
         self.present_idx = list(present_idx)
-        self.prior_idx = list(prior_idx)
+        self.prior_idx = list(prior_idx) if prior_idx is not None else None
         self.severity = severity
         self.apply_fn = apply_fn
         self.abs_mean = abs_mean
         self.abs_std = abs_std
         self.diff_mean = diff_mean
         self.diff_std = diff_std
+        self.temporal = temporal
 
     def __len__(self):
         return len(self.present_idx)
 
     def __getitem__(self, i):
         present_raw = self.source.read_raw(self.present_idx[i])
-        prior_raw   = self.source.read_raw(self.prior_idx[i])
         if self.severity > 0 and self.apply_fn is not None:
             present_raw = corrupt_raw_present(
                 present_raw, self.severity, self.apply_fn,
                 self.abs_mean, self.abs_std,
             )
-        sample = compose_temporal_input(
-            present_raw, prior_raw, "phase",
-            self.abs_mean, self.abs_std, self.diff_mean, self.diff_std,
-        )
+        if self.temporal:
+            prior_raw = self.source.read_raw(self.prior_idx[i])
+            sample = compose_temporal_input(
+                present_raw, prior_raw, "phase",
+                self.abs_mean, self.abs_std, self.diff_mean, self.diff_std,
+            )
+        else:
+            sample = compose_temporal_input(
+                present_raw, None, "none", self.abs_mean, self.abs_std,
+            )
         return torch.from_numpy(sample)
 
 
@@ -131,7 +149,7 @@ def features_for_dataset(model, dataset, device, batch_size, num_workers, label)
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=device.type == "cuda",
     )
-    print(f"  Extracting features: {label} ({len(dataset)} pairs)...")
+    print(f"  Extracting features: {label} ({len(dataset)} samples)...")
     return extract_features_for_loader(model, loader, device)
 
 
@@ -152,7 +170,17 @@ def parse_args():
     )
     parser.add_argument(
         "--model-dir", type=Path,
+        default=Path("results/may_07_512_encoder"),
+        help="Model directory for the non-temporal 4-channel I-JEPA (used unless --temporal).",
+    )
+    parser.add_argument(
+        "--temporal-model-dir", type=Path,
         default=Path("results/may_13_temporal_exp3_phase_d512_maxpool"),
+        help="Model directory for the temporal 8-channel I-JEPA (used with --temporal).",
+    )
+    parser.add_argument(
+        "--temporal", action="store_true",
+        help="Use the 8-channel temporal-exp3 model instead of the 4-channel non-temporal one.",
     )
     parser.add_argument("--n-samples", type=int, default=400)
     parser.add_argument("--n-severity-steps", type=int, default=5,
@@ -161,8 +189,10 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    parser.add_argument("--output", type=Path,
-                        default=Path("plots/poster_fid_severity_data_temporal.npz"))
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output .npz path. Defaults to "
+                             "plots/poster_fid_severity_data_nontemporal.npz (non-temporal) or "
+                             "plots/poster_fid_severity_data_temporal.npz (--temporal).")
     return parser.parse_args()
 
 
@@ -177,38 +207,65 @@ def main():
         device = torch.device(args.device)
     print(f"Device: {device}")
 
-    # Model + stats
-    model_path = args.model_dir / "best_ijepa_model_twin_d512_tm-phase.pth"
-    abs_mean  = np.load(args.model_dir / "data_mean.npy")
-    abs_std   = np.load(args.model_dir / "data_std.npy")
-    diff_mean = np.load(args.model_dir / "diff_mean_dt24h.npy")
-    diff_std  = np.load(args.model_dir / "diff_std_dt24h.npy")
+    # Default output path depends on which model is used.
+    if args.output is None:
+        if args.temporal:
+            args.output = Path("plots/poster_fid_severity_data_temporal.npz")
+        else:
+            args.output = Path("plots/poster_fid_severity_data_nontemporal.npz")
 
-    print(f"\nLoading model: {model_path}")
+    # Model + stats
+    if args.temporal:
+        model_dir = args.temporal_model_dir
+        model_path = model_dir / "best_ijepa_model_twin_d512_tm-phase.pth"
+        abs_mean  = np.load(model_dir / "data_mean.npy")
+        abs_std   = np.load(model_dir / "data_std.npy")
+        diff_mean = np.load(model_dir / "diff_mean_dt24h.npy")
+        diff_std  = np.load(model_dir / "diff_std_dt24h.npy")
+        in_chans = 8
+        print(f"\nMode: temporal (8-channel phase, {model_dir.name})")
+    else:
+        model_dir = args.model_dir
+        model_path = model_dir / "best_ijepa_model_twin_d512.pth"
+        abs_mean = np.load(model_dir / "data_mean.npy")
+        abs_std  = np.load(model_dir / "data_std.npy")
+        diff_mean = diff_std = None
+        in_chans = 4
+        print(f"\nMode: non-temporal (4-channel, {model_dir.name})")
+
+    print(f"Loading model: {model_path}")
     model = build_model("ijepa", device=device, model_size="twin",
-                        embed_dim=512, in_chans=8)
+                        embed_dim=512, in_chans=in_chans)
     model = load_model_checkpoint("ijepa", model, model_path, device)
     model.eval()
 
-    # ERA5 source — clean present + clean 24h-prior pairs
+    # ERA5 source — clean present (+ clean 24h-prior in temporal mode)
     print(f"\nLoading ERA5 source into memory: {args.data}")
     src = InMemoryRawSource(args.data)
     print(f"  {len(src)} samples; first/last: {src.times[0]} / {src.times[-1]}")
 
-    # Build pair indices: present at i, prior at i - delta_steps (24h on 6h grid).
-    valid_present = np.arange(DELTA_STEPS_6H, len(src))
-    n_avail = len(valid_present)
-    n_use = min(args.n_samples, n_avail)
-    chosen = rng.permutation(n_avail)[:n_use]
-    present_idx = valid_present[chosen].tolist()
-    prior_idx   = (valid_present[chosen] - DELTA_STEPS_6H).tolist()
-    print(f"  Using {n_use}/{n_avail} pair samples")
+    if args.temporal:
+        # Build pair indices: present at i, prior at i - delta_steps (24h on 6h grid).
+        valid_present = np.arange(DELTA_STEPS_6H, len(src))
+        n_avail = len(valid_present)
+        n_use = min(args.n_samples, n_avail)
+        chosen = rng.permutation(n_avail)[:n_use]
+        present_idx = valid_present[chosen].tolist()
+        prior_idx   = (valid_present[chosen] - DELTA_STEPS_6H).tolist()
+        print(f"  Using {n_use}/{n_avail} pair samples")
+    else:
+        # Non-temporal: no prior needed; sample present frames over all of src.
+        n_avail = len(src)
+        n_use = min(args.n_samples, n_avail)
+        present_idx = rng.permutation(n_avail)[:n_use].tolist()
+        prior_idx = None
+        print(f"  Using {n_use}/{n_avail} samples")
 
     # Clean reference features (once).
-    ref_ds = CorruptedTemporalPairDataset(
+    ref_ds = CorruptedSeverityDataset(
         src, present_idx, prior_idx, severity=0.0, apply_fn=None,
         abs_mean=abs_mean, abs_std=abs_std,
-        diff_mean=diff_mean, diff_std=diff_std,
+        diff_mean=diff_mean, diff_std=diff_std, temporal=args.temporal,
     )
     z_ref = features_for_dataset(
         model, ref_ds, device, args.batch_size, args.num_workers, "clean reference",
@@ -232,10 +289,10 @@ def main():
                 fid = 0.0
                 print(f"  {key:8s}: FID = 0.0000 (clean reference)")
             else:
-                cor_ds = CorruptedTemporalPairDataset(
+                cor_ds = CorruptedSeverityDataset(
                     src, present_idx, prior_idx, severity=float(sev), apply_fn=apply_fn,
                     abs_mean=abs_mean, abs_std=abs_std,
-                    diff_mean=diff_mean, diff_std=diff_std,
+                    diff_mean=diff_mean, diff_std=diff_std, temporal=args.temporal,
                 )
                 z_cor = features_for_dataset(
                     model, cor_ds, device, args.batch_size, args.num_workers,
@@ -253,6 +310,7 @@ def main():
         fid_rotation=np.array(fid_results["rotation"], dtype=np.float64),
         n_samples=np.int64(n_use),
         seed=np.int64(args.seed),
+        temporal=bool(args.temporal),
         model_path=str(model_path),
         data_path=str(args.data),
     )
