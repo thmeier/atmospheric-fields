@@ -1,31 +1,34 @@
 # Data paths
 data_dir: "/cluster/courses/pmlr/teams/team07/data"
-real_nc_file: "${data_dir}/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
-fake_nc_file: "${data_dir}/graphcast_6steps_1.5deg_2018-01-01_2018-12-31.nc"
+real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"
+fake_nc_file:
+  - "${data_dir}/pangu_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/fuxi_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
 
-test_real_nc_file: "${data_dir}/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
-test_fake_nc_file: "${data_dir}/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+test_real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"
+test_fake_nc_file: "${data_dir}/graphcast_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
 
 # Variables and Level
 variables:
-  - "temperature"
-  - "u_component_of_wind"
-  - "v_component_of_wind"
-  - "specific_humidity"
-selected_variable: "u_component_of_wind"
-#selected_variable: "temperature"
-#selected_variable: "specific_humidity"
-level: 850
+  - "2m_temperature"
+  - "10m_u_component_of_wind"
+  - "10m_v_component_of_wind"
+  - "mean_sea_level_pressure"
+selected_variable: "mean_sea_level_pressure"
+level: null
 
 # Training Time Ranges
-train_real_range: ["2008-01-01", "2018-12-31"]
-train_fake_range: ["2018-01-01", "2018-12-31"]
+train_real_range:
+  - ["2008-01-01", "2017-12-31"]
+  - ["2020-01-01", "2020-12-31"]
+train_fake_range: ["2020-01-01", "2020-12-31"]
 
 # Testing Time Ranges
 test_real_ranges:
-  - ["2004-01-01", "2007-12-31"]
-  - ["2019-01-01", "2023-12-31"]
-test_fake_range: ["2020-01-01", "2020-12-31"]
+  - [null, "2007-12-31"]
+  - ["2018-01-01", "2019-12-31"]
+  - ["2021-01-01", null]
+test_fake_range: ["2018-01-01", "2019-12-31"]
 
 # Lead Times (hours)
 lead_times: [6, 12, 24, 48, 96, 192]
@@ -33,9 +36,9 @@ lead_times: [6, 12, 24, 48, 96, 192]
 # Sampling for analysis (0 = no limit)
 max_samples: 0
 
-batch_size: 16
+batch_size: 64
 
-epochs: 2
+epochs: 10
 #epochs: 5
 learning_rate: 1e-4
 #model_name: "resnet18"
@@ -44,6 +47,14 @@ num_workers: 4
 #augment: false
 augment: true
 augment_prob: 0.5
+field_corruption_prob: 0.5
+corruption_types:
+  - "blur"
+  - "grf"
+  - "pixel_replace"
+  - "wind_patch_shuffle"
+corruption_severity_max: 1.0
+corruption_severity_power: 2.0
 disturb_type: null
 disturb_level: 0.0
 precision: "16-mixed"
@@ -52,11 +63,6 @@ output_dir: "results"
 
 # For comparative analysis
 comparison_files:
-  "GraphCast": "${data_dir}/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "PanguWeather": "${data_dir}/pangu_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "IFS HRES": "${data_dir}/ifs-hres_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "FuXi": "${data_dir}/fuxi_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "NeuralGCM": "${data_dir}/neuralgcm_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "SphericalCNN": "${data_dir}/spherical-cnn_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "Keisler": "${data_dir}/keisler_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  "ERA5 Forecast": "${data_dir}/era5-forecast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "GraphCast": "${data_dir}/graphcast_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+  "IFS HRES": "${data_dir}/ifs_hres_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+  "ERA5 Forecast": "${data_dir}/era5_forecast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"

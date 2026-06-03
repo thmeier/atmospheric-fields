@@ -11,7 +11,7 @@ import hydra
 from omegaconf import DictConfig
 
 # Import the Dataset and Model classes from your training script
-from train_discriminator import WeatherDiscriminatorDataset, WeatherDiscriminator
+from train_discriminator import WeatherDiscriminatorDataset, WeatherDiscriminator, variables_from_config
 
 import os
 
@@ -21,16 +21,19 @@ def evaluate_and_visualize(cfg: DictConfig):
     real_nc_file = cfg.test_real_nc_file
     fake_nc_file = cfg.test_fake_nc_file
     
-    model_weights = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{cfg.selected_variable}_lightning.pth")
-    model_vars = [cfg.selected_variable]
+    model_vars = variables_from_config(cfg)
+    variable_tag = cfg.get("selected_variable", "all_fields") if len(model_vars) == 1 else "all_fields"
+    model_weights = os.path.join(cfg.output_dir, f"weather_discriminator_{cfg.model_name}_{variable_tag}_lightning.pth")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Evaluating on device: {device}")
 
     # --- Setup Data and Model ---
     with xr.open_dataset(real_nc_file) as r_ds, xr.open_dataset(fake_nc_file) as f_ds:
-        if cfg.selected_variable not in r_ds.data_vars or cfg.selected_variable not in f_ds.data_vars:
-            print(f"Skipping evaluation: {cfg.selected_variable} not found in both datasets.")
+        missing_real = [v for v in model_vars if v not in r_ds.data_vars]
+        missing_fake = [v for v in model_vars if v not in f_ds.data_vars]
+        if missing_real or missing_fake:
+            print(f"Skipping evaluation: missing real variables={missing_real}; missing fake variables={missing_fake}.")
             return
 
     test_dataset = WeatherDiscriminatorDataset(
@@ -81,7 +84,11 @@ def evaluate_and_visualize(cfg: DictConfig):
         'v_component_of_wind': {'cmap': 'viridis', 'title': 'v component of wind', 'unit': 'm/s'},
         'wind_speed': {'cmap': 'viridis', 'title': 'Wind Speed', 'unit': 'm/s'},
         'temperature': {'cmap': 'inferno', 'title': 'Temperature', 'unit': 'K'},
+        '2m_temperature': {'cmap': 'inferno', 'title': '2m Temperature', 'unit': 'K'},
+        '10m_u_component_of_wind': {'cmap': 'viridis', 'title': '10m U Wind', 'unit': 'm/s'},
+        '10m_v_component_of_wind': {'cmap': 'viridis', 'title': '10m V Wind', 'unit': 'm/s'},
         'specific_humidity': {'cmap': 'GnBu', 'title': 'Specific Humidity', 'unit': 'kg/kg'},
+        'mean_sea_level_pressure': {'cmap': 'plasma', 'title': 'Mean Sea Level Pressure', 'unit': 'Pa'},
     }
     
     plot_vars = [cfg.selected_variable]
