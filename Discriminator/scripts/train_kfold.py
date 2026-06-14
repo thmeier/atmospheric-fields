@@ -1,24 +1,60 @@
 import os
+import shutil
 import subprocess
+import sys
+from pathlib import Path
+
 import hydra
 from omegaconf import DictConfig
-import copy
-import sys
-import shutil
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
+
+NUMERICAL_MODELS = {"IFS HRES", "ERA5 Forecast"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def safe_model_name(name):
+    """Convert display model names into filename-safe tags."""
+    return name.replace(" ", "_").replace("/", "_")
+
+
+def training_file_for_comparison(path_2020):
+    """Prefer the matching 2018 file; fall back to the configured path."""
+    path_2018 = path_2020.replace("2020-01-01_2020-12-31", "2018-01-01_2018-12-31")
+    if os.path.exists(path_2018):
+        return path_2018
+    if os.path.exists(path_2020):
+        return path_2020
+    return None
+
+
+def build_train_command(cfg, train_files, output_filename):
+    """Build a Hydra override command for one discriminator training run."""
+    train_files_arg = "[" + ",".join(train_files) + "]"
+    return [
+        sys.executable,
+        str(SCRIPT_DIR / "train_discriminator.py"),
+        f"++fake_nc_file={train_files_arg}",
+        f"++selected_variable={cfg.selected_variable}",
+        f"++model_name={cfg.model_name}",
+        f"++output_filename={output_filename}",
+        f"++project_name={cfg.project_name}_kfold",
+        f"++epochs={cfg.epochs}",
+        f"++logger={cfg.get('logger', 'csv')}",
+        "++train_fake_range=['2018-01-01','2020-12-31']",
+        "++augment=true",
+    ]
+
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
+    """Train leave-one-neural-model-out and full-pool discriminators."""
     comparison_files = cfg.comparison_files
     models = list(comparison_files.keys())
 
-    # Define numerical simulations that should ALWAYS be held out from training
-    NUMERICAL_MODELS = ["IFS HRES", "ERA5 Forecast"]
+    # Avoid retraining identical pools created by different holdout requests.
+    trained_models = {}  # key: tuple(train_files), value: output filename
 
-    trained_models = {} # key: tuple of train_files, value: output_filename
-
-    # --- Phase 1: Individual Neural Model Holdouts ---
+    # Phase 1: train one discriminator per neural model holdout.
     for model_to_exclude in models:
-        # SKIP numerical models from having their own holdout discriminator
         if model_to_exclude in NUMERICAL_MODELS:
             print(f"Skipping holdout discriminator for Numerical Model: {model_to_exclude}")
             continue
@@ -29,31 +65,26 @@ def main(cfg: DictConfig):
 
         train_files = []
         for m in models:
-            # 1. Skip the target model (Standard k-fold)
             if m == model_to_exclude:
                 continue
-
-            # 2. ALWAYS skip numerical models from training pool
             if m in NUMERICAL_MODELS:
                 continue
 
-            path_2020 = comparison_files[m]
-            # Replace 2020 range with 2018 range to get training files
-            path_2018 = path_2020.replace("2020-01-01_2020-12-31", "2018-01-01_2018-12-31")
-
-            if os.path.exists(path_2018):
-                train_files.append(path_2018)
-            elif os.path.exists(path_2020):
+            training_file = training_file_for_comparison(comparison_files[m])
+            if training_file is None:
+                continue
+            if training_file == comparison_files[m]:
                 print(f"Warning: 2018 data not found for {m}, using 2020 data instead.")
-                train_files.append(path_2020)
+            train_files.append(training_file)
 
         if not train_files:
             print(f"Error: No training files available for evaluation of {model_to_exclude}. Skipping.")
             continue
 
-        # Unique output name
-        safe_model_name = model_to_exclude.replace(' ', '_').replace('/', '_')
-        output_filename = f"discriminator_{cfg.model_name}_{cfg.selected_variable}_exclude_{safe_model_name}.pth"
+        output_filename = (
+            f"discriminator_{cfg.model_name}_{cfg.selected_variable}_"
+            f"exclude_{safe_model_name(model_to_exclude)}.pth"
+        )
 
         train_files_key = tuple(sorted(train_files))
 
@@ -71,20 +102,7 @@ def main(cfg: DictConfig):
 
         print(f"Training on AI Pool: {[os.path.basename(f) for f in train_files]}")
 
-        # Build command for train_discriminator.py
-        train_files_arg = "[" + ",".join(train_files) + "]"
-
-        cmd = [
-            sys.executable, "train_discriminator.py",
-            f"++fake_nc_file={train_files_arg}",
-            f"++selected_variable={cfg.selected_variable}",
-            f"++model_name={cfg.model_name}",
-            f"++output_filename={output_filename}",
-            f"++project_name={cfg.project_name}_kfold",
-            f"++epochs={cfg.epochs}",
-            "++train_fake_range=['2018-01-01','2020-12-31']",
-            "++augment=true" # Ensure augmentation is on, but only standard types are used in train_discriminator.py
-        ]
+        cmd = build_train_command(cfg, train_files, output_filename)
 
         print(f"Executing command: {' '.join(cmd)}")
         try:
@@ -94,7 +112,7 @@ def main(cfg: DictConfig):
         except subprocess.CalledProcessError as e:
             print(f"Failed to train for target model {model_to_exclude}: {e}")
 
-    # --- Phase 2: Full Pool (for evaluating numerical models) ---
+    # Phase 2: train one full neural pool for numerical-model evaluation.
     print(f"\n" + "="*50)
     print(f"Training Full AI Pool (for evaluating numerical models)")
     print("="*50 + "\n")
@@ -103,29 +121,15 @@ def main(cfg: DictConfig):
     for m in models:
         if m in NUMERICAL_MODELS:
             continue
-        path_2020 = comparison_files[m]
-        path_2018 = path_2020.replace("2020-01-01_2020-12-31", "2018-01-01_2018-12-31")
-        if os.path.exists(path_2018):
-            train_files.append(path_2018)
-        elif os.path.exists(path_2020):
-            train_files.append(path_2020)
+        training_file = training_file_for_comparison(comparison_files[m])
+        if training_file is not None:
+            train_files.append(training_file)
 
     output_filename = f"discriminator_{cfg.model_name}_{cfg.selected_variable}_full_pool.pth"
     train_files_key = tuple(sorted(train_files))
     
     if train_files_key not in trained_models:
-        train_files_arg = "[" + ",".join(train_files) + "]"
-        cmd = [
-            sys.executable, "train_discriminator.py",
-            f"++fake_nc_file={train_files_arg}",
-            f"++selected_variable={cfg.selected_variable}",
-            f"++model_name={cfg.model_name}",
-            f"++output_filename={output_filename}",
-            f"++project_name={cfg.project_name}_kfold",
-            f"++epochs={cfg.epochs}",
-            "++train_fake_range=['2018-01-01','2020-12-31']",
-            "++augment=true"
-        ]
+        cmd = build_train_command(cfg, train_files, output_filename)
         print(f"Executing command: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
     else:

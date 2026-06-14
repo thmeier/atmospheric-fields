@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -70,9 +72,10 @@ class WeatherEvalDataset(Dataset):
 # ==========================================
 def main():
     # --- Configuration ---
-    train_file = "/cluster/courses/pmlr/teams/team07/data/graphcast_4steps_4vars_1.5deg_2018.nc"
-    test_gc_file = "/cluster/courses/pmlr/teams/team07/data/graphcast_4steps_1.5deg_2019-01.nc"
-    test_era5_file = "/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc"
+    data_dir = os.environ.get("DATA_DIR", "data")
+    train_file = os.path.join(data_dir, "graphcast_4steps_4vars_1.5deg_2018.nc")
+    test_gc_file = os.path.join(data_dir, "graphcast_4steps_1.5deg_2019-01.nc")
+    test_era5_file = os.path.join(data_dir, "era5_1.5deg_2004-01-01_2023-12-31.nc")
     model_weights_path = "weather_discriminator_squeezenet.pth"
     
     variables = [

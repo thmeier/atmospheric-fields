@@ -1,2 +1,7 @@
-#!/bin/bash
-conda run --no-capture-output -p /home/yelberkennou/miniconda3/envs/pmlr python train_discriminator.py
+#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON="${PYTHON:-python}"
+LOGGER="${LOGGER:-csv}"
+
+"$PYTHON" scripts/train_discriminator.py logger="$LOGGER"

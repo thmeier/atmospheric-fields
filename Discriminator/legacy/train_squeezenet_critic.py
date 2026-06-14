@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -119,8 +121,9 @@ def get_squeezenet_weather(num_weather_channels):
 # ==========================================
 def main():
     # --- File Paths (TRAINING ON 2018) ---
-    gc_file = "/cluster/courses/pmlr/teams/team07/data/graphcast_4steps_4vars_1.5deg_2018.nc" 
-    era5_file = "/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc"
+    data_dir = os.environ.get("DATA_DIR", "data")
+    gc_file = os.path.join(data_dir, "graphcast_4steps_4vars_1.5deg_2018.nc")
+    era5_file = os.path.join(data_dir, "era5_1.5deg_2004-01-01_2023-12-31.nc")
     
     # --- 4 Variables ---
     variables = [

@@ -7,7 +7,7 @@ import hydra
 from omegaconf import DictConfig
 
 # Import dataset from training script
-from train_discriminator import WeatherDiscriminatorDataset
+from scripts.train_discriminator import WeatherDiscriminatorDataset
 
 def compute_psd_components(data):
     """Computes the absolute components of the 2D FFT (PSD components)."""
@@ -18,7 +18,7 @@ def compute_psd_components(data):
     # Return absolute components (flattened)
     return np.abs(fft_data).flatten()
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
 def plot_histograms(cfg: DictConfig):
     # --- Setup ---
     nc_file = cfg.nc_file

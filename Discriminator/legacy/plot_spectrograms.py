@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 from scipy import signal
 
 # Import dataset from training script
-from train_discriminator import WeatherDiscriminatorDataset
+from scripts.train_discriminator import WeatherDiscriminatorDataset
 
 def compute_2d_psd(data):
     """Computes the 2D Power Spectral Density of a 2D array."""
@@ -22,7 +22,7 @@ def compute_2d_psd(data):
     # Log scale for visualization
     return np.log10(psd + 1e-8)
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
 def plot_spectrograms(cfg: DictConfig):
     # --- Setup ---
     nc_file = cfg.nc_file

@@ -11,6 +11,7 @@ S(Q) = E_X[T(x)] - E_Q[f*(T(y))].
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib as mpl
@@ -20,13 +21,22 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader, Dataset
 
-from corruptions import apply_high_freq_noise, apply_wind_channel_rotation
-from train_discriminator import (
-    WeatherDiscriminator,
-    safe_open_dataset,
-    validate_no_train_test_overlap,
-    variables_from_config,
-)
+try:
+    from .corruptions import apply_high_freq_noise, apply_wind_channel_rotation
+    from .train_discriminator import (
+        WeatherDiscriminator,
+        safe_open_dataset,
+        validate_no_train_test_overlap,
+        variables_from_config,
+    )
+except ImportError:
+    from corruptions import apply_high_freq_noise, apply_wind_channel_rotation
+    from train_discriminator import (
+        WeatherDiscriminator,
+        safe_open_dataset,
+        validate_no_train_test_overlap,
+        variables_from_config,
+    )
 
 
 INK_BLACK = "#0D1821"
@@ -43,7 +53,7 @@ mpl.rcParams["pdf.fonttype"] = 42
 mpl.rcParams["ps.fonttype"] = 42
 
 
-DEFAULT_DATA_DIR = Path("/cluster/courses/pmlr/teams/team07/data")
+DEFAULT_DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DEFAULT_REAL = DEFAULT_DATA_DIR / "era5-gt_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
 DEFAULT_PANGU_FORECAST = DEFAULT_DATA_DIR / "pangu_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
 SCORE_KIND = "reverse_kl_variational_s_q"
@@ -51,6 +61,8 @@ EXP_CLAMP_MAX = 50.0
 
 
 class ScoreDataset(Dataset):
+    """Inference dataset for scoring real, corrupted, or forecast fields."""
+
     def __init__(
         self,
         ds,
@@ -100,6 +112,7 @@ class ScoreDataset(Dataset):
 
 
 def to_int_lead_hours(values):
+    """Convert lead-time coordinates to integer hours."""
     values = np.asarray(values)
     if np.issubdtype(values.dtype, np.timedelta64):
         return values.astype("timedelta64[h]").astype(int)
@@ -107,12 +120,14 @@ def to_int_lead_hours(values):
 
 
 def select_time_range(ds, time_range):
+    """Select one optional `[start, end]` time range from a dataset."""
     if not time_range:
         return ds
     return ds.sel(time=slice(time_range[0], time_range[1]))
 
 
 def select_time_ranges(ds, time_ranges):
+    """Select and concatenate one or more configured time ranges."""
     if not time_ranges:
         return ds
 
@@ -133,6 +148,7 @@ def select_time_ranges(ds, time_ranges):
 
 
 def select_zero_lead(ds):
+    """Return the dataset and the index of lead zero when a lead dimension exists."""
     if "prediction_timedelta" not in ds.dims:
         return ds, None
     lead_hours = to_int_lead_hours(ds.prediction_timedelta.values)
@@ -141,6 +157,7 @@ def select_zero_lead(ds):
 
 
 def stats_from_real(real_ds, variables, train_range, time_chunk=32):
+    """Compute memory-bounded ERA5/reference normalization statistics."""
     ranges = [train_range] if (
         len(train_range) == 2 and all(t is None or isinstance(t, str) for t in train_range)
     ) else train_range
@@ -176,6 +193,7 @@ def stats_from_real(real_ds, variables, train_range, time_chunk=32):
 
 
 def expectation_over_dataset(model, dataset, batch_size, num_workers, device, transform, desc):
+    """Average a transformed model-logit quantity over an inference dataset."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     values = []
     with torch.no_grad():
@@ -192,14 +210,17 @@ def expectation_over_dataset(model, dataset, batch_size, num_workers, device, tr
 
 
 def reverse_kl_critic_from_logits(logits):
+    """Map BCE logits to the reverse-KL variational critic T(x)."""
     return -torch.exp((-logits).clamp(max=EXP_CLAMP_MAX))
 
 
 def reverse_kl_conjugate_from_logits(logits):
+    """Map BCE logits to f*(T(x)) for the reverse-KL objective."""
     return logits - 1.0
 
 
 def reverse_kl_score(model, dataset, real_term, real_term_stderr, batch_size, num_workers, device, desc):
+    """Compute S(Q) = E_X[T(x)] - E_Q[f*(T(y))] for one candidate distribution."""
     conjugate_mean, conjugate_stderr = expectation_over_dataset(
         model,
         dataset,
@@ -219,6 +240,7 @@ def reverse_kl_score(model, dataset, real_term, real_term_stderr, batch_size, nu
 
 
 def load_model(cfg, variables, device, model_path=None):
+    """Load the saved discriminator weights into a freshly constructed model."""
     model = WeatherDiscriminator(len(variables), cfg.model_name).to(device)
     variable_tag = cfg.get("selected_variable", "all_fields") if len(variables) == 1 else "all_fields"
     if model_path is None:
@@ -233,6 +255,7 @@ def load_model(cfg, variables, device, model_path=None):
 
 
 def compute_real_term(model, real_ds, variables, means, stds, real_lead_index, args, device, desc):
+    """Compute the fixed E_X[T(x)] term on clean ERA5/reference samples."""
     real_dataset = ScoreDataset(
         real_ds, variables, means, stds, max_samples=args.n_samples, lead_index=real_lead_index
     )
@@ -248,6 +271,7 @@ def compute_real_term(model, real_ds, variables, means, stds, real_lead_index, a
 
 
 def compute_forecast_curve(label, path, model, real_term, real_term_stderr, variables, means, stds, args, cfg, device):
+    """Compute the reverse-KL score curve for one forecast file over lead time."""
     path = Path(path)
     if not path.exists():
         print(f"Skipping {label}: file not found at {path}")
@@ -286,27 +310,35 @@ def compute_forecast_curve(label, path, model, real_term, real_term_stderr, vari
 
 
 def compute_curves(args, cfg):
+    """Compute all discriminator curves needed by the poster figure."""
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     variables = variables_from_config(cfg)
+    poster_cfg = cfg.get("poster", {})
     real_path = Path(args.real_file or cfg.get("test_real_nc_file", DEFAULT_REAL))
     comparison_files = cfg.get("comparison_files", {})
     ifs_path = Path(args.ifs_file or comparison_files["IFS HRES"])
     graphcast_path = Path(args.graphcast_file or comparison_files["GraphCast"])
     pangu_data_dir = Path(cfg.get("data_dir", DEFAULT_DATA_DIR))
     pangu_path = Path(args.pangu_file or (pangu_data_dir / DEFAULT_PANGU_FORECAST.name))
+    graphcast_model_path = args.graphcast_holdout_model or poster_cfg.get("graphcast_holdout_model")
     if args.pangu_holdout_model is None:
         variable_tag = cfg.get("selected_variable", "all_fields") if len(variables) == 1 else "all_fields"
-        pangu_model_path = Path(cfg.output_dir) / f"weather_discriminator_{cfg.model_name}_{variable_tag}_pangu_holdout_lightning.pth"
+        pangu_model_path = Path(
+            poster_cfg.get(
+                "pangu_holdout_model",
+                Path(cfg.output_dir) / f"weather_discriminator_{cfg.model_name}_{variable_tag}_pangu_holdout_lightning.pth",
+            )
+        )
     else:
         pangu_model_path = Path(args.pangu_holdout_model)
 
     real_ds = select_time_ranges(safe_open_dataset(real_path), cfg.test_real_ranges)
     real_ds, real_lead_index = select_zero_lead(real_ds)
     means, stds = stats_from_real(safe_open_dataset(real_path), variables, cfg.train_real_range)
-    model, model_path = load_model(cfg, variables, device)
+    model, model_path = load_model(cfg, variables, device, graphcast_model_path)
 
     print(f"Device: {device}")
     print(f"Model:  {model_path}")
@@ -408,6 +440,7 @@ def compute_curves(args, cfg):
 
 
 def save_cache(cache_path, curves):
+    """Persist computed discriminator curves and provenance metadata to `.npz`."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "severities": curves["severities"],
@@ -436,6 +469,7 @@ def save_cache(cache_path, curves):
 
 
 def load_cache(cache_path, expected_test_real_ranges=None, expected_real_file=None):
+    """Load cached curves when their basic provenance matches the current run."""
     data = np.load(cache_path, allow_pickle=True)
     score_kind = str(data["score_kind"]) if "score_kind" in data else ""
     if score_kind != SCORE_KIND:
@@ -480,6 +514,7 @@ def load_cache(cache_path, expected_test_real_ranges=None, expected_real_file=No
 
 
 def style_axis(ax):
+    """Apply the poster figure's shared axis styling."""
     ax.set_facecolor("white")
     ax.tick_params(colors=INK_BLACK, labelsize=18, width=1.0)
     for spine in ax.spines.values():
@@ -489,10 +524,12 @@ def style_axis(ax):
 
 
 def add_zero_reference(ax):
+    """Draw a faint zero baseline on a score axis."""
     ax.axhline(0.0, color=INK_BLACK, linewidth=1.0, alpha=0.35)
 
 
 def set_y_scale(ax, y_scale):
+    """Apply the requested y-axis scale to one panel."""
     if y_scale == "symlog":
         ax.set_yscale("symlog", linthresh=1e-4, linscale=0.5)
     elif y_scale != "linear":
@@ -500,6 +537,7 @@ def set_y_scale(ax, y_scale):
 
 
 def resolve_npz_path(path):
+    """Resolve cached input files relative to cwd when needed."""
     path = Path(path)
     if path.exists():
         return path
@@ -510,6 +548,7 @@ def resolve_npz_path(path):
 
 
 def draw_missing_panel(ax, title, path):
+    """Render a placeholder panel when an optional input `.npz` is absent."""
     style_axis(ax)
     ax.set_title(title, fontsize=26, color=INK_BLACK, fontweight="bold", pad=14)
     ax.text(
@@ -522,6 +561,7 @@ def draw_missing_panel(ax, title, path):
 
 
 def draw_fid_severity_panel(ax, sev_npz_path):
+    """Draw the I-JEPA/FID corruption-sensitivity panel from cached data."""
     sev_npz_path = resolve_npz_path(sev_npz_path)
     if not sev_npz_path.exists():
         draw_missing_panel(ax, "I-JEPA Sensitivity to Synthetic Corruptions", sev_npz_path)
@@ -561,6 +601,7 @@ def draw_fid_severity_panel(ax, sev_npz_path):
 
 
 def draw_fid_leadtime_panel(ax, lt_npz_path):
+    """Draw the I-JEPA/FID forecast lead-time panel from cached data."""
     lt_npz_path = resolve_npz_path(lt_npz_path)
     if not lt_npz_path.exists():
         draw_missing_panel(ax, "Held-Out Forecast Divergence from ERA5", lt_npz_path)
@@ -611,6 +652,7 @@ def draw_fid_leadtime_panel(ax, lt_npz_path):
 
 
 def save_figure(fig, output_path):
+    """Save the final figure, with a PNG companion for PDF outputs."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, bbox_inches="tight", facecolor="white")
@@ -624,6 +666,7 @@ def save_figure(fig, output_path):
 
 
 def plot_figure(curves, output_path, y_scale="linear", fid_severity_npz=None, fid_leadtime_npz=None):
+    """Assemble and save the 2x2 discriminator/I-JEPA poster figure."""
     fig_sq, axes = plt.subplots(2, 2, figsize=(17, 11), constrained_layout=True)
     ax_top, ax_fid_top = axes[0]
     ax_bot, ax_fid_bot = axes[1]
@@ -695,21 +738,30 @@ def plot_figure(curves, output_path, y_scale="linear", fid_severity_npz=None, fi
     save_figure(fig_sq, output_path)
 
 
-def load_cfg():
-    from hydra import compose, initialize
+def load_cfg(config_name):
+    """Load a Hydra config outside a Hydra-decorated entrypoint."""
+    from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
 
     GlobalHydra.instance().clear()
-    with initialize(version_base=None, config_path="conf"):
-        return compose(config_name="config")
+    config_dir = Path(__file__).resolve().parent.parent / "conf"
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+        return compose(config_name=config_name)
 
 
 def main():
+    """Parse CLI arguments, load/cache curves, and render the poster figure."""
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config-name",
+        default="poster_config",
+        help="Hydra config name from conf/ to use for poster provenance.",
+    )
     parser.add_argument("--real-file", default=None)
     parser.add_argument("--ifs-file", default=None)
     parser.add_argument("--graphcast-file", default=None)
     parser.add_argument("--pangu-file", default=None)
+    parser.add_argument("--graphcast-holdout-model", default=None)
     parser.add_argument("--pangu-holdout-model", default=None)
     parser.add_argument("--n-severity-steps", type=int, default=7)
     parser.add_argument("--n-samples", type=int, default=400)
@@ -732,7 +784,7 @@ def main():
     parser.add_argument("--y-scale", choices=("symlog", "linear"), default="linear")
     args = parser.parse_args()
 
-    cfg = load_cfg()
+    cfg = load_cfg(args.config_name)
     validate_no_train_test_overlap(cfg)
     real_file = str(Path(args.real_file or cfg.get("test_real_nc_file", DEFAULT_REAL)))
     variables = variables_from_config(cfg)

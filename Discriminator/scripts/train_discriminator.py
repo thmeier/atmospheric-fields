@@ -1,37 +1,59 @@
+import os
+
+import hydra
+import numpy as np
+import pandas as pd
+import pytorch_lightning as L
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 import torchvision.models as models
-import xarray as xr
-import numpy as np
-from pathlib import Path
-import os
-from dotenv import load_dotenv
-import pytorch_lightning as L
-from pytorch_lightning.loggers import WandbLogger
-import hydra
 from omegaconf import DictConfig, OmegaConf
-import pandas as pd
-from corruptions import (
-    apply_gaussian_blur,
-    apply_gaussian_field_noise,
-    apply_high_freq_noise,
-    apply_random_pixel_replace,
-    apply_wind_channel_rotation,
-    apply_wind_patch_shuffle,
-)
+from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.loggers import WandbLogger
+from torch.utils.data import DataLoader, Dataset
+import xarray as xr
 
-# Load environment variables from .env file
-load_dotenv("../wandb_info.env")
+try:
+    from .corruptions import (
+        apply_gaussian_blur,
+        apply_gaussian_field_noise,
+        apply_high_freq_noise,
+        apply_random_pixel_replace,
+        apply_wind_channel_rotation,
+        apply_wind_patch_shuffle,
+    )
+except ImportError:
+    from corruptions import (
+        apply_gaussian_blur,
+        apply_gaussian_field_noise,
+        apply_high_freq_noise,
+        apply_random_pixel_replace,
+        apply_wind_channel_rotation,
+        apply_wind_patch_shuffle,
+    )
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+# Optional W&B credentials live one directory above this experiment folder on
+# the cluster.  CSV/no-logger runs should not require python-dotenv.
+if load_dotenv is not None:
+    load_dotenv("../wandb_info.env")
+
 
 def variables_from_config(cfg):
+    """Return all configured input fields, falling back to one selected field."""
     variables = cfg.get("variables")
     if variables:
         return list(variables)
     return [cfg.selected_variable]
 
+
 def _as_time_ranges(value):
+    """Normalize `[start, end]` or `[[start, end], ...]` into a list of ranges."""
     if not value:
         return []
     value = list(value)
@@ -39,7 +61,9 @@ def _as_time_ranges(value):
         return [value]
     return [list(item) for item in value]
 
+
 def _time_ranges_overlap(left, right):
+    """Inclusive interval-overlap test for optional start/end timestamp strings."""
     left_start, left_end = left
     right_start, right_end = right
     if left_end is not None and right_start is not None and pd.Timestamp(left_end) < pd.Timestamp(right_start):
@@ -48,7 +72,9 @@ def _time_ranges_overlap(left, right):
         return False
     return True
 
+
 def validate_no_train_test_overlap(cfg):
+    """Fail early if train/test time splits leak into each other."""
     checks = [
         ("real", cfg.get("train_real_range"), cfg.get("test_real_ranges")),
         ("fake", cfg.get("train_fake_range"), cfg.get("test_fake_range")),
@@ -62,7 +88,9 @@ def validate_no_train_test_overlap(cfg):
                         f"train={train_range}, test={test_range}"
                     )
 
+
 def select_time_ranges(ds, ranges):
+    """Select and concatenate one or more time intervals from an xarray dataset."""
     ranges = _as_time_ranges(ranges)
     if not ranges:
         return ds
@@ -79,22 +107,37 @@ def select_time_ranges(ds, ranges):
         return selected[0]
     return xr.concat(selected, dim="time")
 
+
+def normalize_prediction_timedelta(ds):
+    """Convert timedelta lead-time coordinates to integer hours when present."""
+    if "prediction_timedelta" not in ds.coords:
+        return ds
+
+    lead_times = ds.prediction_timedelta.values
+    if np.issubdtype(lead_times.dtype, np.timedelta64):
+        return ds.assign_coords(
+            prediction_timedelta=lead_times.astype("timedelta64[h]").astype(int)
+        )
+    return ds
+
+
 def safe_open_dataset(path):
+    """Open NetCDF-like data with explicit fallbacks for cluster file variants."""
     print(f"Attempting to open dataset: {path}")
     if not os.path.exists(path):
         print(f"Error: File does not exist at {path}")
         raise FileNotFoundError(f"No such file: {path}")
     
-    engines = ['netcdf4', 'h5netcdf', 'scipy']
+    engines = ["netcdf4", "h5netcdf", "scipy"]
     for engine in engines:
         try:
             ds = xr.open_dataset(path, use_cftime=True, engine=engine)
-            # Force a check to see if time is actually decoded
+            # Force lazy time decoding now so failures happen before training.
             if "time" in ds.coords:
                 _ = ds.time.values[0]
             print(f"Successfully opened {path} with engine {engine}")
             return ds
-        except Exception as e:
+        except Exception:
             continue
             
     try:
@@ -112,9 +155,12 @@ def safe_open_dataset(path):
                     base_time = base_time_parts[1].split(" ")[0]
                     unit_type = units.split(" ")[0].lower()
                     pd_unit = "D"
-                    if "hour" in unit_type: pd_unit = "h"
-                    elif "minute" in unit_type: pd_unit = "m"
-                    elif "second" in unit_type: pd_unit = "s"
+                    if "hour" in unit_type:
+                        pd_unit = "h"
+                    elif "minute" in unit_type:
+                        pd_unit = "m"
+                    elif "second" in unit_type:
+                        pd_unit = "s"
                     new_times = pd.to_datetime(base_time) + pd.to_timedelta(ds.time.values, unit=pd_unit)
                     ds = ds.assign_coords(time=new_times)
                     print(f"Successfully decoded time manually for {path}")
@@ -149,6 +195,7 @@ FIELDWISE_CORRUPTION_FNS = {
 }
 
 def apply_configured_corruption(sample, corruption_type, severity):
+    """Apply a corruption to a single CxHxW sample."""
     if severity <= 0:
         return sample
     try:
@@ -159,6 +206,7 @@ def apply_configured_corruption(sample, corruption_type, severity):
     return fn(sample.unsqueeze(0), severity).squeeze(0)
 
 def apply_fieldwise_corruption(sample, corruption_type, channel_idx, severity):
+    """Apply a spatial corruption to one channel while leaving other fields intact."""
     if severity <= 0:
         return sample
     try:
@@ -175,22 +223,53 @@ def apply_fieldwise_corruption(sample, corruption_type, channel_idx, severity):
     return corrupted
 
 def random_field_subset(num_fields, field_prob):
+    """Sample at least one field index for fieldwise corruption."""
     mask = np.random.random(num_fields) < field_prob
     if not mask.any():
         mask[np.random.randint(num_fields)] = True
     return np.flatnonzero(mask)
 
 def sample_power_law_severity(max_severity, power):
+    """Bias random severities toward low values when `power > 1`."""
     if max_severity <= 0:
         return 0.0
     if power <= 0:
         raise ValueError(f"corruption_severity_power must be > 0, got {power}")
     return float(max_severity) * (np.random.random() ** float(power))
 
-# ==========================================
-# 1. Dataset Definition
-# ==========================================
+
+def build_logger(cfg):
+    """Create the configured Lightning logger.
+
+    The default `csv` mode writes local metrics under `output_dir/lightning_logs`
+    and needs no W&B account, network, or credentials.  Use `logger=wandb` for
+    explicit Weights & Biases logging, or `logger=none` for no experiment logger.
+    """
+    logger_kind = str(cfg.get("logger", "csv")).lower()
+    if logger_kind == "csv":
+        return CSVLogger(save_dir=cfg.output_dir, name="lightning_logs")
+    if logger_kind == "wandb":
+        return WandbLogger(
+            project=cfg.project_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+    if logger_kind in ("none", "false", "disabled"):
+        return False
+    raise ValueError("logger must be one of: csv, wandb, none")
+
+
 class WeatherDiscriminatorDataset(Dataset):
+    """Binary dataset for ERA5-vs-forecast discriminator training/evaluation.
+
+    Labels are deliberately simple:
+    - `1.0`: ERA5/reference fields.
+    - `0.0`: model forecasts, corrupted ERA5, or corrupted forecasts.
+
+    In balanced training mode the first half of an epoch is real samples and
+    the second half is fake samples.  Fake samples are drawn from forecasts and,
+    when augmentation is enabled, synthetic corruption categories.
+    """
+
     def __init__(self, real_nc_path, fake_nc_path, variables, 
                  real_range=None, fake_range=None, lead_times=None, level=None, 
                  means=None, stds=None, balanced=True,
@@ -208,21 +287,13 @@ class WeatherDiscriminatorDataset(Dataset):
         self.corruption_severity_power = corruption_severity_power
         self.field_corruption_prob = field_corruption_prob
         
-        self.real_ds = safe_open_dataset(real_nc_path)
-        if "prediction_timedelta" in self.real_ds.coords:
-            lt = self.real_ds.prediction_timedelta.values
-            if np.issubdtype(lt.dtype, np.timedelta64):
-                self.real_ds = self.real_ds.assign_coords(prediction_timedelta=lt.astype('timedelta64[h]').astype(int))
+        self.real_ds = normalize_prediction_timedelta(safe_open_dataset(real_nc_path))
         
         from omegaconf import ListConfig
         if isinstance(fake_nc_path, (list, ListConfig)): 
             datasets = []
             for p in fake_nc_path:
-                ds = safe_open_dataset(p)
-                if "prediction_timedelta" in ds.coords:
-                    lt = ds.prediction_timedelta.values
-                    if np.issubdtype(lt.dtype, np.timedelta64):
-                        ds = ds.assign_coords(prediction_timedelta=lt.astype('timedelta64[h]').astype(int))
+                ds = normalize_prediction_timedelta(safe_open_dataset(p))
                 if fake_range:
                     ds = select_time_ranges(ds, fake_range)
                 if ds.sizes.get("time", 0) > 0:
@@ -232,14 +303,10 @@ class WeatherDiscriminatorDataset(Dataset):
             self.fake_ds = xr.concat(datasets, dim='time')
             self.fake_range_applied = True
         else:
-            self.fake_ds = safe_open_dataset(fake_nc_path)
-            if "prediction_timedelta" in self.fake_ds.coords:
-                lt = self.fake_ds.prediction_timedelta.values
-                if np.issubdtype(lt.dtype, np.timedelta64):
-                    self.fake_ds = self.fake_ds.assign_coords(prediction_timedelta=lt.astype('timedelta64[h]').astype(int))
+            self.fake_ds = normalize_prediction_timedelta(safe_open_dataset(fake_nc_path))
             self.fake_range_applied = False
         
-        # 1. Level Selection
+        # Keep only one pressure level when upper-air fields are used.
         if level is not None:
             for ds_attr in ['real_ds', 'fake_ds']:
                 ds = getattr(self, ds_attr)
@@ -248,7 +315,8 @@ class WeatherDiscriminatorDataset(Dataset):
                 elif 'pressure_level' in ds.dims:
                     setattr(self, ds_attr, ds.sel(pressure_level=level))
 
-        # 2. Time Range Selection
+        # Real and fake ranges are configured separately so the discriminator can
+        # train on one period and evaluate on disjoint holdout periods.
         if real_range:
             self.real_ds = select_time_ranges(self.real_ds, real_range)
         
@@ -266,7 +334,8 @@ class WeatherDiscriminatorDataset(Dataset):
                 f"Missing from real: {missing_real}; missing from fake: {missing_fake}"
             )
         
-        # 3. Lead Time Filtering
+        # Forecast datasets contain multiple lead times.  ERA5/reference data is
+        # evaluated at lead zero when that coordinate exists.
         if "prediction_timedelta" in self.fake_ds.dims:
             lt_h = self.fake_ds.prediction_timedelta.values
             if lead_times is not None:
@@ -283,7 +352,9 @@ class WeatherDiscriminatorDataset(Dataset):
         else:
             self.real_lead_idx = None
 
-        # 4. Normalization Stats (from REAL)
+        # Normalize all fields using ERA5/reference statistics from the selected
+        # training split.  This makes the discriminator output comparable across
+        # real and fake samples without using forecast statistics.
         if means is None or stds is None:
             print(f"Calculating stats from REAL dataset...")
             self.means = {}
@@ -298,7 +369,8 @@ class WeatherDiscriminatorDataset(Dataset):
         else:
             self.means, self.stds = means, stds
 
-        # 5. Class Balancing
+        # Balanced mode defines a stable 50/50 real/fake epoch even when the
+        # number of ERA5 times and forecast-times-by-leads differs.
         self.num_fake_leads = len(self.fake_lead_indices)
         self.total_fake_samples = len(self.fake_times) * self.num_fake_leads
         self.total_real_samples = len(self.real_times)
@@ -434,10 +506,9 @@ class WeatherDiscriminatorDataset(Dataset):
 
         return sample, label
 
-# ==========================================
-# 2. Lightning Module Definition
-# ==========================================
 class WeatherDiscriminator(L.LightningModule):
+    """Torchvision backbone adapted for weather-field binary classification."""
+
     def __init__(self, num_weather_channels, model_name="resnet18", learning_rate=1e-4):
         super().__init__()
         self.save_hyperparameters()
@@ -496,8 +567,9 @@ class WeatherDiscriminator(L.LightningModule):
     def configure_optimizers(self):
         return optim.AdamW(self.parameters(), lr=self.learning_rate)
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig):
+    """Train one discriminator from the Hydra configuration."""
     validate_no_train_test_overlap(cfg)
     vars_to_use = variables_from_config(cfg)
     real_path, fake_path = cfg.real_nc_file, cfg.fake_nc_file
@@ -526,8 +598,12 @@ def main(cfg: DictConfig):
         learning_rate=cfg.learning_rate
     )
     
-    wandb_logger = WandbLogger(project=cfg.project_name, config=OmegaConf.to_container(cfg, resolve=True))
-    trainer = L.Trainer(max_epochs=cfg.epochs, logger=wandb_logger, accelerator="auto", precision=cfg.precision if torch.cuda.is_available() else 32)
+    trainer = L.Trainer(
+        max_epochs=cfg.epochs,
+        logger=build_logger(cfg),
+        accelerator="auto",
+        precision=cfg.precision if torch.cuda.is_available() else 32,
+    )
     
     trainer.fit(model, dataloader)
 
