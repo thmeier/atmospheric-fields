@@ -142,7 +142,57 @@ def get_mean_logit(dataset, model, cfg, device):
             logits.extend(outputs)
     return np.mean(logits), np.std(logits)
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config")
+
+DISTURBANCE_CATALOG = {
+    "blur": {"name": "Gaussian Blur", "levels": [0, 0.5, 1.5, 3.0, 5.0], "xlabel": "Sigma"},
+    "noise": {"name": "HF Noise", "levels": [0, 0.1, 0.3, 0.6, 1.0], "xlabel": "Amplitude (rel to std)"},
+    "grf": {"name": "GRF Noise", "levels": [0, 0.1, 0.3, 0.6, 1.0], "xlabel": "Amplitude (rel to std)"},
+    "replace": {"name": "Pixel Replace", "levels": [0, 0.05, 0.15, 0.3, 0.5], "xlabel": "Fraction"},
+    "patch": {"name": "Patch Replace", "levels": [0, 0.05, 0.15, 0.3, 0.5], "xlabel": "Fraction"},
+    "quant": {"name": "Quantization", "levels": [256, 64, 32, 16, 8, 4], "xlabel": "Levels"},
+}
+
+DISTURBANCE_ALIASES = {
+    "gaussian_blur": "blur",
+    "hf_noise": "noise",
+    "high_freq_noise": "noise",
+    "grf_noise": "grf",
+    "gaussian_field_noise": "grf",
+    "pixel_replace": "replace",
+    "random_pixel_replace": "replace",
+    "patch_replace": "patch",
+    "patch_dropout": "patch",
+    "quantization": "quant",
+}
+
+
+def canonical_disturbance_name(name):
+    """Map training/config names onto the plotting disturbance keys."""
+    return DISTURBANCE_ALIASES.get(str(name), str(name))
+
+
+def configured_disturbances(cfg):
+    """Return disturbances requested by the config, marking held-out probes."""
+    training_types = [canonical_disturbance_name(name) for name in cfg.get("corruption_types", [])]
+    held_out_types = [canonical_disturbance_name(name) for name in cfg.get("held_out_corruption_types", [])]
+    requested = training_types + held_out_types
+    if not requested:
+        requested = list(DISTURBANCE_CATALOG)
+
+    disturbances = {}
+    held_out_set = set(held_out_types)
+    for dtype in requested:
+        if dtype not in DISTURBANCE_CATALOG or dtype in disturbances:
+            continue
+        dinfo = dict(DISTURBANCE_CATALOG[dtype])
+        dinfo["held_out"] = dtype in held_out_set
+        if dinfo["held_out"]:
+            dinfo["name"] = f"{dinfo['name']} (Holdout)"
+        disturbances[dtype] = dinfo
+    return disturbances
+
+
+@hydra.main(version_base=None, config_path="../conf", config_name="kfold_config_old")
 def main(cfg: DictConfig):
     """Compare disturbance sensitivity across k-fold/full-pool discriminators."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,14 +203,9 @@ def main(cfg: DictConfig):
     means, stds = normalization_stats(real_ds_global, model_vars, cfg.train_real_range)
     era5_test_ds = select_time_ranges(real_ds_global, cfg.test_real_ranges)
 
-    disturbances = {
-        "blur": {"name": "Gaussian Blur", "levels": [0, 0.5, 1.5, 3.0, 5.0], "xlabel": "Sigma"},
-        "noise": {"name": "HF Noise", "levels": [0, 0.1, 0.3, 0.6, 1.0], "xlabel": "Amplitude (rel to std)"},
-        "grf": {"name": "GRF Noise", "levels": [0, 0.1, 0.3, 0.6, 1.0], "xlabel": "Amplitude (rel to std)"},
-        "replace": {"name": "Pixel Replace", "levels": [0, 0.05, 0.15, 0.3, 0.5], "xlabel": "Fraction"},
-        "patch": {"name": "Patch Dropout (OOD)", "levels": [0, 0.05, 0.15, 0.3, 0.5], "xlabel": "Fraction"},
-        "quant": {"name": "Quantization (OOD)", "levels": [256, 64, 32, 16, 8, 4], "xlabel": "Levels"}
-    }
+    disturbances = configured_disturbances(cfg)
+    if not disturbances:
+        raise ValueError("No valid disturbances configured for k-fold plotting.")
 
     model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
     
@@ -194,8 +239,10 @@ def main(cfg: DictConfig):
                 results[label][dtype]['s'].append(s)
 
     # --- Plotting Line Graphs ---
-    fig, axes = plt.subplots(3, 2, figsize=(18, 18))
-    axes = axes.flatten()
+    n_cols = 2
+    n_rows = int(np.ceil(len(disturbances) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
     colors = plt.cm.tab10(np.linspace(0, 1, len(results)))
     
     for i, (dtype, dinfo) in enumerate(disturbances.items()):
@@ -217,10 +264,15 @@ def main(cfg: DictConfig):
         ax.text(0.02, 0.95, "REAL-LIKE", transform=ax.transAxes, color='green', fontweight='bold', fontsize=10)
         ax.text(0.02, 0.05, "FAKE-LIKE", transform=ax.transAxes, color='red', fontweight='bold', fontsize=10)
 
+    for ax in axes[len(disturbances):]:
+        ax.axis("off")
+
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.15, 0.5), fontsize=10)
     var_display = cfg.selected_variable.replace('_', ' ').title()
-    plt.suptitle(f"K-Fold Holdout: Sensitivity to Synthetic Artifacts\nNote: Patch & Quantization are Out-Of-Distribution (not seen during training)\nModel: {cfg.model_name} | Variable: {var_display}", fontsize=18, y=0.98)
+    holdout_names = [dinfo["name"].replace(" (Holdout)", "") for dinfo in disturbances.values() if dinfo.get("held_out")]
+    holdout_note = f"\nHoldout corruptions: {', '.join(holdout_names)}" if holdout_names else ""
+    plt.suptitle(f"K-Fold Holdout: Sensitivity to Synthetic Artifacts{holdout_note}\nModel: {cfg.model_name} | Variable: {var_display}", fontsize=18, y=0.98)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     output_path = os.path.join(cfg.output_dir, f"kfold_disturbance_analysis_GT_FINAL_{cfg.model_name}_{cfg.selected_variable}.png")
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
@@ -228,12 +280,18 @@ def main(cfg: DictConfig):
     # --- Visualization of Corruptions (Grid) ---
     sample_idx = 0
     sample_ds = era5_test_ds.isel(time=sample_idx)
+    if cfg.get("level") is not None:
+        if "level" in sample_ds.dims:
+            sample_ds = sample_ds.sel(level=cfg.get("level"))
+        elif "pressure_level" in sample_ds.dims:
+            sample_ds = sample_ds.sel(pressure_level=cfg.get("level"))
     v = cfg.selected_variable
     plot_configs = {'u_component_of_wind': 'viridis', 'v_component_of_wind': 'viridis', 'wind_speed': 'viridis', 'temperature': 'inferno', 'specific_humidity': 'GnBu'}
     cmap = plot_configs.get(v, 'viridis')
     raw_sample = sample_ds[v].values.astype(np.float32)
     n_types, n_levels = len(disturbances), 5
     fig_vis, axes_vis = plt.subplots(n_types, n_levels, figsize=(4 * n_levels, 4 * n_types), subplot_kw={'projection': ccrs.PlateCarree()})
+    axes_vis = np.asarray(axes_vis).reshape(n_types, n_levels)
     for i, (dtype, dinfo) in enumerate(disturbances.items()):
         levels = dinfo["levels"][:n_levels]
         for j, level in enumerate(levels):

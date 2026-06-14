@@ -87,13 +87,18 @@ augment_prob: 0.5
 # At least one channel is always corrupted.
 field_corruption_prob: 0.5
 
-# Training-time corruption pool. Fieldwise options can corrupt selected channels;
-# wind options operate on the paired U/V wind channels.
+# Training-time augmentation corruption pool. These names are consumed by
+# scripts/train_discriminator.py.
 corruption_types:
-  - "blur"
+  - "gaussian_blur"
+  - "hf_noise"
   - "grf"
   - "pixel_replace"
-  - "wind_patch_shuffle"
+
+# Corruption families intentionally held out from training-time augmentation.
+held_out_corruption_types:
+  - "patch_replace"
+  - "quantization"
 
 # Maximum sampled corruption severity.
 corruption_severity_max: 1.0
