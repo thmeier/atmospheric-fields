@@ -49,8 +49,8 @@ train_fake_range: ["2014-01-01", "2023-12-31"]
 
 # Real/reference holdout ranges. These should not overlap train_real_range.
 test_real_ranges:
-  - ["2004-01-01", "2007-12-31"]
-  - ["2019-01-01", "2023-12-31"]
+  - ["2001-01-01", "2001-12-31"]
+  - ["2001-01-01", "2001-12-31"]
 
 # Forecast initialization-time holdout range. This should not overlap
 # train_fake_range.
