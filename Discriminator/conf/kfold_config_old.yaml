@@ -51,7 +51,7 @@ max_samples: 0
 batch_size: 64
 
 # Number of full training epochs.
-epochs: 10
+epochs: 5
 
 # AdamW learning rate.
 learning_rate: 1e-4
