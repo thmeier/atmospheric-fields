@@ -13,8 +13,9 @@ then used to derive a realism score in the evaluation and analysis scripts.
 - `scripts/train_discriminator.py`: main training entrypoint. Trains one ResNet18
   or SqueezeNet discriminator and writes a `.pth` file under `output_dir`.
 - `scripts/train_kfold.py`: trains leave-one-neural-model-out discriminators and
-  one full-pool discriminator, trained on data from all non-numerical models,
-  for numerical-model comparisons.
+  one full-pool discriminator for numerical-model comparisons. In the k-fold
+  setup, each fold holds out one neural forecast model and otherwise uses the
+  available ERA5 range and all available non-held-out neural forecast files.
 - `scripts/evaluate_discriminator.py`: computes test accuracy/loss and saves map panels
   for high-logit, uncertain, fooled, and obvious-fake samples.
 - `scripts/plot_logits_vs_lead_time.py`: plots mean discriminator logits across forecast
@@ -231,6 +232,18 @@ The two poster discriminators:
      +output_filename=weather_discriminator_squeezenet_all_fields_pangu_holdout_lightning.pth
    ```
 
+## K-Fold Setup
+
+The k-fold runs use a different split principle from the poster train/test-time
+split above. Each leave-one-neural-model-out discriminator is trained with the
+held-out forecast model removed from the fake training pool; the other neural
+forecast model files are used. ERA5/reference data is not folded by model and,
+for these k-fold runs, should be understood as using the whole available ERA5
+data range configured for the experiment.
+
+The full-pool k-fold discriminator keeps all neural forecast model files in the
+fake training pool and is used for numerical-model comparisons.
+
 Training sample composition:
 
 - Labels: ERA5/reference samples are `1.0`; forecasts and corrupted samples are
@@ -351,5 +364,7 @@ unless the change is intentional.
 - Analysis logits are not calibrated probabilities. They are most useful for
   relative comparisons under the same trained discriminator and normalization
   setup.
-- The k-fold workflow assumes neural forecast files can be resolved for the
-  2018-2020 training period by filename convention.
+- The k-fold workflow assumes the configured neural forecast files can be
+  resolved by filename convention. For leave-one-model-out folds, only the
+  held-out model is removed from the fake training pool; the remaining model
+  files and the configured full ERA5/reference range are used.

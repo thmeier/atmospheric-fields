@@ -4,7 +4,6 @@
 data_dir: ${oc.env:DATA_DIR,data}
 
 # ERA5/reference file used for training real samples.
-# TODO: Verify the exact nonsurf ERA5 filename on the cluster.
 real_nc_file: "${data_dir}/nonsurf/era5_1.5deg_2004-01-01_2023-12-31.nc"
 
 # Forecast files used as fake samples during discriminator training. This can be
@@ -12,12 +11,17 @@ real_nc_file: "${data_dir}/nonsurf/era5_1.5deg_2004-01-01_2023-12-31.nc"
 fake_nc_file:
   # TODO: Verify exact nonsurf forecast filenames; paths assume the surface
   # naming convention with `surf` replaced by `nonsurf`.
-  - "${data_dir}/nonsurf/pangu_6steps_nonsurf_1.5deg_2018-01-01_2018-12-31.nc"
-  - "${data_dir}/nonsurf/fuxi_6steps_nonsurf_1.5deg_2018-01-01_2018-12-31.nc"
-
-# Files used by scripts/evaluate_discriminator.py for a held-out real/fake test set.
-test_real_nc_file: "${data_dir}/nonsurf/era5_1.5deg_2004-01-01_2023-12-31.nc"
-test_fake_nc_file: "${data_dir}/nonsurf/graphcast_6steps_nonsurf_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/era5-forecast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
+  - "${data_dir}/nonsurf/fuxi_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/graphcast_6steps_1.5deg_2018-01-01_2018-12-31.nc"
+  - "${data_dir}/nonsurf/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/ifs-hres_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/keisler_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/neuralgcm_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/pangu_6steps_1.5deg_2018-01-01_2018-12-31.nc"
+  - "${data_dir}/nonsurf/pangu_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  - "${data_dir}/nonsurf/sphericalcnn_6steps_1.5deg_2020-01-01_2020-12-31.nc"
 
 # Input channels. Set `variables: null` to train/evaluate with only
 # `selected_variable`.
@@ -25,7 +29,7 @@ variables:
   - "temperature"
   - "u_component_of_wind"
   - "v_component_of_wind"
-  - "specific_humidity"
+  # - "specific_humidity"
   # TODO: Add/remove nonsurf fields once the final NetCDF variable list is known
   # (for example `geopotential`, if present and intended).
 
@@ -34,23 +38,6 @@ selected_variable: "temperature"
 
 # Optional pressure level selector for upper-air data. Uses 850 hPa fields.
 level: 850
-
-# Real/reference time ranges used for training and normalization statistics.
-# Multiple disjoint intervals are allowed.
-train_real_range:
-  - ["2008-01-01", "2018-12-31"]
-
-# Forecast initialization-time range used for fake training samples.
-train_fake_range: ["2018-01-01", "2018-12-31"]
-
-# Real/reference holdout ranges. These should not overlap train_real_range.
-test_real_ranges:
-  - ["2004-01-01", "2007-12-31"]
-  - ["2019-01-01", "2023-12-31"]
-
-# Forecast initialization-time holdout range. This should not overlap
-# train_fake_range.
-test_fake_range: ["2020-01-01", "2020-12-31"]
 
 # Forecast lead times, in hours, to include from files with a
 # prediction_timedelta dimension.
