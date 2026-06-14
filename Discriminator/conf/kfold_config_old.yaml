@@ -39,6 +39,23 @@ selected_variable: "temperature"
 # Optional pressure level selector for upper-air data. Uses 850 hPa fields.
 level: 850
 
+# Real/reference time ranges used for training and normalization statistics.
+# Multiple disjoint intervals are allowed.
+train_real_range:
+  - ["2004-01-01", "2023-12-31"]
+
+# Forecast initialization-time range used for fake training samples.
+train_fake_range: ["2014-01-01", "2023-12-31"]
+
+# Real/reference holdout ranges. These should not overlap train_real_range.
+test_real_ranges:
+  - ["2004-01-01", "2007-12-31"]
+  - ["2019-01-01", "2023-12-31"]
+
+# Forecast initialization-time holdout range. This should not overlap
+# train_fake_range.
+test_fake_range: ["2020-01-01", "2020-12-31"]
+
 # Forecast lead times, in hours, to include from files with a
 # prediction_timedelta dimension.
 lead_times: [6, 12, 24, 48, 96, 192]

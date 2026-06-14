@@ -244,6 +244,12 @@ data range configured for the experiment.
 The full-pool k-fold discriminator keeps all neural forecast model files in the
 fake training pool and is used for numerical-model comparisons.
 
+Because the k-fold setup uses the whole available ERA5/reference range, its
+configured train and test time ranges can overlap. Standard test accuracy/loss
+from `scripts/evaluate_discriminator.py` should therefore not be interpreted as
+independent held-out metrics for these k-fold checkpoints. The meaningful
+holdout axis is the omitted forecast model, not a disjoint ERA5 time split.
+
 Training sample composition:
 
 - Labels: ERA5/reference samples are `1.0`; forecasts and corrupted samples are
@@ -368,3 +374,5 @@ unless the change is intentional.
   resolved by filename convention. For leave-one-model-out folds, only the
   held-out model is removed from the fake training pool; the remaining model
   files and the configured full ERA5/reference range are used.
+- K-fold train/test time ranges may overlap, so test accuracy/loss is not a
+  meaningful held-out metric for those checkpoints.
