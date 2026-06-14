@@ -27,12 +27,19 @@ def training_file_for_comparison(path_2020):
     return None
 
 
+def hydra_range_arg(time_range):
+    """Format a two-date range as a compact Hydra list override."""
+    return "[" + ",".join(f"'{value}'" for value in time_range) + "]"
+
+
 def build_train_command(cfg, train_files, output_filename):
     """Build a Hydra override command for one discriminator training run."""
     train_files_arg = "[" + ",".join(train_files) + "]"
     return [
         sys.executable,
         str(SCRIPT_DIR / "train_discriminator.py"),
+        "--config-name",
+        "kfold_config",
         f"++fake_nc_file={train_files_arg}",
         f"++selected_variable={cfg.selected_variable}",
         f"++model_name={cfg.model_name}",
@@ -40,11 +47,11 @@ def build_train_command(cfg, train_files, output_filename):
         f"++project_name={cfg.project_name}_kfold",
         f"++epochs={cfg.epochs}",
         f"++logger={cfg.get('logger', 'csv')}",
-        "++train_fake_range=['2018-01-01','2020-12-31']",
+        f"++train_fake_range={hydra_range_arg(cfg.train_fake_range)}",
         "++augment=true",
     ]
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="kfold_config")
 def main(cfg: DictConfig):
     """Train leave-one-neural-model-out and full-pool discriminators."""
     comparison_files = cfg.comparison_files
