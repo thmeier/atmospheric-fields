@@ -121,6 +121,13 @@ def normalize_prediction_timedelta(ds):
     return ds
 
 
+def cftime_decode_kwargs():
+    """Return xarray kwargs for cftime decoding across old/new xarray versions."""
+    if hasattr(xr, "coders") and hasattr(xr.coders, "CFDatetimeCoder"):
+        return {"decode_times": xr.coders.CFDatetimeCoder(use_cftime=True)}
+    return {"use_cftime": True}
+
+
 def safe_open_dataset(path):
     """Open NetCDF-like data with explicit fallbacks for cluster file variants."""
     print(f"Attempting to open dataset: {path}")
@@ -129,9 +136,10 @@ def safe_open_dataset(path):
         raise FileNotFoundError(f"No such file: {path}")
     
     engines = ["netcdf4", "h5netcdf", "scipy"]
+    decode_kwargs = cftime_decode_kwargs()
     for engine in engines:
         try:
-            ds = xr.open_dataset(path, use_cftime=True, engine=engine)
+            ds = xr.open_dataset(path, engine=engine, **decode_kwargs)
             # Force lazy time decoding now so failures happen before training.
             if "time" in ds.coords:
                 _ = ds.time.values[0]
@@ -142,7 +150,7 @@ def safe_open_dataset(path):
             
     try:
         print(f"Attempting standard open for {path} as last resort...")
-        ds = xr.open_dataset(path, use_cftime=True)
+        ds = xr.open_dataset(path, **decode_kwargs)
         return ds
     except Exception as e:
         print(f"Manual fallback for {path}...")
