@@ -169,29 +169,7 @@ def safe_open_dataset(path):
                         pd_unit = "m"
                     elif "second" in unit_type:
                         pd_unit = "s"
-                    # Some forecast files contain int64-min-like padding in the
-                    # time coordinate. Filter those raw offsets before pandas
-                    # converts them, otherwise timedelta conversion overflows.
-                    base_timestamp = pd.to_datetime(base_time)
-                    unit_delta = pd.Timedelta(1, unit=pd_unit).to_pytimedelta()
-                    base_datetime = base_timestamp.to_pydatetime()
-                    min_datetime = pd.Timestamp("1678-01-01").to_pydatetime()
-                    max_datetime = pd.Timestamp("2262-01-01").to_pydatetime()
-                    min_offset = (min_datetime - base_datetime) / unit_delta
-                    max_offset = (max_datetime - base_datetime) / unit_delta
-                    raw_offsets = pd.to_numeric(ds.time.values, errors="coerce")
-                    raw_offsets = np.asarray(raw_offsets, dtype=np.float64)
-                    valid_time_mask = (
-                        np.isfinite(raw_offsets)
-                        & (raw_offsets >= np.ceil(min_offset))
-                        & (raw_offsets <= np.floor(max_offset))
-                    )
-                    if not valid_time_mask.all():
-                        n_invalid = int((~valid_time_mask).sum())
-                        print(f"Dropping {n_invalid} invalid time values while decoding {path}")
-                        ds = ds.isel(time=np.flatnonzero(valid_time_mask))
-                    time_offsets = pd.to_timedelta(raw_offsets[valid_time_mask], unit=pd_unit)
-                    new_times = base_timestamp + time_offsets
+                    new_times = pd.to_datetime(base_time) + pd.to_timedelta(ds.time.values, unit=pd_unit)
                     ds = ds.assign_coords(time=new_times)
                     print(f"Successfully decoded time manually for {path}")
             except Exception as e2:
