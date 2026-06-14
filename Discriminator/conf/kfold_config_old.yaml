@@ -4,7 +4,7 @@
 data_dir: ${oc.env:DATA_DIR,data}
 
 # ERA5/reference file used for training real samples.
-real_nc_file: "${data_dir}/nonsurf/era5_1.5deg_2004-01-01_2023-12-31.nc"
+real_nc_file: "${data_dir}/nonsurf/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
 
 # Forecast files used as fake samples during discriminator training. This can be
 # a single string or a YAML list.
@@ -12,7 +12,6 @@ fake_nc_file:
   # TODO: Verify exact nonsurf forecast filenames; paths assume the surface
   # naming convention with `surf` replaced by `nonsurf`.
   - "${data_dir}/nonsurf/era5-forecast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
-  - "${data_dir}/nonsurf/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
   - "${data_dir}/nonsurf/fuxi_6steps_1.5deg_2020-01-01_2020-12-31.nc"
   - "${data_dir}/nonsurf/graphcast_6steps_1.5deg_2018-01-01_2018-12-31.nc"
   - "${data_dir}/nonsurf/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
