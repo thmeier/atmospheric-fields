@@ -51,11 +51,10 @@ train_fake_range: ["2014-01-01", "2023-12-31"]
 # These are fake to circumvent the blocking overlap.
 test_real_ranges:
   - ["2001-01-01", "2001-12-31"]
-  - ["2001-01-01", "2001-12-31"]
 
 # Forecast initialization-time holdout range. This should not overlap
 # train_fake_range.
-test_fake_range: ["2020-01-01", "2020-12-31"]
+test_fake_range: ["2001-01-01", "2001-12-31"]
 
 # Forecast lead times, in hours, to include from files with a
 # prediction_timedelta dimension.
