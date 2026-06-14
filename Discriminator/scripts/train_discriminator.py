@@ -175,8 +175,10 @@ def safe_open_dataset(path):
                     base_timestamp = pd.to_datetime(base_time)
                     unit_delta = pd.Timedelta(1, unit=pd_unit).to_pytimedelta()
                     base_datetime = base_timestamp.to_pydatetime()
-                    min_offset = (pd.Timestamp.min.to_pydatetime() - base_datetime) / unit_delta
-                    max_offset = (pd.Timestamp.max.to_pydatetime() - base_datetime) / unit_delta
+                    min_datetime = pd.Timestamp("1678-01-01").to_pydatetime()
+                    max_datetime = pd.Timestamp("2262-01-01").to_pydatetime()
+                    min_offset = (min_datetime - base_datetime) / unit_delta
+                    max_offset = (max_datetime - base_datetime) / unit_delta
                     raw_offsets = pd.to_numeric(ds.time.values, errors="coerce")
                     raw_offsets = np.asarray(raw_offsets, dtype=np.float64)
                     valid_time_mask = (
