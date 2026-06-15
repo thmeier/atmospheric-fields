@@ -28,9 +28,13 @@ htmlcov/
 
 # SLURM / job logs
 *.out
+wandb/
+outputs/
+results/
 
 # Project-specific
 plots/
 data/
 results/
 checkpoints/
+.DS_Store
