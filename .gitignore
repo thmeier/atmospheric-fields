@@ -42,3 +42,5 @@ checkpoints/
 Discriminator/weather-discriminator/
 Discriminator/weather-discriminator_kfold/
 *.ckpt
+
+Discriminator/artifacts/
