@@ -27,6 +27,16 @@ def training_file_for_comparison(path_2020):
     return None
 
 
+def require_train_files(train_files, context):
+    """Fail before launching a child trainer with an empty fake file list."""
+    if train_files:
+        return
+    raise RuntimeError(
+        f"No fake training files resolved for {context}. Check cfg.comparison_files "
+        "against the files that exist under DATA_DIR."
+    )
+
+
 def hydra_range_arg(time_range):
     """Format a two-date range as a compact Hydra list override."""
     return "[" + ",".join(f"'{value}'" for value in time_range) + "]"
@@ -39,7 +49,7 @@ def build_train_command(cfg, train_files, output_filename):
         sys.executable,
         str(SCRIPT_DIR / "train_discriminator.py"),
         "--config-name",
-        "kfold_config",
+        cfg.get("child_config_name", "kfold_config"),
         f"++fake_nc_file={train_files_arg}",
         f"++selected_variable={cfg.selected_variable}",
         f"++model_name={cfg.model_name}",
@@ -134,6 +144,7 @@ def main(cfg: DictConfig):
 
     output_filename = f"discriminator_{cfg.model_name}_{cfg.selected_variable}_full_pool.pth"
     train_files_key = tuple(sorted(train_files))
+    require_train_files(train_files, "full-pool k-fold training")
     
     if train_files_key not in trained_models:
         cmd = build_train_command(cfg, train_files, output_filename)
