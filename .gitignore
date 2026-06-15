@@ -214,3 +214,7 @@ plots/
 test_data.nc
 data/
 .DS_Store
+
+Discriminator/weather-discriminator/
+Discriminator/weather-discriminator_kfold/
+*.ckpt
