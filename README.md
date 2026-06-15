@@ -1,149 +1,122 @@
 # Metric for Realism of Atmospheric Fields
 
-Project work for the course ETH AI Center Projects in Machine Learning Research 2026 at ETH Zurich.
+Course project for ETH AI Center, Projects in Machine Learning Research (PMLR) 2026.
 
-## Table of Contents
+## Overview
 
-- [Cluster Setup](#cluster-setup)
-- [Local Setup](#local-setup)
-- [Data](#data)
-- [Usage](#usage)
-- [Results](#results)
+This project develops a quantitative realism metric for atmospheric fields: a score that
+captures how physically plausible a surface weather field is. The metric is trained on
+[ERA5](https://www.ecmwf.int/en/forecasts/dataset/ecmwf-reanalysis-v5) reanalysis, treated
+as the reference "real" distribution, and validated against machine-learning weather
+forecasts (Pangu-Weather, GraphCast, FuXi, and others) as well as a suite of
+physically-motivated synthetic corruptions.
 
----
+All work uses the same four 1.5-degree surface fields: `2m_temperature`,
+`10m_u_component_of_wind`, `10m_v_component_of_wind`, and `mean_sea_level_pressure`.
 
-## Cluster Setup
+## Two complementary directions
 
-### Access
+The project investigates two independent approaches to the same problem. Each lives in its
+own top-level directory with a dedicated README, scripts, and configuration.
 
-Connect to the ETH VPN if off-campus, then SSH in:
+### Discriminator: supervised adversarial discriminator
 
-```bash
-ssh <your-eth-username>@student-cluster.inf.ethz.ch
+See [`Discriminator/`](Discriminator/).
+
+A binary classifier is trained to separate real ERA5 fields (label 1) from fakes (label 0),
+where fakes consist of machine-learning forecasts and synthetically corrupted fields. The raw
+classifier logit is then used directly as a realism score.
+
+- Backbones: ResNet18 and SqueezeNet (torchvision, ImageNet initialization, adapted for the
+  weather-channel input).
+- Hydra-based configuration, with CSV or Weights and Biases logging.
+- Analyses: logit versus forecast lead time, logit versus corruption severity, leave-one-model-out
+  k-fold for numerical-model comparisons, and poster figures.
+
+Refer to [`Discriminator/README.md`](Discriminator/README.md) for the full pipeline,
+configuration options, and poster reproduction.
+
+### FeatureMetric: self-supervised latent-space metric
+
+See [`FeatureMetric/`](FeatureMetric/).
+
+Two self-supervised encoders, a Masked Autoencoder (MAE) and I-JEPA, are trained on ERA5 without
+labels. Realism is then measured in the encoders' latent space rather than from a trained
+classifier:
+
+- Protocol 1 (linear probe): regress corruption severity from frozen latents and report R-squared.
+- Protocol 2 (distribution distance): Frechet Distance and Maximum Mean Discrepancy between a clean
+  reference latent distribution and corrupted or forecast distributions across a severity ladder.
+- Temporal variants (`none`, `diff`, `concat`, `phase`) inject time-difference dynamics so the
+  metric can react to forecast-specific artifacts rather than static state alone.
+
+Refer to [`FeatureMetric/README.md`](FeatureMetric/README.md) and
+[`FeatureMetric/CLAUDE.md`](FeatureMetric/CLAUDE.md) for architecture details and commands.
+
+## Repository layout
+
+```
+.
+├── Discriminator/     adversarial discriminator direction (supervised)
+├── FeatureMetric/     self-supervised encoder direction (MAE and I-JEPA)
+├── download/          shared data-download utilities (ERA5 and forecasts from WeatherBench2)
+├── .gitignore
+└── README.md
 ```
 
-### Install Conda
+Generated and large artifacts (`data/`, `checkpoints/`, `results/`, `plots/`, `wandb/`, and
+`*.out`) are git-ignored and not committed.
 
-Each team member needs their own conda installation in their home directory:
+## Data
 
-```bash
-bash /cluster/data/miniconda/Miniconda3-py312_25.11.1-1-Linux-x86_64.sh
-```
+All fields are obtained from the [WeatherBench2](https://weatherbench2.readthedocs.io/) Google
+Cloud buckets at 1.5-degree resolution and 6-hourly cadence. Shared download utilities are located
+in [`download/`](download/):
 
-Accept the license and confirm the install location (`~/miniconda3`). When asked to initialize conda, type `yes`. Then accept the Terms of Service:
+- [`download/download_era5_netcdf.py`](download/download_era5_netcdf.py): download an ERA5 or
+  forecast variable and time slice from a WeatherBench2 zarr store to NetCDF.
+- [`download/download_era5_args.sh`](download/download_era5_args.sh): SLURM wrapper. Edit the
+  source, time range, variables, and output path, then submit with `sbatch`.
+- [`download/download_gen_data.sh`](download/download_gen_data.sh): recipes for the various
+  forecast sources (ERA5, GraphCast, Pangu, FuXi, IFS HRES, and others).
 
-```bash
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-```
+On the cluster, data is downloaded once into the shared team directory
+`/cluster/courses/pmlr/teams/team07/data`. Please do not re-download or overwrite files that
+others are using.
 
-Reload your shell:
+The current ERA5 dataset covers 1.5-degree resolution, 2004 to 2023, for the four surface fields
+listed above.
 
-```bash
-source ~/.bashrc
-```
+## Setup
 
-You should now see `(base)` in your prompt.
-
-### Create the Environment
-
-```bash
-conda create -n pmlr python=3.12 -y
-conda activate pmlr
-```
-
-If the package install fails, add the conda-forge channel first:
-
-```bash
-conda config --add channels conda-forge
-```
-
-Then install dependencies:
-
-```bash
-conda install --file requirements.txt
-```
-
-### Team Shared Storage
-
-The shared team directory is at `/cluster/courses/pmlr/teams/team07`. Data downloads go here — only download once, don't overwrite files others are using.
-
-If a teammate gets a permission denied error on a file you created, grant them access:
-
-```bash
-# for a file
-setfacl -m u:<their-eth-username>:rwx <file-path>
-
-# for a directory (recursive)
-setfacl -R -m u:<their-eth-username>:rwx <dir-path>
-setfacl -d -m u:<their-eth-username>:rwx <dir-path>
-```
-
-### Clone the Repo
-
-```bash
-cd ~
-git clone <repo-url> atmospheric-fields
-```
-
----
-
-## Local Setup
-
-Create a new conda environment using Python 3.12:
+Each team member uses their own conda environment (Python 3.12):
 
 ```bash
 conda create -n pmlr python=3.12 -y && conda activate pmlr
 ```
 
-Install dependencies:
+Install dependencies. The FeatureMetric direction pins its requirements:
 
 ```bash
-conda install --file requirements.txt
+conda install --file FeatureMetric/requirements.txt
 ```
 
----
+The Discriminator direction additionally uses PyTorch Lightning, torchvision, and Hydra. See
+[`Discriminator/README.md`](Discriminator/README.md) for its specific requirements.
 
-## Data
-
-To download ERA5 data to the shared cluster directory, edit and submit the Slurm job:
+### Cluster access
 
 ```bash
-sbatch ~/atmospheric-fields/start_download_er5.sh
+ssh <your-eth-username>@student-cluster.inf.ethz.ch
 ```
 
-The key settings in `start_download_er5.sh`:
+Connect to the ETH VPN first if off-campus. Install a personal Miniconda in your home directory
+and create the `pmlr` environment as described above.
 
-```
-         SOURCE : Google Cloud bucket URL (determines resolution)
-     TIME_START : start date in YYYY-MM-DD format
-       TIME_END : end date in YYYY-MM-DD format
-      VARIABLES : which variables to select
-OUTPUT_FILENAME : output filename (.nc)
-     OUTPUT_DIR : save location — shared at /cluster/courses/pmlr/teams/team07/data
-```
+## Getting started
 
-Current dataset: 1.5-degree ERA5, 2004–2023, 4 variables:
-- `2m_temperature`
-- `10m_u_component_of_wind`
-- `10m_v_component_of_wind`
-- `mean_sea_level_pressure`
-
-Monitor a running job:
-
-```bash
-squeue --me
-tail -f ~/atmospheric-fields/logs/test_<job_id>.out
-```
-
----
-
-## Usage
-
-TODO
-
----
-
-## Results
-
-TODO
+| Task | Location |
+|------|----------|
+| Train or evaluate the discriminator | [`Discriminator/README.md`](Discriminator/README.md) |
+| Train MAE or I-JEPA encoders and run the latent-space probes and distances | [`FeatureMetric/README.md`](FeatureMetric/README.md) |
+| Download ERA5 or forecast data | [`download/`](download/) |
