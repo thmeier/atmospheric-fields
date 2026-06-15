@@ -1,234 +1,92 @@
-# Metric for Realism of Atmospheric Fields
+# FeatureMetric — Realism Metric from Self-Supervised Encoders
 
-Project work for the course ETH AI Center Projects in Machine Learning Research 2026 at ETH Zurich.
+Subgroup work for *Metric for Realism of Atmospheric Fields* (ETH PMLR 2026).
 
-## Table of Contents
+This folder implements a **latent-space realism metric** for atmospheric fields. Two
+self-supervised encoders — **MAE** and **I-JEPA** — are trained on ERA5 reanalysis and
+evaluated against a suite of physically-motivated corruptions and against ML forecasts
+(Pangu, GraphCast). It is the encoder/embedding counterpart to the `Discriminator/`
+subgroup's adversarial approach.
 
-- [Cluster Setup](#cluster-setup)
-- [Local Setup](#local-setup)
-- [Data](#data)
-- [Usage](#usage)
-- [Results](#results)
+> Environment setup, ERA5 download, and the shared cluster storage layout are documented
+> in the repository's **root `README.md`**. This README covers only the encoder work.
 
----
+## Layout
 
-## Cluster Setup
+```
+FeatureMetric/
+├── utils/        models, dataset, corruptions, masking, feature extraction, temporal compose
+├── train/        train_mae.py, train_ijepa.py, train_twins.py
+├── eval/         eval_probe.py, eval_distances.py, eval_real_vs_forecast.py, ...
+├── scripts/      cluster job launchers + poster/plot utilities + forecast download
+├── tests/        smoke tests + dataset exploration
+├── docs/         ijepa_implementation_report.md
+├── data/         (git-ignored) local NetCDF datasets
+└── checkpoints/  (git-ignored) model weights + data_mean.npy / data_std.npy
+```
 
-### Access
+See [CLAUDE.md](CLAUDE.md) for a detailed architecture and module reference.
 
-Connect to the ETH VPN if off-campus, then SSH in:
+## Quick start (local)
+
+Use the explicit interpreter — never `conda activate`. All commands run **from this
+folder** (`FeatureMetric/`), which is where `data/` and `checkpoints/` live.
 
 ```bash
-ssh <your-eth-username>@student-cluster.inf.ethz.ch
+P=/opt/miniconda3/envs/pmlr/bin/python
+
+# Sanity checks
+$P tests/smoke_test_ijepa.py
+$P tests/smoke_test_mae_masking.py
+
+# Training (local quick runs)
+$P train/train_mae.py   --local --epochs 2 --batch-size 16
+$P train/train_ijepa.py --local --smoke-test --smoke-samples 64
+
+# Temporal variants: --temporal-mode {none,diff,concat,phase}
+$P train/train_mae.py   --local --epochs 2 --batch-size 16 --temporal-mode concat
 ```
 
-### Install Conda
+Pass `--large-local` for the 5-year local dataset, or omit local flags on the cluster.
+Checkpoints and stats (`best_mae_model*.pth`, `best_ijepa_model*.pth`, `data_mean.npy`,
+`data_std.npy`) are written to `checkpoints/`.
 
-Each team member needs their own conda installation in their home directory:
+## Evaluation
+
+Both eval protocols support `--model {mae,ijepa}` and `--local` / `--large-local` / cluster.
 
 ```bash
-bash /cluster/data/miniconda/Miniconda3-py312_25.11.1-1-Linux-x86_64.sh
+# Protocol 1 — linear probe: regress corruption severity from frozen latents (reports R²)
+$P eval/eval_probe.py     --model mae --local
+
+# Protocol 2 — Fréchet & MMD distance vs. severity ladder
+$P eval/eval_distances.py --model mae --local
+
+# Real ERA5 vs. ML forecast separation
+$P eval/eval_real_vs_forecast.py --model mae --local
 ```
 
-Accept the license and confirm the install location (`~/miniconda3`). When asked to initialize conda, type `yes`. Then accept the Terms of Service:
+## Corruptions
 
-```bash
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-```
-
-Reload your shell:
-
-```bash
-source ~/.bashrc
-```
-
-You should now see `(base)` in your prompt.
-
-### Create the Environment
-
-```bash
-conda create -n pmlr python=3.12 -y
-conda activate pmlr
-```
-
-If the package install fails, add the conda-forge channel first:
-
-```bash
-conda config --add channels conda-forge
-```
-
-Then install dependencies:
-
-```bash
-conda install --file requirements.txt
-```
-
-### Team Shared Storage
-
-The shared team directory is at `/cluster/courses/pmlr/teams/team07`. Data downloads go here — only download once, don't overwrite files others are using.
-
-If a teammate gets a permission denied error on a file you created, grant them access:
-
-```bash
-# for a file
-setfacl -m u:<their-eth-username>:rwx <file-path>
-
-# for a directory (recursive)
-setfacl -R -m u:<their-eth-username>:rwx <dir-path>
-setfacl -d -m u:<their-eth-username>:rwx <dir-path>
-```
-
-### Clone the Repo
-
-```bash
-cd ~
-git clone <repo-url> atmospheric-fields
-```
-
----
-
-## Local Setup
-
-Create a new conda environment using Python 3.12:
-
-```bash
-conda create -n pmlr python=3.12 -y && conda activate pmlr
-```
-
-Install dependencies:
-
-```bash
-conda install --file requirements.txt
-```
-
----
-
-## Data
-
-To download ERA5 data to the shared cluster directory, edit and submit the Slurm job:
-
-```bash
-sbatch ~/atmospheric-fields/scripts/start_download_er5.sh
-```
-
-The key settings in `scripts/start_download_er5.sh`:
-
-```
-         SOURCE : Google Cloud bucket URL (determines resolution)
-     TIME_START : start date in YYYY-MM-DD format
-       TIME_END : end date in YYYY-MM-DD format
-      VARIABLES : which variables to select
-OUTPUT_FILENAME : output filename (.nc)
-     OUTPUT_DIR : save location — shared at /cluster/courses/pmlr/teams/team07/data
-```
-
-Current dataset: 1.5-degree ERA5, 2004–2023, 4 variables:
-- `2m_temperature`
-- `10m_u_component_of_wind`
-- `10m_v_component_of_wind`
-- `mean_sea_level_pressure`
-
-Monitor a running job:
-
-```bash
-squeue --me
-tail -f ~/atmospheric-fields/logs/test_<job_id>.out
-```
-
----
-
-## Usage
-
-### Training
-
-Train the MAE model on the cluster:
-
-```bash
-sbatch scripts/submit_job.sh
-```
-
-Or run locally:
-
-```bash
-python train/train_mae.py --local
-python train/train_mae.py --large-local  # 5-year local dataset
-```
-
-Train the spatial-only I-JEPA proof of concept locally:
-
-```bash
-python train/train_ijepa.py --local
-python train/train_ijepa.py --local --smoke-test
-```
-
-Run the controlled twin experiments:
-
-```bash
-python train/train_twins.py --model mae --large-local --mae-mask-mode target-blocks
-python train/train_twins.py --model ijepa --large-local --target-mask-mode shared-blocks
-python train/train_twins.py --model ijepa --large-local --ijepa-context-mode world-band
-```
-
-Checkpoints and data statistics (`data_mean.npy`, `data_std.npy`, `best_mae_model.pth`, `best_ijepa_model.pth`) are saved to `checkpoints/`.
-
-Overnight Slurm launchers for the new ablations:
-
-```bash
-sbatch scripts/submit_job_shared_targets.sh
-sbatch scripts/submit_job_world_band.sh
-```
-
-### Evaluation
-
-Both eval scripts support `--local`, `--large-local`, or no flag (cluster dataset). Use `--eager` to load the full dataset into memory upfront.
-Both scripts also support `--model mae` or `--model ijepa`, plus `--mae-variant` / `--ijepa-variant` to load experiment-specific twin checkpoints such as `shared-targets` or `world-band`.
-
-**Validation Protocol 1 — Linear Probe (severity regression):**
-
-Trains a small MLP on frozen MAE latents to predict corruption severity. Reports R² per corruption type.
-
-```bash
-python eval/eval_probe.py --model mae --large-local --eager
-python eval/eval_probe.py --model ijepa --local
-```
-
-Saved plot names include the model, e.g. `probe_scatter_combined_mae.png` and `probe_scatter_combined_ijepa.png`.
-
-**Validation Protocol 2 — Fréchet & MMD Distances:**
-
-Computes Fréchet Distance and MMD between the reference latent distribution and corrupted distributions across a severity ladder.
-
-```bash
-python eval/eval_distances.py --model mae --large-local --eager
-python eval/eval_distances.py --model ijepa --local
-```
-
-Saved plot names include the model, e.g. `distances_vs_severity_mae.png` and `distances_vs_severity_ijepa.png`.
-
-Plots are saved to `plots/standard_corruptions/` and `plots/physical_decoupling/`.
-
-### Corruptions
-
-`utils/corruptions.py` defines six corruption types applied to input fields:
+`utils/corruptions.py` defines six corruption types (severity ∈ [0, 1]):
 
 | Corruption | Description | Severity → parameter |
 |---|---|---|
-| Gaussian Blur | Spatial smoothing | severity → sigma ∈ [0, 1.125] |
-| High-Freq Noise | Per-pixel iid Gaussian noise | severity → std ∈ [0, 0.25] |
-| GRF Noise | Spatially correlated Gaussian Random Field noise | severity → std ∈ [0, 0.375] |
-| Random Pixel Replace | Replaces random pixels with Gaussian samples | severity → replace prob ∈ [0, 0.3] |
-| Spatial Shuffle (Wind Only) | Shuffles 8x8 wind patches while leaving temperature and pressure unchanged | severity → shuffled patch fraction ∈ [0, 1] |
-| Channel Rotation | Rotates every wind vector while leaving temperature and pressure unchanged | severity → rotation angle ∈ [0°, 90°] |
-
-### Visualisation
+| Gaussian Blur | Spatial smoothing | σ ∈ [0, 1.125] |
+| High-Freq Noise | Per-pixel iid Gaussian noise | std ∈ [0, 0.25] |
+| GRF Noise | Spatially correlated Gaussian Random Field noise | std ∈ [0, 0.375] |
+| Random Pixel Replace | Replaces random pixels with Gaussian samples | prob ∈ [0, 0.3] |
+| Spatial Shuffle (wind only) | Shuffles wind patches; T2M/MSL unchanged | shuffled fraction ∈ [0, 1] |
+| Channel Rotation (wind only) | Rotates wind vectors; T2M/MSL unchanged | angle ∈ [0°, 90°] |
 
 ```bash
-python eval/visualize_corruptions.py
+$P eval/visualize_corruptions.py
 ```
 
----
+## Cluster jobs
 
-## Results
-
-TODO
+```bash
+sbatch scripts/submit_job.sh             # generic MAE training template
+sbatch scripts/submit_probe_eval.sh      # probe evaluation
+sbatch scripts/submit_temporal_all.sh    # all four temporal modes (none/diff/concat/phase)
+```
