@@ -26,6 +26,9 @@ htmlcov/
 # macOS
 .DS_Store
 
+# SLURM / job logs
+*.out
+
 # Project-specific
 plots/
 data/
