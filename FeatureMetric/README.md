@@ -25,8 +25,6 @@ FeatureMetric/
 └── checkpoints/  (git-ignored) model weights + data_mean.npy / data_std.npy
 ```
 
-See [CLAUDE.md](CLAUDE.md) for a detailed architecture and module reference.
-
 ## Quick start (local)
 
 Use the explicit interpreter — never `conda activate`. All commands run **from this

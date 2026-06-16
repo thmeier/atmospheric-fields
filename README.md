@@ -50,8 +50,6 @@ classifier:
 - Temporal variants (`none`, `diff`, `concat`, `phase`) inject time-difference dynamics so the
   metric can react to forecast-specific artifacts rather than static state alone.
 
-Refer to [`FeatureMetric/README.md`](FeatureMetric/README.md) and
-[`FeatureMetric/CLAUDE.md`](FeatureMetric/CLAUDE.md) for architecture details and commands.
 
 ## Repository layout
 
