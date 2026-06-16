@@ -147,20 +147,8 @@ class SFNOEmbedding(nn.Module):
             return c * self.embedding_resolution[0] * self.embedding_resolution[1]
         return c
 
-    @torch.no_grad()
-    def encode(self, x):
-        """Raw fields ``(B, 5, 121, 240)`` → SFNO spatial embedding ``(B, C, h, w)``."""
-        if x.shape[-3:] != (5, 121, 240):
-            raise ValueError(
-                f"expected (B, 5, 121, 240) raw fields, got {tuple(x.shape)}"
-            )
-        xn = (x - self.norm_mean) / self.norm_std
-        return self.model(xn, self.static_channels)
-
-    @torch.no_grad()
-    def extract_features(self, x):
-        """Raw fields ``(B, 5, 121, 240)`` → pooled feature vector ``(B, feature_dim)``."""
-        emb = self.encode(x)
+    def _pool(self, emb):
+        """Reduce a spatial embedding ``(B, C, h, w)`` to ``(B, feature_dim)``."""
         if self.pooling == "mean":
             return emb.mean(dim=(-2, -1))
         if self.pooling == "max":
@@ -174,6 +162,34 @@ class SFNOEmbedding(nn.Module):
             return pooled.flatten(1)
         # flatten: full (C, h, w) concatenation. High-dim — use with MMD, not FID.
         return emb.flatten(1)
+
+    @torch.no_grad()
+    def encode(self, x, corruption_fn=None):
+        """Raw fields ``(B, 5, 121, 240)`` → SFNO spatial embedding ``(B, C, h, w)``.
+
+        ``corruption_fn`` (if given) is applied in SFNO's *standardized* space —
+        i.e. after per-channel normalization, before the encoder. This is the
+        space the corruption severities are calibrated for (unit-ish per channel),
+        and it matches how the MAE/I-JEPA eval corrupts. Applying corruptions to
+        the raw physical fields instead would be meaningless across the wildly
+        different variable scales (e.g. K vs Pa vs m of precip).
+        """
+        if x.shape[-3:] != (5, 121, 240):
+            raise ValueError(
+                f"expected (B, 5, 121, 240) raw fields, got {tuple(x.shape)}"
+            )
+        xn = (x - self.norm_mean) / self.norm_std
+        if corruption_fn is not None:
+            xn = corruption_fn(xn)
+        return self.model(xn, self.static_channels)
+
+    @torch.no_grad()
+    def extract_features(self, x, corruption_fn=None):
+        """Raw fields ``(B, 5, 121, 240)`` → pooled feature vector ``(B, feature_dim)``.
+
+        ``corruption_fn`` is applied in standardized space (see :meth:`encode`).
+        """
+        return self._pool(self.encode(x, corruption_fn=corruption_fn))
 
     def forward(self, x):
         return self.extract_features(x)
