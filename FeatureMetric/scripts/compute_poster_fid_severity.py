@@ -70,9 +70,11 @@ class InMemoryRawSource:
         ds.close()
 
     def read_raw(self, idx):
+        """Return the raw ``(4, H, W)`` field at time index ``idx``."""
         return self.data[idx]
 
     def __len__(self):
+        """Number of time steps held in memory."""
         return self.data.shape[0]
 
 
@@ -122,9 +124,11 @@ class CorruptedSeverityDataset(Dataset):
         self.temporal = temporal
 
     def __len__(self):
+        """Number of present-frame samples."""
         return len(self.present_idx)
 
     def __getitem__(self, i):
+        """Corrupt the raw present frame (if severity>0), then compose the model input."""
         present_raw = self.source.read_raw(self.present_idx[i])
         if self.severity > 0 and self.apply_fn is not None:
             present_raw = corrupt_raw_present(
@@ -145,6 +149,7 @@ class CorruptedSeverityDataset(Dataset):
 
 
 def features_for_dataset(model, dataset, device, batch_size, num_workers, label):
+    """Build a DataLoader over ``dataset`` and extract mean-pooled encoder features."""
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=device.type == "cuda",
@@ -154,6 +159,7 @@ def features_for_dataset(model, dataset, device, batch_size, num_workers, label)
 
 
 def fid_from_features(z_ref_np, mu_ref, sigma_ref, z_cor):
+    """Compute FID between the reference Gaussian and the corrupted features (clamped ≥ 0)."""
     z_cor_np = z_cor.numpy()
     mu_c  = np.mean(z_cor_np, axis=0)
     sig_c = np.cov(z_cor_np, rowvar=False)
@@ -162,6 +168,7 @@ def fid_from_features(z_ref_np, mu_ref, sigma_ref, z_cor):
 
 
 def parse_args():
+    """Parse CLI arguments for the corruption-severity FID computation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data", type=Path,
@@ -197,6 +204,7 @@ def parse_args():
 
 
 def main():
+    """Compute FID(clean ERA5, corrupted ERA5) across severity levels and save to .npz."""
     args = parse_args()
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)

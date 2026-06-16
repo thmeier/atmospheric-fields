@@ -33,14 +33,17 @@ def get_corruption_ladder(corruption_type, n_steps=9):
 
 
 def _is_model_padded_shape(x):
+    """True if ``x`` has the model's padded ``(128, 256)`` spatial shape."""
     return tuple(x.shape[-2:]) == PADDED_SHAPE
 
 
 def _crop_interior(x):
+    """Strip the dataset padding, returning the real ERA5 interior region."""
     return x[:, :, PAD_TOP:x.shape[-2] - PAD_BOTTOM, PAD_LEFT:x.shape[-1] - PAD_RIGHT]
 
 
 def _repad_like_dataset(x):
+    """Re-apply the dataset's padding (wrap in longitude, zero-pad in latitude)."""
     x_np = x.detach().cpu().numpy()
     x_np = np.pad(x_np, pad_width=((0, 0), (0, 0), (0, 0), (PAD_LEFT, PAD_RIGHT)), mode="wrap")
     x_np = np.pad(x_np, pad_width=((0, 0), (0, 0), (PAD_TOP, PAD_BOTTOM), (0, 0)), mode="constant", constant_values=0)
@@ -48,6 +51,7 @@ def _repad_like_dataset(x):
 
 
 def _finalize_like_input(original_x, work_x):
+    """Re-pad ``work_x`` if the original input was padded; otherwise return as-is."""
     if _is_model_padded_shape(original_x):
         return _repad_like_dataset(work_x)
     return work_x

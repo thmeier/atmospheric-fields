@@ -27,6 +27,7 @@ LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local
 
 
 def format_model_label(model_name, model_size, model_variant=None):
+    """Build a human-readable model label like ``MAE (twin) [variant]`` for plots/logs."""
     label = f"{model_name.upper()} ({model_size})"
     if model_variant:
         label += f" [{model_variant}]"
@@ -35,6 +36,12 @@ def format_model_label(model_name, model_size, model_variant=None):
 
 def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dataset, batch_size,
                    num_workers, local_flags, n_probe_samples=None, embed_dim=None):
+    """Protocol 1 for one model: train a linear probe to regress corruption severity.
+
+    For each corruption, applies a random severity per sample, extracts latent
+    features, fits a linear probe (80/20 split), and reports MSE/R². Returns
+    ``(results, scatters, corruption_fns)`` for downstream plotting.
+    """
     print(f"Loading {format_model_label(model_name, model_size, model_variant)} model...")
     model = build_model(model_name, device=device, model_size=model_size, embed_dim=embed_dim)
     ckpt_path = checkpoint_path(model_name, model_size, stats_dir, variant=model_variant, embed_dim=embed_dim)
@@ -127,6 +134,7 @@ def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dat
 
 def plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
                     model_variants, corruption_fns, plots_dir, run_tag):
+    """Render and save the probe R² bar chart, comparison delta, and prediction scatters."""
     import matplotlib.pyplot as plt
 
     corr_names = list(corruption_fns.keys())
@@ -202,6 +210,7 @@ def plot_comparison(all_results, all_scatters, models_to_run, model_sizes,
 
 
 def print_summary(all_results, models_to_run, model_sizes, corruption_fns):
+    """Print a formatted table of per-corruption probe R² (and model delta) values."""
     labels = [f"{m.upper()} ({model_sizes[m]})" for m in models_to_run]
     col_w = 12
     print("\n" + "=" * 80)
@@ -222,6 +231,7 @@ def print_summary(all_results, models_to_run, model_sizes, corruption_fns):
 
 
 def main():
+    """CLI entry point for Protocol 1 (linear-probe severity regression from latents)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa", "both"], default="mae")
     # Per-model size flags for the mixed comparison (mae default vs ijepa small)

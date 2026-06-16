@@ -22,6 +22,7 @@ LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local
 
 
 class WarmupCosineSchedule:
+    """Learning-rate schedule: linear warmup to ``ref_lr`` then cosine decay to ``final_lr``."""
     def __init__(self, optimizer, warmup_steps, start_lr, ref_lr, final_lr, total_steps):
         self.optimizer = optimizer
         self.warmup_steps = max(1, warmup_steps)
@@ -32,6 +33,7 @@ class WarmupCosineSchedule:
         self.step_num = 0
 
     def step(self):
+        """Advance one step, set the new LR on every param group, and return it."""
         self.step_num += 1
         if self.step_num <= self.warmup_steps:
             progress = self.step_num / self.warmup_steps
@@ -46,6 +48,7 @@ class WarmupCosineSchedule:
 
 
 class CosineWDSchedule:
+    """Weight-decay schedule: cosine anneal from ``start_wd`` to ``final_wd`` over training."""
     def __init__(self, optimizer, start_wd, final_wd, total_steps):
         self.optimizer = optimizer
         self.start_wd = start_wd
@@ -54,6 +57,7 @@ class CosineWDSchedule:
         self.step_num = 0
 
     def step(self):
+        """Advance one step, set WD on non-excluded param groups, and return it."""
         self.step_num += 1
         progress = self.step_num / self.total_steps
         wd = self.final_wd + 0.5 * (self.start_wd - self.final_wd) * (1.0 + math.cos(math.pi * progress))
@@ -65,6 +69,11 @@ class CosineWDSchedule:
 
 
 def make_optimizer(model, lr, weight_decay):
+    """Build AdamW over the context encoder + predictor.
+
+    Splits params into two groups so weight decay is excluded from biases and
+    1-D params (norms), as in the original I-JEPA recipe.
+    """
     param_groups = [
         {
             "params": [
@@ -88,6 +97,7 @@ def make_optimizer(model, lr, weight_decay):
 
 
 def resolve_data_path(args):
+    """Pick the dataset path from the ``--local`` / ``--large-local`` flags (else cluster)."""
     if args.local and args.large_local:
         raise ValueError("Use only one of --local or --large-local.")
     if args.local:
@@ -98,6 +108,7 @@ def resolve_data_path(args):
 
 
 def load_stats(checkpoint_dir, recompute_stats):
+    """Load cached ``(mean, std)`` normalization stats, or None to recompute them."""
     mean_path = checkpoint_dir / "data_mean.npy"
     std_path = checkpoint_dir / "data_std.npy"
     if not recompute_stats and mean_path.exists() and std_path.exists():
@@ -107,6 +118,11 @@ def load_stats(checkpoint_dir, recompute_stats):
 
 def build_datasets(data_path, stats, lazy_load, stats_chunk_size,
                    temporal_mode="none", delta_steps=0, diff_stats=None):
+    """Build train/val :class:`AtmosphereDataset`s sharing the train-split stats.
+
+    Returns ``(train_dataset, val_dataset, stats)`` where ``stats`` are the
+    normalization stats actually used (computed on train if not supplied).
+    """
     train_dataset = AtmosphereDataset(
         data_path,
         split="train",
@@ -132,11 +148,17 @@ def build_datasets(data_path, stats, lazy_load, stats_chunk_size,
 
 
 def truncate_for_smoke(dataset, limit):
+    """Return a Subset of the first ``limit`` samples for quick smoke tests."""
     limit = min(limit, len(dataset))
     return Subset(dataset, list(range(limit)))
 
 
 def train_epoch(model, loader, optimizer, device, mask_generator, lr_schedule, wd_schedule, momentum_schedule, grad_clip):
+    """Run one training epoch and return averaged loss/diagnostic metrics.
+
+    Per batch: sample context/target masks, forward+backward, optional grad
+    clipping, optimizer step, EMA target-encoder update, and LR/WD schedule steps.
+    """
     model.train()
     total_loss = 0.0
     pred_std_sum = 0.0
@@ -190,6 +212,7 @@ def train_epoch(model, loader, optimizer, device, mask_generator, lr_schedule, w
 
 @torch.no_grad()
 def val_epoch(model, loader, device, mask_generator):
+    """Run one validation epoch (no grad/updates); return averaged loss metrics."""
     model.eval()
     total_loss = 0.0
     pred_std_sum = 0.0
@@ -217,6 +240,7 @@ def val_epoch(model, loader, device, mask_generator):
 
 
 def main():
+    """CLI entry point: parse args, build data/model/schedules, and run the I-JEPA training loop."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--large-local", action="store_true")

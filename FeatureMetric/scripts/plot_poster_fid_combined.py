@@ -29,6 +29,7 @@ mpl.rcParams["pdf.fonttype"] = 42
 
 
 def style_axis(ax):
+    """Apply the shared poster styling (colors, ticks, spines, grid) to an axis."""
     ax.set_facecolor("white")
     ax.tick_params(colors=INK_BLACK, labelsize=18, width=1.0)
     for spine in ax.spines.values():
@@ -38,6 +39,7 @@ def style_axis(ax):
 
 
 def draw_severity_panel(ax, sev_npz_path):
+    """Draw the FID-vs-corruption-severity panel from a precomputed .npz file."""
     d = np.load(sev_npz_path)
     severities   = d["severities"]
     fid_noise    = np.maximum(d["fid_noise"], 0.0)
@@ -76,6 +78,7 @@ def draw_severity_panel(ax, sev_npz_path):
 
 
 def draw_leadtime_panel(ax, lt_npz_path):
+    """Draw the FID-vs-forecast-lead-time panel from a precomputed .npz file."""
     d = np.load(lt_npz_path)
     leads          = d["lead_times_hours"]
     fid_ifs_hres   = np.maximum(d["fid_ifs_hres"], 0.0)
@@ -125,6 +128,7 @@ def draw_leadtime_panel(ax, lt_npz_path):
 
 
 def parse_args():
+    """Parse CLI arguments (input .npz paths and output figure path)."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--severity-npz", type=Path,
@@ -142,6 +146,7 @@ def parse_args():
 
 
 def main():
+    """Assemble the two-panel poster FID figure from the cached .npz data and save it."""
     args = parse_args()
 
     fig, (ax_top, ax_bot) = plt.subplots(

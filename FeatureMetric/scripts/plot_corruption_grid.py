@@ -62,12 +62,14 @@ def load_sample(path: Path, time: np.datetime64):
 
 
 def normalize(x: torch.Tensor, mean: np.ndarray, std: np.ndarray) -> torch.Tensor:
+    """Per-channel normalize a ``(1, 4, H, W)`` tensor with the dataset mean/std."""
     m = torch.from_numpy(mean.reshape(1, -1, 1, 1).astype(np.float32))
     s = torch.from_numpy(std.reshape(1, -1, 1, 1).astype(np.float32))
     return (x - m) / s
 
 
 def main():
+    """Render the poster's 2×3 corruption grid for one ERA5 snapshot and save as PDF."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default="2020-07-15T12:00:00")
     parser.add_argument("--severity", type=float, default=1.0,

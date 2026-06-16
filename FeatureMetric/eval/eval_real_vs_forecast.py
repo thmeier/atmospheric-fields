@@ -57,6 +57,7 @@ SOURCE_HATCHES = {"pangu": "", "graphcast": "//"}
 # ---------------------------------------------------------------------------
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Fréchet (FID-style) distance between two Gaussians given their means/covariances."""
     mu1, mu2 = np.atleast_1d(mu1), np.atleast_1d(mu2)
     sigma1, sigma2 = np.atleast_2d(sigma1), np.atleast_2d(sigma2)
     diff = mu1 - mu2
@@ -72,6 +73,10 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 
 def mmd_rbf(X, Y, gamma=None):
+    """Unbiased squared MMD between feature sets ``X`` and ``Y`` with an RBF kernel.
+
+    Uses the median-distance heuristic for the bandwidth when ``gamma`` is None.
+    """
     XX = torch.cdist(X, X, p=2) ** 2
     YY = torch.cdist(Y, Y, p=2) ** 2
     XY = torch.cdist(X, Y, p=2) ** 2
@@ -257,9 +262,11 @@ class TemporalPairDataset(torch.utils.data.Dataset):
         self.diff_std  = diff_stats[1] if diff_stats is not None else None
 
     def __len__(self):
+        """Number of (prior, present) pairs in this dataset."""
         return len(self.prior_idx)
 
     def __getitem__(self, i):
+        """Read the raw prior/present pair at index ``i`` and compose the temporal input."""
         prior_raw   = self.prior_ds.read_raw(self.prior_idx[i])
         present_raw = self.present_ds.read_raw(self.present_idx[i])
         sample = compose_temporal_input(
@@ -313,6 +320,7 @@ def print_metrics_table(results, models, sizes, device, label_suffix=""):
 
 
 def plot_metric_bars(results, models, plots_dir, run_tag):
+    """Bar chart of FID and MMD per model/forecast source, with the ERA5-self baseline line."""
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     sources = ["pangu", "graphcast"]
     x = np.arange(len(models))
@@ -422,6 +430,7 @@ def plot_pca_scatter(features_by_model, results, models, plots_dir, run_tag, mod
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: extract encoder latents for ERA5/forecasts and report FID/MMD + plots."""
     parser = argparse.ArgumentParser(
         description="Compare ERA5 vs forecast latent distributions (MAE + I-JEPA).")
     parser.add_argument("--local", action="store_true",
