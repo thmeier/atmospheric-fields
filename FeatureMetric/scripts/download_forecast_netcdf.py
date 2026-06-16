@@ -18,11 +18,18 @@ SURFACE_VARS = [
     "mean_sea_level_pressure",
 ]
 
+# 5-var order expected by the SFNO encoder (adds 6h-accumulated precipitation).
+# Pangu does NOT forecast precipitation, so this only applies to ERA5 + GraphCast.
+SFNO_SURFACE_VARS = SURFACE_VARS + ["total_precipitation_6hr"]
+
 # Known WeatherBench2 GCS paths at 240x121 (1.5 deg, equiangular with poles)
 SOURCES = {
     "pangu": "gs://weatherbench2/datasets/pangu/2018-2022_0012_240x121_equiangular_with_poles_conservative.zarr",
     # GraphCast is split by year; override with --source if you need a different range
     "graphcast": "gs://weatherbench2/datasets/graphcast/2020/date_range_2019-11-16_2021-02-01_12_hours-240x121_equiangular_with_poles_conservative.zarr",
+    # ERA5 reanalysis (no prediction_timedelta — handled as analysis data). Has
+    # total_precipitation_6hr, so it can supply the SFNO 5th channel.
+    "era5": "gs://weatherbench2/datasets/era5/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr",
 }
 
 
@@ -104,6 +111,12 @@ def main():
         help="Variables to download (default: 4 surface vars matching ERA5)",
     )
     parser.add_argument(
+        "--sfno-vars",
+        action="store_true",
+        help="Download the 5 surface vars (incl. total_precipitation_6hr) in the "
+             "order the SFNO encoder expects. Overrides -v. Not valid for Pangu.",
+    )
+    parser.add_argument(
         "--lead-hours",
         type=int,
         default=24,
@@ -111,11 +124,18 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.sfno_vars:
+        if args.model == "pangu":
+            raise SystemExit("Pangu has no precipitation variable; --sfno-vars is unsupported.")
+        variables = SFNO_SURFACE_VARS
+    else:
+        variables = args.variables
+
     source = args.source or SOURCES[args.model]
     download_forecast(
         source,
         args.output,
-        args.variables,
+        variables,
         args.time_start,
         args.time_end,
         args.lead_hours,
