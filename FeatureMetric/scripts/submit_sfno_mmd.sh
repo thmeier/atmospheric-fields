@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sfno_mmd
+#SBATCH --job-name=sfno_rvf
 #SBATCH --time=02:00:00
 #SBATCH --account=pmlr_jobs
 #SBATCH --mem=16G
@@ -9,34 +9,29 @@
 #SBATCH --error=slurm_%j.err
 
 # ============================================================================
-# SFNO embedding — real (ERA5) vs forecast (GraphCast) MMD, smallest model.
+# SFNO (4-field) embedding — real (ERA5) vs 24h forecast (Pangu + GraphCast).
 #
-# Uses the 5c/15x30 SFNO checkpoint with FULL flatten (concatenate the whole
-# (5,15,30)=2250-dim latent) and MMD only. MMD needs only pairwise distances,
-# so high dim is fine; the smallest model keeps the vector at 2250 dims so the
-# RBF median-bandwidth heuristic stays well-conditioned. FID is skipped (its
-# covariance is singular at this dimension).
+# Produces FID/MMD bars + joint-PCA scatter, the same plots as the MAE/I-JEPA
+# eval_real_vs_forecast.py. The 4-field checkpoints drop precipitation, so SFNO
+# reads the SAME standard 4-var ERA5/Pangu/GraphCast files MAE/I-JEPA use — no
+# special 5-var download, and Pangu is no longer excluded.
 #
-# ── PREREQUISITES (stage these on the LOGIN node before sbatch) ──────────────
-# Compute nodes usually have no internet, so download data + weights first.
+# Default config: 8c/31x60 (best RMSE/SSIM of the 4-field set), mean pooling
+# (feature_dim=8 → FID is valid). Override via env (CHANNELS/RES/POOLING/...).
 #
-# 1) SFNO repo + weights at $SFNO_REPO (default ~/SFNO-Embedding):
-#      git clone <sfno-embedding-url> ~/SFNO-Embedding
-#      # download weights/ (~130 MB) per SFNO-Embedding/README.md into
-#      # ~/SFNO-Embedding/weights/  (needs at least model_5c_15.pth,
-#      # static_fields.pth, normalization_means.pt, normalization_stds.pt)
-#
-# 2) 5-var ERA5 + GraphCast NetCDF (with total_precipitation_6hr) in data/:
-#      cd ~/atmospheric-fields/FeatureMetric
-#      python scripts/download_forecast_netcdf.py era5 \
-#          data/era5_5var_2020.nc -s 2020-01-01 -e 2020-12-31 --sfno-vars
-#      python scripts/download_forecast_netcdf.py graphcast \
-#          data/graphcast_5var_2020_lead24h.nc -s 2020-01-01 -e 2020-12-31 \
-#          --lead-hours 24 --sfno-vars
+# ── PREREQUISITES (stage on the LOGIN node before sbatch) ────────────────────
+# SFNO repo + 4-field weights at $SFNO_REPO (default ~/SFNO-Embedding):
+#     git clone <sfno-embedding-url> ~/SFNO-Embedding
+#     # copy the 4-field weights into ~/SFNO-Embedding/weights_4fields/ :
+#     #   model_<C>c_<HxW>_4fields.pth  (e.g. model_8c_31x60_4fields.pth)
+#     #   static_fields.pth
+#     #   normalization_means_4fields.pt  normalization_stds_4fields.pt
+# Data: the standard team07 ERA5/Pangu/GraphCast files (cluster defaults below)
+# are read directly — nothing to download.
 #
 # Then:  sbatch scripts/submit_sfno_mmd.sh
-# Override paths/config via env vars, e.g.:
-#   CHANNELS=5 RES=15 N_SAMPLES=1000 sbatch scripts/submit_sfno_mmd.sh
+#   # or e.g.:  CHANNELS=16 RES=15 POOLING=grid sbatch scripts/submit_sfno_mmd.sh
+#   #           POOLING=flatten MMD_ONLY=1 sbatch scripts/submit_sfno_mmd.sh
 # ============================================================================
 
 . /etc/profile.d/modules.sh
@@ -50,21 +45,28 @@ cd ~/atmospheric-fields/FeatureMetric
 
 # ── Config (override via env) ───────────────────────────────────────────────
 export SFNO_REPO="${SFNO_REPO:-$HOME/SFNO-Embedding}"
-ERA5_5VAR="${ERA5_5VAR:-data/era5_5var_2020.nc}"
-GC_5VAR="${GC_5VAR:-data/graphcast_5var_2020_lead24h.nc}"
-CHANNELS="${CHANNELS:-5}"        # smallest model
-RES="${RES:-15}"                 # 15 -> 15x30
-POOLING="${POOLING:-flatten}"    # concatenate the full latent
-N_SAMPLES="${N_SAMPLES:-1000}"   # cap; uses all available if pool is smaller
+CHANNELS="${CHANNELS:-8}"          # 4 / 8 / 16  (31x60 only has 8c)
+RES="${RES:-31}"                   # 15 -> 15x28, 31 -> 31x60
+POOLING="${POOLING:-mean}"         # mean/max/meanstd/grid/flatten
+N_SAMPLES="${N_SAMPLES:-1000}"
 SEED="${SEED:-0}"
+MMD_ONLY="${MMD_ONLY:-0}"          # 1 = pass --mmd-only (needed for flatten)
+
+# Resolve HxW for the weight-file preflight check.
+case "$RES" in
+    15) HW="15x28" ;;
+    31) HW="31x60" ;;
+    *) echo "Unsupported RES=$RES (use 15 or 31)"; exit 1 ;;
+esac
 
 mkdir -p plots
 
 # ── Preflight: fail fast with clear guidance if prerequisites are missing ────
 missing=0
-for f in "$SFNO_REPO/weights/model_${CHANNELS}c_${RES}.pth" \
-         "$SFNO_REPO/weights/static_fields.pth" \
-         "$ERA5_5VAR" "$GC_5VAR"; do
+for f in "$SFNO_REPO/weights_4fields/model_${CHANNELS}c_${HW}_4fields.pth" \
+         "$SFNO_REPO/weights_4fields/static_fields.pth" \
+         "$SFNO_REPO/weights_4fields/normalization_means_4fields.pt" \
+         "$SFNO_REPO/weights_4fields/normalization_stds_4fields.pt"; do
     if [ ! -e "$f" ]; then
         echo "MISSING: $f"
         missing=1
@@ -72,28 +74,28 @@ for f in "$SFNO_REPO/weights/model_${CHANNELS}c_${RES}.pth" \
 done
 if [ "$missing" -ne 0 ]; then
     echo ""
-    echo "Prerequisites missing — see the PREREQUISITES block in this script."
-    echo "Stage the SFNO repo/weights and download the 5-var data on the login"
-    echo "node, then re-submit."
+    echo "SFNO 4-field weights missing — see the PREREQUISITES block in this script."
     exit 1
 fi
 
-echo "Starting SFNO MMD eval on node: $(hostname)"
+mmd_flag=""
+[ "$MMD_ONLY" = "1" ] && mmd_flag="--mmd-only"
+
+echo "Starting SFNO 4-field real-vs-forecast eval on node: $(hostname)"
 nvidia-smi || true
 echo "SFNO_REPO=$SFNO_REPO"
-echo "ERA5=$ERA5_5VAR  GraphCast=$GC_5VAR"
-echo "config: ${CHANNELS}c ${RES}  pool=$POOLING  n=$N_SAMPLES"
+echo "config: ${CHANNELS}c ${HW}  pool=$POOLING  n=$N_SAMPLES  mmd_only=$MMD_ONLY"
 
+# No --local: uses the team07 cluster ERA5/Pangu/GraphCast defaults baked into
+# the eval script. Override with --era5-path/--pangu-path/--graphcast-path if needed.
 python eval/eval_sfno_real_vs_forecast.py \
-    --era5-path "$ERA5_5VAR" \
-    --graphcast-path "$GC_5VAR" \
     --channels "$CHANNELS" \
     --res "$RES" \
     --pooling "$POOLING" \
-    --mmd-only \
+    $mmd_flag \
     --n-samples "$N_SAMPLES" \
     --batch-size 16 \
     --num-workers 2 \
     --seed "$SEED"
 
-echo "SFNO MMD eval finished!"
+echo "SFNO real-vs-forecast eval finished!"

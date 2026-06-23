@@ -5,18 +5,18 @@ distribution, then measures Fréchet (FID) distance and RBF-MMD against each of 
 six physically-motivated corruptions across a severity ladder.
 
 Differences from the MAE/I-JEPA version:
-  * raw 5-var 121x240 input (SFNO standardizes internally);
+  * raw 4-var 121x240 input (SFNO standardizes internally);
   * corruptions are applied in SFNO's *standardized* space (after per-channel
     normalization, before the encoder) — that's the space the severities are
     calibrated for, and it matches how the MAE/I-JEPA eval corrupts. The existing
     corruption functions already handle un-padded input, so they're reused as-is;
-    the wind corruptions leave T2M, MSL and the precip channel untouched.
+    the wind corruptions leave T2M and MSL untouched.
 
 Only ERA5 is needed (no forecast). Example::
 
     python eval/eval_sfno_distances.py \
-        --era5-path /work/scratch/$USER/sfno_data/era5_5var_2020.nc \
-        --channels 5 --res 15 --pooling flatten --mmd-only --n-samples 500
+        --era5-path data/test_data_local.nc \
+        --channels 4 --res 15 --pooling flatten --mmd-only --n-samples 500
 """
 import sys
 from pathlib import Path
@@ -30,7 +30,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from utils.sfno_embedding import SFNOEmbedding, RawFiveVarDataset
+from utils.sfno_embedding import SFNOEmbedding, RawFourVarDataset
 from utils.corruptions import (
     apply_gaussian_blur,
     apply_high_freq_noise,
@@ -42,7 +42,7 @@ from utils.corruptions import (
 )
 from eval.eval_real_vs_forecast import calculate_frechet_distance, mmd_rbf
 
-RES_BY_FIRST = {61: (61, 120), 31: (31, 60), 15: (15, 30)}
+RES_BY_FIRST = {31: (31, 60), 15: (15, 28)}
 
 COLORS = {
     "Gaussian Blur": "blue", "High-Freq Noise": "red", "GRF Noise": "green",
@@ -97,8 +97,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--era5-path", required=True, type=Path)
-    parser.add_argument("--channels", type=int, default=5, choices=[5, 10, 20])
-    parser.add_argument("--res", type=int, default=15, choices=[15, 31, 61])
+    parser.add_argument("--channels", type=int, default=4, choices=[4, 8, 16],
+                        help="SFNO embedding channels. 31x60 only has 8c.")
+    parser.add_argument("--res", type=int, default=15, choices=[15, 31],
+                        help="SFNO embedding resolution (first dim): 15 -> 15x28, 31 -> 31x60")
     parser.add_argument("--pooling", choices=["mean", "max", "meanstd", "grid", "flatten"],
                         default="flatten",
                         help="Embedding→vector reduction (see eval_sfno_real_vs_forecast). "
@@ -130,7 +132,7 @@ def main():
     model.eval()
     print(f"  feature_dim = {model.feature_dim}")
 
-    dataset = RawFiveVarDataset(args.era5_path)
+    dataset = RawFourVarDataset(args.era5_path)
     n = min(args.n_samples, len(dataset))
     idx = rng.choice(len(dataset), n, replace=False).tolist()
     loader = DataLoader(Subset(dataset, idx), batch_size=args.batch_size, shuffle=False,
@@ -175,7 +177,7 @@ def main():
             results[cond]["mmd"].append(mmd)
             print(f"    Severity {sev:.2f} | FID: {fid:8.3f} | MMD: {mmd:9.6f}")
 
-    run_tag = (f"{args.channels}c{res[0]}_pool-{args.pooling}_n{n}_steps{ns}_seed{args.seed}"
+    run_tag = (f"{args.channels}c{res[0]}x{res[1]}_pool-{args.pooling}_n{n}_steps{ns}_seed{args.seed}"
                + ("_mmd" if args.mmd_only else ""))
     plots_dir = (Path(args.output_dir) / "plots" if args.output_dir else Path("plots")) / "sfno_distances"
     plot_curves(results, plots_dir, run_tag, args.mmd_only)

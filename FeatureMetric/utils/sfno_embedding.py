@@ -1,17 +1,21 @@
 """Adapter that exposes a colleague's pretrained SFNO autoencoder as a frozen
 feature extractor, compatible with this repo's eval pipeline.
 
-The SFNO encoder lives in a sibling repository (``SFNO-Embedding``). It maps raw,
-un-normalized, un-padded ERA5 surface fields ``(B, 5, 121, 240)`` — in the fixed
-order ``[T2M, U10, V10, MSL, total_precipitation_6hr]`` — to a *spatial* embedding
-``(B, C, h, w)``. To plug into the FID/MMD machinery (which expects one feature
-vector per sample) we spatially pool the embedding to ``(B, C)``.
+The SFNO encoder lives in a sibling repository (``SFNO-Embedding``). This adapter
+targets the **4-field** checkpoints (no precipitation, trained 1975-2019 with
+2020 held out of training) stored in ``SFNO-Embedding/weights_4fields/``. They map
+raw, un-normalized, un-padded ERA5 surface fields ``(B, 4, 121, 240)`` — in the
+fixed order ``[T2M, U10, V10, MSL]`` — to a *spatial* embedding ``(B, C, h, w)``.
+To plug into the FID/MMD machinery (which expects one feature vector per sample)
+we spatially pool the embedding to ``(B, feature_dim)``.
 
 Two integration notes that differ from the MAE/I-JEPA path:
   * SFNO normalizes inputs internally with its *own* training stats, so we feed it
     raw physical units — not this repo's normalized+padded tensors.
-  * SFNO needs a 5th channel (6h precipitation) that the 4-var pipeline lacks;
-    callers must supply 5-var data via :class:`RawFiveVarDataset`.
+  * The fields are the same 4 surface vars MAE/I-JEPA use, so SFNO reads the
+    standard ERA5/Pangu/GraphCast NetCDF files directly via :class:`RawFourVarDataset`
+    (un-normalized, un-padded). Dropping precipitation is what lets SFNO compare
+    against Pangu (which forecasts no precip) as well as GraphCast.
 """
 import os
 import sys
@@ -21,17 +25,19 @@ import torch
 import torch.nn as nn
 from netCDF4 import Dataset as NetCDFDataset
 
-# Channel order the released SFNO checkpoints were trained on (load-bearing).
+# Channel order the released 4-field SFNO checkpoints were trained on (load-bearing).
 SFNO_VARS = [
     "2m_temperature",
     "10m_u_component_of_wind",
     "10m_v_component_of_wind",
     "mean_sea_level_pressure",
-    "total_precipitation_6hr",
 ]
 
+# Default subdirectory of the SFNO repo holding the 4-field checkpoints.
+DEFAULT_WEIGHTS_SUBDIR = "weights_4fields"
 
-def _resolve_sfno_repo(repo_root=None):
+
+def _resolve_sfno_repo(repo_root=None, weights_subdir=DEFAULT_WEIGHTS_SUBDIR):
     """Locate the SFNO-Embedding repo and put its ``src/`` on ``sys.path``.
 
     Resolution order: explicit ``repo_root`` arg → ``SFNO_REPO`` env var →
@@ -49,7 +55,7 @@ def _resolve_sfno_repo(repo_root=None):
         )
         repo_root = candidate
     src = os.path.join(repo_root, "src")
-    weights = os.path.join(repo_root, "weights")
+    weights = os.path.join(repo_root, weights_subdir)
     if not os.path.isdir(src):
         raise FileNotFoundError(
             f"SFNO repo src/ not found at {src!r}. Set --sfno-repo or $SFNO_REPO "
@@ -57,8 +63,9 @@ def _resolve_sfno_repo(repo_root=None):
         )
     if not os.path.isdir(weights):
         raise FileNotFoundError(
-            f"SFNO weights/ not found at {weights!r}. Download the checkpoints "
-            f"(see SFNO-Embedding/README.md) into that folder."
+            f"SFNO weights not found at {weights!r}. Place the 4-field checkpoints "
+            f"(model_<C>c_<HxW>_4fields.pth, static_fields.pth, "
+            f"normalization_means_4fields.pt, normalization_stds_4fields.pt) there."
         )
     if src not in sys.path:
         sys.path.insert(0, src)
@@ -66,32 +73,44 @@ def _resolve_sfno_repo(repo_root=None):
 
 
 class SFNOEmbedding(nn.Module):
-    """Frozen SFNO encoder + spatial pooling → per-sample feature vector.
+    """Frozen 4-field SFNO encoder + spatial pooling → per-sample feature vector.
 
     ``extract_features(x)`` mirrors the contract used by MAE/I-JEPA so the same
     ``extract_features_for_loader`` helper drives all three. Input ``x`` is
-    ``(B, 5, 121, 240)`` in raw physical units.
+    ``(B, 4, 121, 240)`` in raw physical units.
     """
 
-    VALID_RES = {(61, 120), (31, 60), (15, 30)}
-    VALID_CHANNELS = {5, 10, 20}
+    # (embed_channels, embedding_resolution) combinations Marino shipped.
+    VALID_CONFIGS = {
+        (4, (15, 28)),
+        (8, (15, 28)),
+        (16, (15, 28)),
+        (8, (31, 60)),
+    }
+    VALID_RES = {res for _, res in VALID_CONFIGS}
+    VALID_CHANNELS = {c for c, _ in VALID_CONFIGS}
+
+    # Number of input/output physical fields (T2M, U10, V10, MSL).
+    IN_CHANNELS = 4
 
     POOLINGS = ("mean", "max", "meanstd", "grid", "flatten")
 
-    def __init__(self, embedding_channels=10, embedding_resolution=(31, 60),
-                 repo_root=None, pooling="mean", pool_grid=(7, 8)):
+    def __init__(self, embedding_channels=8, embedding_resolution=(31, 60),
+                 repo_root=None, pooling="mean", pool_grid=(7, 8),
+                 weights_subdir=DEFAULT_WEIGHTS_SUBDIR):
         super().__init__()
-        if tuple(embedding_resolution) not in self.VALID_RES:
-            raise ValueError(f"embedding_resolution must be one of {self.VALID_RES}")
-        if embedding_channels not in self.VALID_CHANNELS:
-            raise ValueError(f"embedding_channels must be one of {self.VALID_CHANNELS}")
+        res = tuple(embedding_resolution)
+        if (embedding_channels, res) not in self.VALID_CONFIGS:
+            raise ValueError(
+                f"({embedding_channels}c, {res}) is not an available 4-field config. "
+                f"Valid configs: {sorted(self.VALID_CONFIGS)}"
+            )
         if pooling not in self.POOLINGS:
             raise ValueError(f"unknown pooling {pooling!r}, expected one of {self.POOLINGS}")
 
-        repo_root, weights = _resolve_sfno_repo(repo_root)
+        repo_root, weights = _resolve_sfno_repo(repo_root, weights_subdir)
         from models import SFNO  # vendored; no torchvision / external torch_harmonics
 
-        res = tuple(embedding_resolution)
         self.embedding_channels = embedding_channels
         self.embedding_resolution = res
         self.pooling = pooling
@@ -106,11 +125,13 @@ class SFNOEmbedding(nn.Module):
         self.patch_size = 16
 
         self.model = SFNO(
-            nlat=121, nlon=240, channels=5,
+            nlat=121, nlon=240, channels=self.IN_CHANNELS,
             static_field_set="geopotential_and_mask", blocks=7,
             embed_size=[res[0], res[1]], embed_channels=embedding_channels,
         )
-        ckpt = os.path.join(weights, f"model_{embedding_channels}c_{res[0]}.pth")
+        ckpt = os.path.join(
+            weights, f"model_{embedding_channels}c_{res[0]}x{res[1]}_4fields.pth"
+        )
         self.model.load_state_dict(torch.load(ckpt, map_location="cpu"))
         self.model.eval()
 
@@ -118,11 +139,11 @@ class SFNOEmbedding(nn.Module):
             os.path.join(weights, "static_fields.pth"), map_location="cpu"
         )["static_channels"].float()
         means = torch.load(
-            os.path.join(weights, "normalization_means.pt"),
+            os.path.join(weights, "normalization_means_4fields.pt"),
             map_location="cpu", weights_only=False,
         )
         stds = torch.load(
-            os.path.join(weights, "normalization_stds.pt"),
+            os.path.join(weights, "normalization_stds_4fields.pt"),
             map_location="cpu", weights_only=False,
         )
         self.register_buffer("static_channels", static)
@@ -165,18 +186,18 @@ class SFNOEmbedding(nn.Module):
 
     @torch.no_grad()
     def encode(self, x, corruption_fn=None):
-        """Raw fields ``(B, 5, 121, 240)`` → SFNO spatial embedding ``(B, C, h, w)``.
+        """Raw fields ``(B, 4, 121, 240)`` → SFNO spatial embedding ``(B, C, h, w)``.
 
         ``corruption_fn`` (if given) is applied in SFNO's *standardized* space —
         i.e. after per-channel normalization, before the encoder. This is the
         space the corruption severities are calibrated for (unit-ish per channel),
         and it matches how the MAE/I-JEPA eval corrupts. Applying corruptions to
         the raw physical fields instead would be meaningless across the wildly
-        different variable scales (e.g. K vs Pa vs m of precip).
+        different variable scales (e.g. K vs Pa).
         """
-        if x.shape[-3:] != (5, 121, 240):
+        if x.shape[-3:] != (self.IN_CHANNELS, 121, 240):
             raise ValueError(
-                f"expected (B, 5, 121, 240) raw fields, got {tuple(x.shape)}"
+                f"expected (B, {self.IN_CHANNELS}, 121, 240) raw fields, got {tuple(x.shape)}"
             )
         xn = (x - self.norm_mean) / self.norm_std
         if corruption_fn is not None:
@@ -185,7 +206,7 @@ class SFNOEmbedding(nn.Module):
 
     @torch.no_grad()
     def extract_features(self, x, corruption_fn=None):
-        """Raw fields ``(B, 5, 121, 240)`` → pooled feature vector ``(B, feature_dim)``.
+        """Raw fields ``(B, 4, 121, 240)`` → pooled feature vector ``(B, feature_dim)``.
 
         ``corruption_fn`` is applied in standardized space (see :meth:`encode`).
         """
@@ -195,13 +216,13 @@ class SFNOEmbedding(nn.Module):
         return self.extract_features(x)
 
 
-class RawFiveVarDataset(torch.utils.data.Dataset):
-    """Reads raw (un-normalized, un-padded) 5-var ``(5, 121, 240)`` samples.
+class RawFourVarDataset(torch.utils.data.Dataset):
+    """Reads raw (un-normalized, un-padded) 4-var ``(4, 121, 240)`` samples.
 
     Mirrors :class:`utils.dataset.AtmosphereDataset`'s file orientation
-    (``(time, longitude, latitude)`` → ``(latitude, longitude)``) but keeps the
-    precipitation channel and applies no normalization or padding, since the
-    SFNO encoder standardizes inputs itself.
+    (``(time, longitude, latitude)`` → ``(latitude, longitude)``) but applies no
+    normalization or padding, since the SFNO encoder standardizes inputs itself.
+    Works directly on the standard ERA5/Pangu/GraphCast surface NetCDF files.
     """
 
     def __init__(self, nc_path):
@@ -212,8 +233,7 @@ class RawFiveVarDataset(torch.utils.data.Dataset):
             missing = [v for v in SFNO_VARS if v not in ds.variables]
             if missing:
                 raise ValueError(
-                    f"{nc_path} is missing SFNO variables {missing}. "
-                    f"Re-download with --sfno-vars."
+                    f"{nc_path} is missing SFNO variables {missing}."
                 )
 
     def _get_dataset(self):
@@ -236,5 +256,5 @@ class RawFiveVarDataset(torch.utils.data.Dataset):
                     f"{var_name} slice has shape {a.shape}, expected (121, 240) or (240, 121)"
                 )
             arrays.append(a)
-        x = np.stack(arrays, axis=0)        # (5, 121, 240)
+        x = np.stack(arrays, axis=0)        # (4, 121, 240)
         return torch.from_numpy(x)
