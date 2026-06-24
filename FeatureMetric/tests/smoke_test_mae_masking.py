@@ -17,6 +17,11 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 
 
 def main():
+    """Smoke test: drive the MAE with I-JEPA-style structured (block) masking.
+
+    Converts target blocks to MAE visible/loss masks and checks visible/masked
+    partitioning, a finite loss, and a well-shaped feature vector.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=2)
     args = parser.parse_args()

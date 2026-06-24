@@ -8,6 +8,15 @@ logger = getLogger()
 
 
 class MultiBlockMaskGenerator:
+    """Samples context and target patch masks for I-JEPA training.
+
+    For each batch it draws several rectangular target blocks and one (or more)
+    context block(s) over the patch grid, returning index tensors (not boolean
+    maps) suitable for ``torch.gather``. Two context strategies are supported:
+    "multiblock" (a large block with target patches subtracted) and "world-band"
+    (a vertical longitude band, wrapping around the globe).
+    """
+
     def __init__(
         self,
         input_size=(128, 256),
@@ -22,6 +31,14 @@ class MultiBlockMaskGenerator:
         context_mode="multiblock",
         disjoint_targets=False,
     ):
+        """Configure grid geometry and mask-sampling hyperparameters.
+
+        Args mirror the I-JEPA paper: ``enc_mask_scale``/``pred_mask_scale`` are
+        the (min, max) fractions of patches covered by context/target blocks,
+        ``aspect_ratio`` the allowed block aspect ratios, ``nenc``/``npred`` the
+        number of context/target blocks, and ``min_keep`` the minimum visible
+        patches a block must retain to be accepted.
+        """
         if not isinstance(input_size, tuple):
             input_size = (input_size,) * 2
         self.patch_size = patch_size
@@ -43,6 +60,11 @@ class MultiBlockMaskGenerator:
             raise ValueError(f"Unknown context mode: {self.context_mode}")
 
     def step(self):
+        """Atomically increment and return the shared iteration counter.
+
+        Used to seed a fresh RNG per ``sample()`` call so that masks differ
+        across iterations while staying reproducible across DataLoader workers.
+        """
         counter = self._itr_counter
         with counter.get_lock():
             counter.value += 1
@@ -50,11 +72,18 @@ class MultiBlockMaskGenerator:
         return value
 
     def _make_generator(self):
+        """Build a torch RNG seeded by the current iteration counter."""
         generator = torch.Generator()
         generator.manual_seed(self.step())
         return generator
 
     def _sample_block_size(self, generator, scale, aspect_ratio_scale):
+        """Sample a (height, width) block size in patch units.
+
+        Draws a target coverage fraction from ``scale`` and an aspect ratio from
+        ``aspect_ratio_scale``, then converts them into integer patch dimensions
+        clamped to fit inside the grid.
+        """
         rand = torch.rand(1, generator=generator).item()
         min_scale, max_scale = scale
         mask_scale = min_scale + rand * (max_scale - min_scale)
@@ -72,6 +101,14 @@ class MultiBlockMaskGenerator:
         return max(1, height), max(1, width)
 
     def _sample_block_mask(self, generator, block_size, acceptable_regions=None):
+        """Place one rectangular block at a random grid location.
+
+        Returns ``(mask, mask_complement)`` where ``mask`` is the flat patch
+        indices covered by the block and ``mask_complement`` is the binary grid
+        of patches *outside* the block. ``acceptable_regions`` optionally
+        restricts placement (e.g. to keep context away from targets); if no
+        valid block is found the constraints are progressively relaxed.
+        """
         height, width = block_size
 
         def constrain_mask(mask, tries=0):
@@ -107,6 +144,13 @@ class MultiBlockMaskGenerator:
         return mask, mask_complement
 
     def _sample_target_masks(self, batch_size, device, generator):
+        """Sample ``npred`` target blocks per image for the whole batch.
+
+        All target masks share one block size. When ``disjoint_targets`` is set,
+        each new block avoids patches already claimed by earlier blocks. Returns
+        a list of ``npred`` index tensors, each truncated to the batch-wide
+        minimum length so they can be stacked.
+        """
         pred_size = self._sample_block_size(
             generator=generator,
             scale=self.pred_mask_scale,
@@ -144,6 +188,12 @@ class MultiBlockMaskGenerator:
         return pred_masks
 
     def _sample_multiblock_context(self, batch_size, device, generator, target_masks):
+        """Sample the standard I-JEPA context block(s) for the batch.
+
+        Draws one large block and (unless ``allow_overlap``) subtracts all target
+        patches from the acceptable region so the context never leaks target
+        content. Returns a single index tensor when ``nenc == 1``, else a list.
+        """
         enc_size = self._sample_block_size(
             generator=generator,
             scale=self.enc_mask_scale,
@@ -182,6 +232,13 @@ class MultiBlockMaskGenerator:
         return enc_masks[0] if self.nenc == 1 else enc_masks
 
     def _sample_world_band_context(self, batch_size, device, generator, target_masks):
+        """Sample a vertical longitude band as the context region.
+
+        Picks a band of columns (wrapping around the longitude axis) covering an
+        ``enc_mask_scale`` fraction of the width, then removes target patches
+        unless ``allow_overlap``. Models a "predict the rest of the globe from a
+        slice of longitudes" task. Raises if too few visible patches remain.
+        """
         enc_scale = self.enc_mask_scale[0] + (
             self.enc_mask_scale[1] - self.enc_mask_scale[0]
         ) * torch.rand(1, generator=generator).item()
@@ -215,6 +272,12 @@ class MultiBlockMaskGenerator:
         return context_masks
 
     def sample(self, batch_size, device):
+        """Sample one batch of masks: returns ``(context_masks, target_masks)``.
+
+        ``target_masks`` is a list of ``npred`` index tensors; ``context_masks``
+        follows the configured ``context_mode``. This is the public entry point
+        called once per training step.
+        """
         generator = self._make_generator()
         target_masks = self._sample_target_masks(batch_size=batch_size, device=device, generator=generator)
         if self.context_mode == "multiblock":
@@ -235,12 +298,18 @@ class MultiBlockMaskGenerator:
 
 
 def to_coords(indices, grid_width):
+    """Convert flat patch indices into ``(row, col)`` grid coordinates."""
     rows = indices // grid_width
     cols = indices % grid_width
     return rows, cols
 
 
 def masks_to_complements(target_masks, grid_height, grid_width):
+    """Build the binary "allowed" grid for each target mask.
+
+    Returns a list of grids where patches belonging to the target block are 0
+    and all others are 1 — used to keep sampled context blocks off the targets.
+    """
     complements = []
     for mask in target_masks:
         complement = torch.ones((grid_height, grid_width), dtype=torch.int32)
@@ -251,6 +320,13 @@ def masks_to_complements(target_masks, grid_height, grid_width):
 
 
 def target_masks_to_mae_masks(target_masks, num_patches):
+    """Convert I-JEPA target index masks into MAE-style visible/loss masks.
+
+    Lets the MAE share I-JEPA's block masking: the union of target patches
+    becomes the "masked" (reconstructed) set, and the remaining patches are
+    "visible". Returns ``(visible_indices, loss_mask)``. Requires the same number
+    of visible patches per sample so the batch can be stacked.
+    """
     batch_size = target_masks[0].shape[0]
     mask = torch.zeros((batch_size, num_patches), dtype=torch.float32, device=target_masks[0].device)
 

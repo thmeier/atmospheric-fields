@@ -32,6 +32,11 @@ def _pool_patch_tokens(x):
 # ---------------------------------------------------------------------------
 
 def _mae_get_1d_sincos_pos_embed(embed_dim, positions):
+    """Build 1-D sine/cosine positional embeddings for the given positions.
+
+    Returns an ``(len(positions), embed_dim)`` array; half the dims encode sine,
+    half cosine, at geometrically spaced frequencies.
+    """
     omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.0
     omega = 1.0 / (10000 ** omega)
@@ -41,6 +46,11 @@ def _mae_get_1d_sincos_pos_embed(embed_dim, positions):
 
 
 def _mae_get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=False):
+    """Build 2-D sin/cos positional embeddings for an H×W patch grid.
+
+    Concatenates separate height and width 1-D embeddings per patch. If
+    ``cls_token`` is set, a zero row is prepended for the CLS token.
+    """
     grid_h = np.arange(grid_size_h, dtype=np.float32)
     grid_w = np.arange(grid_size_w, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h, indexing="xy")
@@ -58,6 +68,12 @@ def _mae_get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w, cls_token=
 # ---------------------------------------------------------------------------
 
 class PatchEmbedMAE(nn.Module):
+    """Splits an image into non-overlapping patches and linearly embeds each.
+
+    Implemented as a strided conv; output is a ``(B, num_patches, embed_dim)``
+    token sequence.
+    """
+
     def __init__(self, img_size=(128, 256), patch_size=16, in_chans=4, embed_dim=256):
         super().__init__()
         self.img_size = img_size
@@ -66,6 +82,7 @@ class PatchEmbedMAE(nn.Module):
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
+        """Embed ``(B, C, H, W)`` image into ``(B, num_patches, embed_dim)`` tokens."""
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
@@ -74,6 +91,15 @@ class PatchEmbedMAE(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MaskedAutoencoderViT(nn.Module):
+    """Masked Autoencoder with a ViT encoder/decoder for ERA5 fields.
+
+    A fraction of patches is masked; the encoder processes only visible patches
+    (plus a CLS token) and the lightweight decoder reconstructs the raw pixel
+    values of the masked patches. Loss is L1 on masked patches only.
+    ``extract_features`` reuses the encoder (no masking) to produce a latent
+    feature vector for the realism metric.
+    """
+
     def __init__(
         self,
         img_size=(128, 256),
@@ -127,6 +153,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
+        """Fill fixed sin/cos positional embeddings and init all learnable weights."""
         enc_pe = _mae_get_2d_sincos_pos_embed(
             self.pos_embed.shape[-1], self.grid_size[0], self.grid_size[1], cls_token=True)
         dec_pe = _mae_get_2d_sincos_pos_embed(
@@ -142,6 +169,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.fix_init_weight()
 
     def fix_init_weight(self):
+        """Rescale per-layer weights by 1/sqrt(2*layer_id) for stable deep init."""
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
 
@@ -150,6 +178,7 @@ class MaskedAutoencoderViT(nn.Module):
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
     def _init_weights(self, m):
+        """Per-module weight init: truncated-normal linears/convs, unit LayerNorm."""
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=self.init_std)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -163,6 +192,12 @@ class MaskedAutoencoderViT(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def random_masking(self, x, mask_ratio):
+        """Randomly keep a (1-mask_ratio) subset of patches per sample.
+
+        Returns ``(x_masked, mask, ids_restore)``: the kept tokens, the binary
+        mask (1 = removed) in original order, and indices to un-shuffle the
+        sequence in the decoder.
+        """
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
         noise = torch.rand(N, L, device=x.device)
@@ -176,6 +211,12 @@ class MaskedAutoencoderViT(nn.Module):
         return x_masked, mask, ids_restore
 
     def structured_masking(self, x, visible_indices, loss_mask):
+        """Apply an externally supplied mask (e.g. I-JEPA blocks) instead of random.
+
+        Given explicit ``visible_indices`` and a ``loss_mask`` (1 = masked), gathers
+        the visible tokens and reconstructs ``ids_restore``. Requires a fixed count
+        of masked patches per sample so the batch stays rectangular.
+        """
         _, L, D = x.shape
         ids_keep = visible_indices.long()
         x_visible = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D))
@@ -193,6 +234,11 @@ class MaskedAutoencoderViT(nn.Module):
         return x_visible, mask, ids_restore
 
     def forward_encoder(self, x, mask_ratio=None, visible_indices=None, loss_mask=None):
+        """Patch-embed, mask, prepend CLS, and run the encoder transformer.
+
+        Uses structured masking when ``visible_indices`` is given, otherwise random
+        masking at ``mask_ratio``. Returns ``(encoded, mask, ids_restore)``.
+        """
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
         if visible_indices is not None:
@@ -212,6 +258,10 @@ class MaskedAutoencoderViT(nn.Module):
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
+        """Re-insert mask tokens, restore patch order, and predict raw pixels.
+
+        Returns per-patch pixel predictions of shape ``(B, num_patches, p^2 * C)``.
+        """
         x = self.decoder_embed(x)
         mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
@@ -225,12 +275,14 @@ class MaskedAutoencoderViT(nn.Module):
         return x
 
     def forward_loss(self, imgs, pred, mask):
+        """Mean L1 reconstruction error, averaged over masked patches only."""
         target = self.patchify(imgs)
         loss = (pred - target).abs().mean(dim=-1)
         loss = (loss * mask).sum() / mask.sum()
         return loss
 
     def patchify(self, imgs):
+        """Reshape ``(B, C, H, W)`` images into ``(B, num_patches, p^2 * C)`` targets."""
         p = self.patch_embed.patch_size
         h = imgs.shape[2] // p
         w = imgs.shape[3] // p
@@ -240,6 +292,7 @@ class MaskedAutoencoderViT(nn.Module):
         return x
 
     def forward(self, imgs, mask_ratio=0.75, visible_indices=None, loss_mask=None):
+        """Full MAE forward: encode → decode → loss. Returns ``(loss, pred, mask)``."""
         latent, mask, ids_restore = self.forward_encoder(
             imgs,
             mask_ratio=mask_ratio,
@@ -251,6 +304,11 @@ class MaskedAutoencoderViT(nn.Module):
         return loss, pred, mask
 
     def extract_features(self, imgs):
+        """Encode all patches (no masking) and pool to a latent feature vector.
+
+        This is the metric backbone's representation: runs the full encoder at
+        mask_ratio 0 and pools the patch tokens (CLS excluded).
+        """
         x = self.patch_embed(imgs)
         x = x + self.pos_embed[:, 1:, :]
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
@@ -282,6 +340,7 @@ class MaskedAutoencoderViT(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
+    """In-place fill ``tensor`` with a truncated normal via the inverse-CDF method."""
     def norm_cdf(x):
         return (1. + math.erf(x / math.sqrt(2.))) / 2.
     with torch.no_grad():
@@ -296,6 +355,7 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+    """Public wrapper: fill ``tensor`` with values from a truncated normal in [a, b]."""
     # type: (Tensor, float, float, float, float) -> Tensor
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
@@ -313,6 +373,10 @@ def apply_masks(x, masks):
 
 
 def repeat_interleave_batch(x, B, repeat):
+    """Repeat each per-batch block of ``x`` ``repeat`` times, keeping batches grouped.
+
+    Used to align predictor mask tokens with the number of context masks.
+    """
     N = len(x) // B
     x = torch.cat([
         torch.cat([x[i*B:(i+1)*B] for _ in range(repeat)], dim=0)
@@ -347,6 +411,7 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w=None, cls_token=
 
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    """Combine separate height/width 1-D sin/cos embeddings for a coordinate grid."""
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
@@ -383,6 +448,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 # ---------------------------------------------------------------------------
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """Stochastic depth: randomly zero whole residual paths per sample at train time."""
     if drop_prob == 0. or not training:
         return x
     keep_prob = 1 - drop_prob
@@ -404,6 +470,7 @@ class DropPath(nn.Module):
 
 
 class MLP(nn.Module):
+    """Two-layer feed-forward block (Linear → activation → Linear) used in transformer blocks."""
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -423,6 +490,7 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
+    """Standard multi-head self-attention; returns ``(output, attention_weights)``."""
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -450,6 +518,7 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
+    """Pre-norm transformer block: attention + MLP, each with a residual connection."""
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -547,6 +616,7 @@ class VisionTransformerPredictor(nn.Module):
         self.fix_init_weight()
 
     def fix_init_weight(self):
+        """Rescale per-layer weights by 1/sqrt(2*layer_id) for stable deep init."""
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
 
@@ -555,6 +625,7 @@ class VisionTransformerPredictor(nn.Module):
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
     def _init_weights(self, m):
+        """Per-module weight init: truncated-normal linears/convs, unit LayerNorm."""
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=self.init_std)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -568,6 +639,12 @@ class VisionTransformerPredictor(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x, masks_x, masks):
+        """Predict target-block representations from context tokens.
+
+        Takes context tokens ``x`` (selected by ``masks_x``) plus learned mask
+        tokens placed at the ``masks`` target positions, runs the predictor
+        transformer, and returns only the predictions for the target patches.
+        """
         assert (masks is not None) and (masks_x is not None), 'Cannot run predictor without mask indices'
 
         if not isinstance(masks_x, list):
@@ -676,6 +753,7 @@ class VisionTransformer(nn.Module):
         self.fix_init_weight()
 
     def fix_init_weight(self):
+        """Rescale per-layer weights by 1/sqrt(2*layer_id) for stable deep init."""
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
 
@@ -684,6 +762,7 @@ class VisionTransformer(nn.Module):
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
     def _init_weights(self, m):
+        """Per-module weight init: truncated-normal linears/convs, unit LayerNorm."""
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=self.init_std)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -697,6 +776,11 @@ class VisionTransformer(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x, masks=None):
+        """Patch-embed, add positions, optionally keep only ``masks`` patches, encode.
+
+        Returns the normalized patch-token sequence. When ``masks`` is given (a
+        list of index tensors), only those patches are processed.
+        """
         if masks is not None:
             if not isinstance(masks, list):
                 masks = [masks]
@@ -721,6 +805,7 @@ class VisionTransformer(nn.Module):
         return x
 
     def extract_features(self, x):
+        """Encode all patches (no masking) and pool to a latent feature vector."""
         return _pool_patch_tokens(self.forward(x))
 
 
@@ -733,6 +818,14 @@ RectangularVisionTransformer = VisionTransformer
 # ---------------------------------------------------------------------------
 
 class IJEPA(nn.Module):
+    """I-JEPA model bundling the context encoder, EMA target encoder, and predictor.
+
+    Training predicts target-block representations (produced by the frozen,
+    EMA-updated target encoder) from context-block representations, with an MSE/
+    smooth-L1 loss in latent space — no pixel reconstruction. ``extract_features``
+    always uses the target encoder for the realism metric.
+    """
+
     def __init__(
         self,
         img_size=(128, 256),
@@ -781,12 +874,18 @@ class IJEPA(nn.Module):
 
     @torch.no_grad()
     def update_target_encoder(self, momentum):
+        """EMA-update the target encoder toward the context encoder weights."""
         for context_param, target_param in zip(
             self.context_encoder.parameters(), self.target_encoder.parameters()
         ):
             target_param.data.mul_(momentum).add_(context_param.data, alpha=1.0 - momentum)
 
     def forward(self, imgs, context_masks, target_masks):
+        """Run target/context encoders + predictor; return ``(loss, preds, targets)``.
+
+        Target representations come from the frozen target encoder (no grad);
+        the loss is smooth-L1 between predicted and target patch embeddings.
+        """
         self.target_encoder.eval()
         with torch.no_grad():
             target_tokens = self.target_encoder(imgs)
@@ -800,10 +899,12 @@ class IJEPA(nn.Module):
 
     @torch.no_grad()
     def extract_features(self, imgs):
+        """Latent feature vector from the target encoder (the metric backbone)."""
         return self.target_encoder.extract_features(imgs)
 
     @property
     def encoder(self):
+        """The trainable context encoder (alias used by external callers)."""
         return self.context_encoder
 
 
@@ -825,6 +926,12 @@ def build_ijepa(
     depth=None,
     predictor_embed_dim=None,
 ):
+    """Construct an :class:`IJEPA` from a named size preset ("tiny"/"small"/"twin").
+
+    Any of ``embed_dim``/``num_heads``/``depth``/``predictor_embed_dim`` override
+    the preset; ``num_heads`` is auto-derived from ``embed_dim`` when omitted.
+    Validates that ``embed_dim`` is divisible by ``num_heads``.
+    """
     configs = {
         "tiny": {
             "embed_dim": 192,
@@ -882,6 +989,12 @@ def build_mae(
     depth=None,
     decoder_embed_dim=None,
 ):
+    """Construct a :class:`MaskedAutoencoderViT` from a named size preset.
+
+    Overrides mirror :func:`build_ijepa`; when ``embed_dim`` is given the decoder
+    width and head counts are auto-derived. Validates head divisibility for both
+    encoder and decoder.
+    """
     configs = {
         "default": {
             "embed_dim": 256,

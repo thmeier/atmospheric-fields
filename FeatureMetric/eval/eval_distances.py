@@ -29,6 +29,7 @@ LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local
 
 
 def format_model_label(model_name, model_size, model_variant=None):
+    """Build a human-readable model label like ``MAE (twin) [variant]`` for plots/logs."""
     label = f"{model_name.upper()} ({model_size})"
     if model_variant:
         label += f" [{model_variant}]"
@@ -36,6 +37,11 @@ def format_model_label(model_name, model_size, model_variant=None):
 
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Fréchet (FID-style) distance between two Gaussians from their means/covariances.
+
+    Handles numerically imaginary matrix-sqrt results by adding a small diagonal
+    offset, matching the standard FID implementation.
+    """
     mu1, mu2 = np.atleast_1d(mu1), np.atleast_1d(mu2)
     sigma1, sigma2 = np.atleast_2d(sigma1), np.atleast_2d(sigma2)
     diff = mu1 - mu2
@@ -51,6 +57,10 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 
 def mmd_rbf(X, Y, gamma=None):
+    """Unbiased squared MMD between feature sets ``X`` and ``Y`` with an RBF kernel.
+
+    When ``gamma`` is None it uses the median-distance heuristic for the kernel bandwidth.
+    """
     XX = torch.cdist(X, X, p=2) ** 2
     YY = torch.cdist(Y, Y, p=2) ** 2
     XY = torch.cdist(X, Y, p=2) ** 2
@@ -69,6 +79,12 @@ def mmd_rbf(X, Y, gamma=None):
 
 def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dataset, batch_size,
                    num_workers, local_flags, n_severity_steps=5, embed_dim=None):
+    """Protocol 2 for one model: build a clean reference latent distribution, then
+    measure Fréchet distance and MMD against each corruption across severity levels.
+
+    Returns ``(results, ladders)`` where ``results`` maps each corruption to its
+    severity list and per-severity FID/MMD curves.
+    """
     print(f"Loading {format_model_label(model_name, model_size, model_variant)} model...")
     model = build_model(model_name, device=device, model_size=model_size, embed_dim=embed_dim)
     ckpt_path = checkpoint_path(model_name, model_size, stats_dir, variant=model_variant, embed_dim=embed_dim)
@@ -127,6 +143,7 @@ def evaluate_model(model_name, model_size, model_variant, device, stats_dir, dat
 
 
 def plot_distances(all_results, models_to_run, model_sizes, model_variants, ladders, plots_dir, run_tag):
+    """Render and save the distance-vs-severity plots (raw curves + normalised subplots)."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
@@ -241,6 +258,7 @@ def plot_distances(all_results, models_to_run, model_sizes, model_variants, ladd
 
 
 def print_summary(all_results, models_to_run, model_sizes):
+    """Print a formatted table of per-corruption FID/MMD values for each model."""
     print("\n" + "=" * 80)
     print("DISTANCE EVALUATION SUMMARY")
     print("=" * 80)
@@ -256,6 +274,7 @@ def print_summary(all_results, models_to_run, model_sizes):
 
 
 def main():
+    """CLI entry point for Protocol 2 (Fréchet/MMD distance vs. corruption severity)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa", "both"], default="mae")
     parser.add_argument("--mae-size", choices=["default", "twin"], default="twin")

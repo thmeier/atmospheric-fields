@@ -64,6 +64,7 @@ STD_PATH = MODEL_DIR / "data_std.npy"
 
 # -- FID --------------------------------------------------------------------
 def frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Fréchet (FID-style) distance between two Gaussians given their means/covariances."""
     mu1, mu2 = np.atleast_1d(mu1), np.atleast_1d(mu2)
     sigma1, sigma2 = np.atleast_2d(sigma1), np.atleast_2d(sigma2)
     diff = mu1 - mu2
@@ -77,6 +78,10 @@ def frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 
 def fid_curve(model, loader, device, apply_fn, severities, label):
+    """Compute latent FID(clean, corrupted) across ``severities`` for one corruption.
+
+    Returns an array of FID values (clamped ≥ 0) parallel to ``severities``.
+    """
     print(f"\n  {label}")
     fids = []
     for sev in severities:
@@ -100,6 +105,7 @@ def fid_curve(model, loader, device, apply_fn, severities, label):
 
 # -- Plotting ---------------------------------------------------------------
 def style_axis(ax):
+    """Apply the shared poster styling (colors, ticks, spines, grid) to an axis."""
     ax.set_facecolor("white")
     ax.tick_params(colors=INK_BLACK, labelsize=18, width=1.0)
     for spine in ax.spines.values():
@@ -109,6 +115,7 @@ def style_axis(ax):
 
 
 def plot_figure(severities, fid_noise, fid_rotation, output_path):
+    """Render the two-row poster figure (FID-vs-severity + lead-time placeholder) and save it."""
     fig, (ax_top, ax_bot) = plt.subplots(
         2, 1, figsize=(8.5, 11), constrained_layout=True
     )
@@ -244,6 +251,7 @@ def compute_and_cache(args, cache_path):
 
 
 def load_cache(cache_path):
+    """Load previously cached FID curves from ``cache_path`` and print provenance info."""
     data = np.load(cache_path, allow_pickle=True)
     print(f"Loaded cached FID curves <- {cache_path}")
     print(f"  n_samples={int(data['n_samples'])}  seed={int(data['seed'])}")
@@ -253,6 +261,7 @@ def load_cache(cache_path):
 
 
 def main():
+    """Compute (or load cached) FID-vs-severity curves and render the poster figure."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-severity-steps", type=int, default=5,
                         help="Number of severity levels evenly spaced in [0, 1].")

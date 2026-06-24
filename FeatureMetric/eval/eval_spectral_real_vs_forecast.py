@@ -77,6 +77,7 @@ def compute_radial_psd(data):
 # ---------------------------------------------------------------------------
 
 def _read_times(nc_path):
+    """Read the 'time' dimension of a NetCDF file as a pd.DatetimeIndex."""
     try:
         import xarray as xr
         ds = xr.open_dataset(nc_path, decode_times=True)
@@ -215,6 +216,7 @@ def plot_radial_psd(fields_by_source, plots_dir, run_tag):
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: load matched ERA5/forecast fields and save 2D + radial PSD plots."""
     parser = argparse.ArgumentParser(description="Spectral PSD comparison: ERA5 vs forecasts.")
     parser.add_argument("--n-samples", type=int, default=100,
                         help="Number of time steps to average over (default: 100).")

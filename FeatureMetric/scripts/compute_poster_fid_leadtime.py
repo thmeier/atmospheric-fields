@@ -76,9 +76,11 @@ class InMemoryRawSource:
         ds.close()
 
     def read_raw(self, idx):
+        """Return the raw ``(4, H, W)`` field at time index ``idx``."""
         return self.data[idx]
 
     def __len__(self):
+        """Number of time steps held in memory."""
         return self.data.shape[0]
 
 
@@ -92,9 +94,11 @@ class SimpleNormalizedDataset(Dataset):
         self.abs_std = abs_std
 
     def __len__(self):
+        """Number of selected snapshots."""
         return len(self.indices)
 
     def __getitem__(self, i):
+        """Return the normalized 4-channel ("none"-mode) input for snapshot ``i``."""
         raw = self.src.read_raw(self.indices[i])  # (4, H, W)
         sample = compose_temporal_input(raw, None, "none", self.abs_mean, self.abs_std)
         return torch.from_numpy(sample)
@@ -117,9 +121,11 @@ class TemporalPairDataset(Dataset):
         self.diff_std = diff_std
 
     def __len__(self):
+        """Number of (prior, present) pairs."""
         return len(self.prior_idx)
 
     def __getitem__(self, i):
+        """Compose the 8-channel phase input from the prior/present pair at index ``i``."""
         prior = self.prior_src.read_raw(self.prior_idx[i])
         present = self.present_src.read_raw(self.present_idx[i])
         sample = compose_temporal_input(
@@ -130,6 +136,7 @@ class TemporalPairDataset(Dataset):
 
 
 def build_time_lookup(times):
+    """Map each timestamp to its integer index for O(1) time-based lookups."""
     return {pd.Timestamp(t): i for i, t in enumerate(pd.DatetimeIndex(times))}
 
 
@@ -153,6 +160,7 @@ def build_paired_indices(present_times, prior_lookup, prior_offset_hours=24):
 
 
 def cap_pairs(present_idx, prior_idx, n, rng):
+    """Randomly subsample a matched (present, prior) index pair down to ``n`` entries."""
     total = len(present_idx)
     if n >= total:
         return present_idx, prior_idx
@@ -163,6 +171,7 @@ def cap_pairs(present_idx, prior_idx, n, rng):
 def features_for_pairs(model, prior_src, present_src, prior_idx, present_idx,
                        abs_mean, abs_std, diff_mean, diff_std, device,
                        batch_size, num_workers, label):
+    """Temporal path: compose phase pairs and extract encoder features for them."""
     pair_ds = TemporalPairDataset(
         prior_src, present_src, prior_idx, present_idx,
         abs_mean, abs_std, diff_mean, diff_std,
@@ -188,6 +197,7 @@ def features_for_source(model, src, indices, abs_mean, abs_std, device,
 
 
 def parse_args():
+    """Parse CLI arguments for the lead-time FID computation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--ifs", type=Path,
@@ -235,6 +245,7 @@ def parse_args():
 
 
 def main():
+    """Compute FID(ERA5-GT, forecast) for each forecast model × lead time and save to .npz."""
     args = parse_args()
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)

@@ -31,6 +31,7 @@ SOURCES = [
 
 
 def load_temperature(path: Path, time: np.datetime64) -> xr.DataArray:
+    """Load the T2M field at the given valid time as a ``(latitude, longitude)`` DataArray."""
     ds = xr.open_dataset(path)
     t2m = ds["2m_temperature"].sel(time=time)
     # dataset stores (longitude, latitude) — transpose to (latitude, longitude)
@@ -40,6 +41,7 @@ def load_temperature(path: Path, time: np.datetime64) -> xr.DataArray:
 
 
 def main():
+    """Render the side-by-side GraphCast vs ERA5 temperature comparison and save as PDF."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default="2020-07-15T12:00:00",
                         help="ISO timestamp present in all three datasets")

@@ -10,6 +10,14 @@ from utils.temporal import (
 
 
 class AtmosphereDataset(Dataset):
+    """PyTorch dataset for ERA5 surface fields with per-channel normalization.
+
+    Loads the 4 atmospheric variables from a NetCDF file, normalizes each channel,
+    and pads to ``(128, 256)`` (wrap in longitude, zero-pad in latitude). Supports
+    eager (in-memory) or lazy (per-item) loading, an 80/20 time-based train/val
+    split, and temporal-pair modes (diff/concat/phase) via ``utils.temporal``.
+    """
+
     def __init__(
         self,
         data_path,
@@ -115,11 +123,16 @@ class AtmosphereDataset(Dataset):
             self.data_tensor = self._build_eager_tensor()
 
     def _get_dataset(self):
+        """Lazily open (and cache) the NetCDF file handle."""
         if self.ds is None:
             self.ds = NetCDFDataset(self.data_path, mode="r")
         return self.ds
 
     def _read_time_slice(self, start_idx, end_idx):
+        """Read variables for time rows ``[start_idx, end_idx)`` as ``(T, 4, H, W)``.
+
+        Transposes the NetCDF ``(time, lon, lat)`` layout to ``(time, lat, lon)``.
+        """
         ds = self._get_dataset()
         arrays = []
         for var_name in self.vars:
@@ -130,6 +143,11 @@ class AtmosphereDataset(Dataset):
         return np.stack(arrays, axis=1).astype(np.float32, copy=False)
 
     def _build_eager_tensor(self):
+        """Load the whole split into a single composed, padded tensor in memory.
+
+        For temporal modes it reads an extended window so each sample has its
+        prior, then builds the paired/normalized input via ``compose_temporal_input``.
+        """
         if self.temporal_mode == "none":
             data = self._read_time_slice(self.start_idx, self.end_idx)
             composed = compose_temporal_input(
@@ -154,6 +172,10 @@ class AtmosphereDataset(Dataset):
         return torch.from_numpy(composed)
 
     def _compute_stats(self):
+        """Stream the split in chunks to compute per-channel mean/std.
+
+        Returns ``(mean, std)`` each shaped ``(1, 4, 1, 1)`` for broadcasting.
+        """
         total_count = 0
         total_sum = np.zeros(4, dtype=np.float64)
         total_sumsq = np.zeros(4, dtype=np.float64)
@@ -228,9 +250,11 @@ class AtmosphereDataset(Dataset):
         return mean, std
 
     def get_stats(self):
+        """Return the per-channel absolute-field ``(mean, std)`` used for normalization."""
         return self.mean, self.std
 
     def get_diff_stats(self):
+        """Return the per-channel diff-field ``(mean, std)`` (None unless diff/phase mode)."""
         return self.diff_mean, self.diff_std
 
     def read_raw(self, absolute_idx):
@@ -242,9 +266,15 @@ class AtmosphereDataset(Dataset):
         return self._read_time_slice(absolute_idx, absolute_idx + 1)[0]
 
     def __len__(self):
+        """Number of samples in this split."""
         return self.n_samples
 
     def __getitem__(self, idx):
+        """Return the composed, normalized, padded tensor for sample ``idx``.
+
+        Eager mode indexes the preloaded tensor; lazy mode reads the sample (and
+        its prior, for temporal modes) from disk on demand.
+        """
         if not self.lazy:
             return self.data_tensor[idx]
 

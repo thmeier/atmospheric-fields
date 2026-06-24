@@ -30,12 +30,14 @@ MSL_CHANNEL = 3
 
 
 def _orient_for_display(field):
+    """Flip a field to geographic orientation (north up, longitudes mirrored)."""
     # Match the geographic orientation verified by the reference map:
     # north up and longitudes mirrored relative to the raw tensor layout.
     return np.fliplr(field)
 
 
 def _show_scalar_panel(ax, field, var_idx, vmin, vmax):
+    """Draw a single scalar field as a heatmap on ``ax`` with the variable's colormap."""
     ax.imshow(
         _orient_for_display(field),
         cmap=CMAPS[var_idx],
@@ -48,6 +50,11 @@ def _show_scalar_panel(ax, field, var_idx, vmin, vmax):
 
 
 def _show_msl_with_wind(ax, msl_field, u_field, v_field, u_ref=None, v_ref=None):
+    """Draw MSL as a heatmap with wind vectors overlaid as a quiver plot.
+
+    If ``u_ref``/``v_ref`` are given, the un-corrupted wind is drawn faintly
+    underneath so the rotation/shuffle effect is visible.
+    """
     _show_scalar_panel(ax, msl_field, MSL_CHANNEL, float(msl_field.min()), float(msl_field.max()))
     u_field = _orient_for_display(u_field)
     v_field = _orient_for_display(v_field)
@@ -74,6 +81,7 @@ def _show_msl_with_wind(ax, msl_field, u_field, v_field, u_ref=None, v_ref=None)
     ax.quiver(xx, yy, uu, vv, color="black", scale=40, width=0.002)
 
 def main():
+    """Render corruption-ladder grids (per variable) showing each corruption at rising severity."""
     mean = np.load(STATS_DIR / "data_mean.npy")
     std = np.load(STATS_DIR / "data_std.npy")
     stats = (mean, std)

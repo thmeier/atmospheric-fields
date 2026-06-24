@@ -23,6 +23,7 @@ LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local
 # ---------------------------------------------------------------------------
 
 class WarmupCosineSchedule:
+    """Learning-rate schedule: linear warmup to ``ref_lr`` then cosine decay to ``final_lr``."""
     def __init__(self, optimizer, warmup_steps, start_lr, ref_lr, final_lr, total_steps):
         self.optimizer = optimizer
         self.warmup_steps = max(1, warmup_steps)
@@ -33,6 +34,7 @@ class WarmupCosineSchedule:
         self.step_num = 0
 
     def step(self):
+        """Advance one step, set the new LR on every param group, and return it."""
         self.step_num += 1
         if self.step_num <= self.warmup_steps:
             progress = self.step_num / self.warmup_steps
@@ -46,6 +48,7 @@ class WarmupCosineSchedule:
 
 
 class CosineWDSchedule:
+    """Weight-decay schedule: cosine anneal from ``start_wd`` to ``final_wd`` over training."""
     def __init__(self, optimizer, start_wd, final_wd, total_steps):
         self.optimizer = optimizer
         self.start_wd = start_wd
@@ -54,6 +57,7 @@ class CosineWDSchedule:
         self.step_num = 0
 
     def step(self):
+        """Advance one step, set WD on non-excluded param groups, and return it."""
         self.step_num += 1
         progress = self.step_num / self.total_steps
         wd = self.final_wd + 0.5 * (self.start_wd - self.final_wd) * (1.0 + math.cos(math.pi * progress))
@@ -69,6 +73,10 @@ class CosineWDSchedule:
 # ---------------------------------------------------------------------------
 
 def make_optimizer(model, lr, weight_decay):
+    """Build AdamW over all trainable params, excluding biases/norms from weight decay.
+
+    Generic version that works for both MAE and I-JEPA twin models.
+    """
     # Collect all trainable parameters regardless of model type
     all_named_params = list(model.named_parameters())
     decay_params = [
@@ -93,6 +101,7 @@ def make_optimizer(model, lr, weight_decay):
 # ---------------------------------------------------------------------------
 
 def forward_mae(model, batch, mask_generator, device, args):
+    """MAE forward returning the loss; uses random or I-JEPA-style block masking."""
     if args.mae_mask_mode == "random":
         loss, _, _ = model(batch, mask_ratio=0.75)
         return loss
@@ -104,12 +113,14 @@ def forward_mae(model, batch, mask_generator, device, args):
 
 
 def forward_ijepa(model, batch, mask_generator, device, args):
+    """I-JEPA forward returning the loss; samples context + target masks per batch."""
     context_masks, target_masks = mask_generator.sample(batch.shape[0], device=device)
     loss, _, _ = model(batch, context_masks, target_masks)
     return loss
 
 
 def get_forward_fn(model_name):
+    """Return the per-model forward function (``forward_mae`` or ``forward_ijepa``)."""
     if model_name == "mae":
         return forward_mae
     if model_name == "ijepa":
@@ -123,6 +134,11 @@ def get_forward_fn(model_name):
 
 def train_epoch(model, loader, optimizer, device, forward_fn, mask_generator,
                 lr_schedule, wd_schedule, grad_clip, args):
+    """Run one training epoch for either model type; return averaged loss + LR/WD.
+
+    Uses the model-specific ``forward_fn``, applies optional grad clipping, and
+    EMA-updates the target encoder when the model is I-JEPA.
+    """
     model.train()
     total_loss = 0.0
     total_batches = 0
@@ -162,6 +178,7 @@ def train_epoch(model, loader, optimizer, device, forward_fn, mask_generator,
 
 @torch.no_grad()
 def val_epoch(model, loader, device, forward_fn, mask_generator, args):
+    """Run one validation epoch (no grad/updates); return averaged loss."""
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -180,6 +197,7 @@ def val_epoch(model, loader, device, forward_fn, mask_generator, args):
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(model_name, model, optimizer, epoch, val_loss, args, path):
+    """Dispatch to the MAE or I-JEPA checkpoint saver by model type."""
     if model_name == "mae":
         save_mae_checkpoint(path, model, optimizer, epoch, val_loss, args)
     elif model_name == "ijepa":
@@ -193,6 +211,7 @@ def save_checkpoint(model_name, model, optimizer, epoch, val_loss, args, path):
 # ---------------------------------------------------------------------------
 
 def resolve_data_path(args):
+    """Pick the dataset path from the ``--local`` / ``--large-local`` flags (else cluster)."""
     if args.local and args.large_local:
         raise ValueError("Use only one of --local or --large-local.")
     if args.local:
@@ -203,6 +222,7 @@ def resolve_data_path(args):
 
 
 def build_datasets(data_path, stats, lazy_load, stats_chunk_size):
+    """Build train/val datasets sharing the train-split normalization stats."""
     train_dataset = AtmosphereDataset(data_path, split="train", stats=stats,
                                        lazy=lazy_load, stats_chunk_size=stats_chunk_size)
     stats = train_dataset.get_stats()
@@ -212,6 +232,7 @@ def build_datasets(data_path, stats, lazy_load, stats_chunk_size):
 
 
 def build_mask_generator(args):
+    """Construct the I-JEPA mask generator from the chosen context/target mask modes."""
     return MultiBlockMaskGenerator(
         input_size=(128, 256),
         patch_size=16,
@@ -228,6 +249,7 @@ def build_mask_generator(args):
 
 
 def resolve_variant(model_name, args):
+    """Derive the checkpoint variant tag from the masking-mode flags (or None)."""
     tags = []
     if args.target_mask_mode == "shared-blocks":
         tags.append("shared-targets")
@@ -245,6 +267,11 @@ def resolve_variant(model_name, args):
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: train an MAE or I-JEPA "twin" (matched-architecture) model.
+
+    The twin models share an identical encoder so MAE and I-JEPA can be compared
+    head-to-head as realism-metric backbones.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["mae", "ijepa"], required=True)
     parser.add_argument("--local", action="store_true")

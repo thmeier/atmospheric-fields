@@ -19,6 +19,7 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local_5y.nc"
 
 def train_epoch(model, loader, optimizer, device):
+    """Run one MAE training epoch at 75% masking; return mean batch loss."""
     model.train()
     total_loss = 0
 
@@ -36,6 +37,7 @@ def train_epoch(model, loader, optimizer, device):
     return total_loss / len(loader)
 
 def validate_epoch(model, loader, device):
+    """Run one MAE validation epoch (no grad) at 75% masking; return mean loss."""
     model.eval()
     total_loss = 0
     with torch.no_grad():
@@ -47,6 +49,7 @@ def validate_epoch(model, loader, device):
     return total_loss / len(loader)
 
 def main():
+    """CLI entry point: parse args, build data/model/scheduler, and run the MAE training loop."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--local", action="store_true", help="Run locally using subset data")
     parser.add_argument("--large-local", action="store_true", help="Run locally using the larger 5-year dataset")

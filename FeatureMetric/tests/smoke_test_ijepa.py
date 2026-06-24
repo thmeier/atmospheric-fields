@@ -16,6 +16,11 @@ LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
 
 
 def main():
+    """Smoke test: build I-JEPA, sample masks, run a forward pass, and assert shapes/finiteness.
+
+    Verifies mask geometry (context/target disjointness, grid bounds), positional
+    embedding sizes, a finite training loss, and a well-shaped feature vector.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--model-size", choices=["tiny", "small"], default="tiny")

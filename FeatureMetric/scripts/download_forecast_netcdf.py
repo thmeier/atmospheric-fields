@@ -34,6 +34,11 @@ def download_forecast(
     time_end: str,
     lead_hours: int,
 ):
+    """Download one lead time of a WeatherBench2 forecast zarr and save as NetCDF.
+
+    Selects the requested variables and ``lead_hours`` slice, converts init time
+    to valid time, slices the time range, and writes an ERA5-compatible file.
+    """
     print(f"Opening {source}...")
     ds = xr.open_zarr(source, chunks="auto", decode_timedelta=True)
 
@@ -76,6 +81,7 @@ def download_forecast(
 
 
 def main():
+    """Parse CLI arguments and download the selected forecast model's surface data."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "model",

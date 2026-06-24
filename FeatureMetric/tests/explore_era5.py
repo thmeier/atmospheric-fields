@@ -47,6 +47,7 @@ print(f"  lon  : {float(ds.longitude.min()):.2f} → {float(ds.longitude.max()):
 
 # ── 2. Helper for a quick map ─────────────────────────────────────────────────
 def plot_map(da, title, filename, cmap="RdBu_r", units=""):
+    """Plot a single 2-D field on a Robinson projection with coastlines and save it."""
     fig, ax = plt.subplots(
         figsize=(14, 7),
         subplot_kw={"projection": ccrs.Robinson()},
