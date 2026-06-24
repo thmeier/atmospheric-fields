@@ -107,6 +107,94 @@ Train k-fold holdout discriminators:
 python scripts/train_kfold.py
 ```
 
+### K-Fold Experiment
+
+The k-fold experiment is configured by `conf/kfold_config.yaml`. It trains one
+discriminator per neural forecast model by holding that model out and training
+on all configured non-held-out neural forecast files in `fake_nc_file`. It also
+trains a full-pool discriminator for numerical-model comparisons. The current
+multi-field configuration uses `temperature`, `u_component_of_wind`, and
+`v_component_of_wind`, so checkpoint names use the `all_fields` tag.
+
+On the cluster, run:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 02:00 bash run_finetune_kfold.sh
+```
+
+For a quick smoke test:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+MAX_SAMPLES=128 EPOCHS=1 BATCH_SIZE=8 NUM_WORKERS=0 \
+srun -A pmlr -t 00:10 bash run_finetune_kfold.sh
+```
+
+K-fold checkpoints are written to:
+
+```text
+results/kfold_checkpoints/
+```
+
+Generate the lead-time comparison plot:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_lead_time_kfold.py
+```
+
+Generate the disturbance sensitivity plots:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_disturbance_kfold.py
+```
+
+Train temporal holdout discriminators, one per forecast model with matching
+train/test-period files:
+
+```bash
+python scripts/train_temporal_holdout.py
+```
+
+### Temporal Holdout Experiment
+
+The temporal holdout experiment is configured by `conf/config.yaml`. It trains
+one discriminator per forecast model using that model's training-period forecast
+file as fake data and ERA5 from `train_real_range` as real data. It then
+evaluates each discriminator on the same forecast model's test-period file,
+using `test_fake_range` and the configured real test ranges. With the default
+multi-field config, checkpoint names use the `all_fields` tag.
+
+On the cluster, run:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 02:00 bash run_temporal_holdout.sh
+```
+
+For a quick smoke test:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+MAX_SAMPLES=128 EPOCHS=1 BATCH_SIZE=8 NUM_WORKERS=0 \
+srun -A pmlr -t 00:10 bash run_temporal_holdout.sh
+```
+
+Temporal holdout checkpoints are written to:
+
+```text
+results/temporal_holdout_checkpoints/
+```
+
+Generate the lead-time comparison plot:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_lead_time_temporal_holdout.py
+```
+
 Evaluate one trained discriminator:
 
 ```bash
@@ -118,6 +206,7 @@ Plot lead-time degradation:
 ```bash
 python scripts/plot_logits_vs_lead_time.py
 python scripts/plot_logits_vs_lead_time_kfold.py
+python scripts/plot_logits_vs_lead_time_temporal_holdout.py
 ```
 
 Plot sensitivity to synthetic disturbances:
@@ -353,8 +442,14 @@ results/weather_discriminator_<model_name>_<variable_tag>_lightning.pth
 K-fold training writes:
 
 ```text
-results/discriminator_<model_name>_<selected_variable>_exclude_<model>.pth
-results/discriminator_<model_name>_<selected_variable>_full_pool.pth
+results/kfold_checkpoints/discriminator_<model_name>_<variable_tag>_exclude_<model>.pth
+results/kfold_checkpoints/discriminator_<model_name>_<variable_tag>_full_pool.pth
+```
+
+Temporal holdout training writes:
+
+```text
+results/temporal_holdout_checkpoints/discriminator_<model_name>_<variable_tag>_temporal_<model>.pth
 ```
 
 Because normalization statistics are recomputed from the configured real-data

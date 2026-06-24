@@ -68,7 +68,7 @@ max_samples: 0
 batch_size: 64
 
 # Number of full training epochs.
-epochs: 5
+epochs: 3
 
 # AdamW learning rate.
 learning_rate: 1e-4
@@ -130,6 +130,10 @@ project_name: "weather-discriminator"
 
 # Destination for model weights, plots, local CSV logs, and cache files.
 output_dir: "results"
+
+# Destination for k-fold discriminator checkpoints. Plots remain under
+# `output_dir`.
+kfold_checkpoint_dir: "${output_dir}/kfold_checkpoints"
 
 # Named files used by comparison plots and k-fold training. Numerical models are
 # intentionally excluded from the neural-model training pool in scripts/train_kfold.py.

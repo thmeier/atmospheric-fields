@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -171,6 +172,46 @@ def canonical_disturbance_name(name):
     return DISTURBANCE_ALIASES.get(str(name), str(name))
 
 
+def variables_from_config(cfg):
+    """Return all configured input fields, falling back to one selected field."""
+    variables = cfg.get("variables")
+    if variables:
+        return list(variables)
+    return [cfg.selected_variable]
+
+
+def variable_tag(cfg):
+    """Return the checkpoint filename tag for configured input channels."""
+    variables = variables_from_config(cfg)
+    return cfg.selected_variable if len(variables) == 1 else "all_fields"
+
+
+def kfold_checkpoint_dir(cfg):
+    """Return the directory that stores k-fold discriminator weights."""
+    return Path(cfg.get("kfold_checkpoint_dir", Path(cfg.output_dir) / "kfold_checkpoints"))
+
+
+def kfold_checkpoint_files(cfg):
+    """List k-fold checkpoints, with fallback for legacy flat output dirs."""
+    checkpoint_dir = kfold_checkpoint_dir(cfg)
+    if checkpoint_dir.exists():
+        files = [
+            path for path in checkpoint_dir.iterdir()
+            if path.suffix == ".pth" and ("_exclude_" in path.name or "_full_pool" in path.name)
+        ]
+        if files:
+            return files
+
+    legacy_dir = Path(cfg.output_dir)
+    files = [
+        path for path in legacy_dir.iterdir()
+        if path.suffix == ".pth" and ("_exclude_" in path.name or "_full_pool" in path.name)
+    ]
+    if files:
+        print(f"Using legacy flat checkpoint directory: {legacy_dir}")
+    return files
+
+
 def configured_disturbances(cfg):
     """Return disturbances requested by the config, marking held-out probes."""
     training_types = [canonical_disturbance_name(name) for name in cfg.get("corruption_types", [])]
@@ -192,16 +233,29 @@ def configured_disturbances(cfg):
     return disturbances
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="kfold_config_old")
+def configured_real_file(cfg):
+    """Return the real/reference file configured for this experiment."""
+    return cfg.get("test_real_nc_file", cfg.real_nc_file)
+
+
+def configured_real_ranges(cfg):
+    """Return real ranges with data, falling back when k-fold placeholders are empty."""
+    return cfg.get("test_real_ranges", cfg.train_real_range)
+
+
+@hydra.main(version_base=None, config_path="../conf", config_name="kfold_config")
 def main(cfg: DictConfig):
     """Compare disturbance sensitivity across k-fold/full-pool discriminators."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_vars = [cfg.selected_variable]
+    model_vars = variables_from_config(cfg)
     NUMERICAL_MODELS = ["IFS HRES", "ERA5 Forecast"]
     
-    real_ds_global = safe_open_dataset(cfg.test_real_nc_file)
+    real_ds_global = safe_open_dataset(configured_real_file(cfg))
     means, stds = normalization_stats(real_ds_global, model_vars, cfg.train_real_range)
-    era5_test_ds = select_time_ranges(real_ds_global, cfg.test_real_ranges)
+    era5_test_ds = select_time_ranges(real_ds_global, configured_real_ranges(cfg))
+    if era5_test_ds.sizes.get("time", 0) == 0:
+        print("Warning: configured real test ranges are empty; using train_real_range for ERA5 reference.")
+        era5_test_ds = select_time_ranges(real_ds_global, cfg.train_real_range)
 
     disturbances = configured_disturbances(cfg)
     if not disturbances:
@@ -211,11 +265,12 @@ def main(cfg: DictConfig):
     
     # Evaluate only holdout/full-pool discriminator weights produced by
     # `train_kfold.py`.
-    model_files = [f for f in os.listdir(cfg.output_dir) if f.endswith(".pth") and (f"_exclude_" in f or "_full_pool" in f)]
+    model_files = kfold_checkpoint_files(cfg)
     
     results = {} # label -> dtype -> {'m': [], 's': []}
 
-    for m_file in model_files:
+    for model_path in model_files:
+        m_file = model_path.name
         if "_exclude_" in m_file:
             label = m_file.split("_exclude_")[1].replace(".pth", "").replace("_", " ")
             if label in NUMERICAL_MODELS or label.replace(" ", "_") in [m.replace(" ", "_") for m in NUMERICAL_MODELS]:
@@ -227,7 +282,7 @@ def main(cfg: DictConfig):
             continue
             
         print(f"Evaluating Discriminator: {label}")
-        model.model.load_state_dict(torch.load(os.path.join(cfg.output_dir, m_file), map_location=device))
+        model.model.load_state_dict(torch.load(model_path, map_location=device))
         results[label] = {}
         
         for dtype, dinfo in disturbances.items():
@@ -269,12 +324,12 @@ def main(cfg: DictConfig):
 
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.15, 0.5), fontsize=10)
-    var_display = cfg.selected_variable.replace('_', ' ').title()
+    var_display = cfg.selected_variable.replace('_', ' ').title() if len(model_vars) == 1 else "All Fields"
     holdout_names = [dinfo["name"].replace(" (Holdout)", "") for dinfo in disturbances.values() if dinfo.get("held_out")]
     holdout_note = f"\nHoldout corruptions: {', '.join(holdout_names)}" if holdout_names else ""
     plt.suptitle(f"K-Fold Holdout: Sensitivity to Synthetic Artifacts{holdout_note}\nModel: {cfg.model_name} | Variable: {var_display}", fontsize=18, y=0.98)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    output_path = os.path.join(cfg.output_dir, f"kfold_disturbance_analysis_GT_FINAL_{cfg.model_name}_{cfg.selected_variable}.png")
+    output_path = os.path.join(cfg.output_dir, f"kfold_disturbance_analysis_GT_FINAL_{cfg.model_name}_{variable_tag(cfg)}.png")
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
 
     # --- Visualization of Corruptions (Grid) ---
@@ -310,7 +365,7 @@ def main(cfg: DictConfig):
             if j == 0: ax.text(-0.1, 0.5, dinfo["name"], transform=ax.transAxes, rotation=90, va='center', ha='right', fontsize=16, fontweight='bold')
     plt.suptitle(f"Disturbance Visuals: {v.replace('_', ' ').title()}", fontsize=22, y=1.02)
     plt.tight_layout()
-    vis_output_path = os.path.join(cfg.output_dir, f"kfold_disturbance_visuals_GT_{cfg.model_name}_{cfg.selected_variable}.png")
+    vis_output_path = os.path.join(cfg.output_dir, f"kfold_disturbance_visuals_GT_{cfg.model_name}_{variable_tag(cfg)}.png")
     plt.savefig(vis_output_path, dpi=200, bbox_inches='tight')
     print(f"Disturbance grid saved to: {vis_output_path}")
 

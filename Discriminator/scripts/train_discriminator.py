@@ -283,7 +283,8 @@ class WeatherDiscriminatorDataset(Dataset):
                  means=None, stds=None, balanced=True,
                  augment=False, augment_prob=0.5, disturb_type=None, disturb_level=0.0,
                  corruption_types=None, corruption_severity_max=1.0,
-                 corruption_severity_power=2.0, field_corruption_prob=0.5):
+                 corruption_severity_power=2.0, field_corruption_prob=0.5,
+                 max_samples=0):
         self.variables = variables
         self.balanced = balanced
         self.augment = augment
@@ -294,48 +295,36 @@ class WeatherDiscriminatorDataset(Dataset):
         self.corruption_severity_max = corruption_severity_max
         self.corruption_severity_power = corruption_severity_power
         self.field_corruption_prob = field_corruption_prob
+        max_samples = int(max_samples or 0)
         
         self.real_ds = normalize_prediction_timedelta(safe_open_dataset(real_nc_path))
+        self.real_ds = self._prepare_dataset(self.real_ds, level=level, time_range=real_range, max_samples=max_samples)
         
         from omegaconf import ListConfig
         if isinstance(fake_nc_path, (list, ListConfig)): 
-            datasets = []
+            self.fake_sources = []
             for p in fake_nc_path:
                 ds = normalize_prediction_timedelta(safe_open_dataset(p))
-                if fake_range:
-                    ds = select_time_ranges(ds, fake_range)
+                ds = self._prepare_dataset(ds, level=level, time_range=fake_range, max_samples=max_samples)
                 if ds.sizes.get("time", 0) > 0:
-                    datasets.append(ds)
-            if not datasets:
+                    self.fake_sources.append(ds)
+            if not self.fake_sources:
                 raise ValueError(f"No fake samples found in configured training range: {fake_range}")
-            self.fake_ds = xr.concat(datasets, dim='time')
             self.fake_range_applied = True
         else:
             self.fake_ds = normalize_prediction_timedelta(safe_open_dataset(fake_nc_path))
+            self.fake_ds = self._prepare_dataset(self.fake_ds, level=level, time_range=fake_range, max_samples=max_samples)
+            self.fake_sources = [self.fake_ds]
             self.fake_range_applied = False
-        
-        # Keep only one pressure level when upper-air fields are used.
-        if level is not None:
-            for ds_attr in ['real_ds', 'fake_ds']:
-                ds = getattr(self, ds_attr)
-                if 'level' in ds.dims:
-                    setattr(self, ds_attr, ds.sel(level=level))
-                elif 'pressure_level' in ds.dims:
-                    setattr(self, ds_attr, ds.sel(pressure_level=level))
-
-        # Real and fake ranges are configured separately so the discriminator can
-        # train on one period and evaluate on disjoint holdout periods.
-        if real_range:
-            self.real_ds = select_time_ranges(self.real_ds, real_range)
-        
-        if fake_range and not self.fake_range_applied:
-            self.fake_ds = select_time_ranges(self.fake_ds, fake_range)
             
         self.real_times = self.real_ds.time.values
-        self.fake_times = self.fake_ds.time.values
 
         missing_real = [v for v in self.variables if v not in self.real_ds.data_vars]
-        missing_fake = [v for v in self.variables if v not in self.fake_ds.data_vars]
+        missing_fake_by_source = [
+            [v for v in self.variables if v not in ds.data_vars]
+            for ds in self.fake_sources
+        ]
+        missing_fake = sorted({v for missing in missing_fake_by_source for v in missing})
         if missing_real or missing_fake:
             raise ValueError(
                 "Configured variables are missing from the loaded datasets. "
@@ -344,14 +333,9 @@ class WeatherDiscriminatorDataset(Dataset):
         
         # Forecast datasets contain multiple lead times.  ERA5/reference data is
         # evaluated at lead zero when that coordinate exists.
-        if "prediction_timedelta" in self.fake_ds.dims:
-            lt_h = self.fake_ds.prediction_timedelta.values
-            if lead_times is not None:
-                self.fake_lead_indices = [np.where(lt_h == h)[0][0] for h in lead_times if h in lt_h]
-            else:
-                self.fake_lead_indices = np.where(lt_h > 0)[0].tolist()
-        else:
-            self.fake_lead_indices = [None]
+        self.fake_sample_index = self._build_fake_sample_index(self.fake_sources, lead_times)
+        if not self.fake_sample_index:
+            raise ValueError(f"No fake samples found for configured lead_times={lead_times}")
 
         if "prediction_timedelta" in self.real_ds.dims:
             lt_h = self.real_ds.prediction_timedelta.values
@@ -379,8 +363,7 @@ class WeatherDiscriminatorDataset(Dataset):
 
         # Balanced mode defines a stable 50/50 real/fake epoch even when the
         # number of ERA5 times and forecast-times-by-leads differs.
-        self.num_fake_leads = len(self.fake_lead_indices)
-        self.total_fake_samples = len(self.fake_times) * self.num_fake_leads
+        self.total_fake_samples = len(self.fake_sample_index)
         self.total_real_samples = len(self.real_times)
         self.fake_categories = (
             ("forecast", "corrupted_real", "corrupted_forecast")
@@ -403,6 +386,53 @@ class WeatherDiscriminatorDataset(Dataset):
             )
             print(f"  Fake multi-sampling: {fake_mix}")
 
+    @classmethod
+    def _prepare_dataset(cls, ds, level=None, time_range=None, max_samples=0):
+        """Apply cheap selections before expensive multi-file concat or stats."""
+        if level is not None:
+            if "level" in ds.dims:
+                ds = ds.sel(level=level)
+            elif "pressure_level" in ds.dims:
+                ds = ds.sel(pressure_level=level)
+        if time_range:
+            ds = select_time_ranges(ds, time_range)
+        if max_samples > 0:
+            ds = cls._subsample_time(ds, max_samples)
+        return ds
+
+    @staticmethod
+    def _lead_indices_for_dataset(ds, lead_times):
+        """Return lead indices available in one forecast dataset."""
+        if "prediction_timedelta" not in ds.dims:
+            return [None]
+        available = ds.prediction_timedelta.values
+        if lead_times is None:
+            return np.where(available > 0)[0].tolist()
+        missing = [lead for lead in lead_times if lead not in available]
+        if missing:
+            print(f"Warning: fake dataset is missing lead_times {missing}; using available leads only.")
+        return [int(np.where(available == lead)[0][0]) for lead in lead_times if lead in available]
+
+    @classmethod
+    def _build_fake_sample_index(cls, fake_sources, lead_times):
+        """Flatten valid fake `(source, time, lead)` combinations."""
+        sample_index = []
+        for source_idx, ds in enumerate(fake_sources):
+            lead_indices = cls._lead_indices_for_dataset(ds, lead_times)
+            for time_idx in range(ds.sizes.get("time", 0)):
+                for lead_idx in lead_indices:
+                    sample_index.append((source_idx, time_idx, lead_idx))
+        return sample_index
+
+    @staticmethod
+    def _subsample_time(ds, max_samples):
+        """Select an evenly spaced time subset for smoke tests and small jobs."""
+        n_time = ds.sizes.get("time", 0)
+        if n_time <= max_samples:
+            return ds
+        indices = np.linspace(0, n_time - 1, max_samples, dtype=int)
+        return ds.isel(time=indices)
+
     def __len__(self):
         if self.balanced:
             return self.samples_per_class * 2
@@ -413,8 +443,7 @@ class WeatherDiscriminatorDataset(Dataset):
         return idx % self.total_real_samples, self.real_lead_idx
 
     def _fake_indices(self, idx):
-        f_idx = idx % self.total_fake_samples
-        return f_idx // self.num_fake_leads, self.fake_lead_indices[f_idx % self.num_fake_leads]
+        return self.fake_sample_index[idx % self.total_fake_samples]
 
     def _sample_tensor(self, ds, t_idx, l_idx):
         ds_slice = ds.isel(time=t_idx)
@@ -489,8 +518,8 @@ class WeatherDiscriminatorDataset(Dataset):
                 sample = self._apply_fake_corruption(sample)
                 return sample, torch.tensor([0.0], dtype=torch.float32)
 
-            t_idx, l_idx = self._fake_indices(sub_idx)
-            sample = self._sample_tensor(self.fake_ds, t_idx, l_idx)
+            source_idx, t_idx, l_idx = self._fake_indices(sub_idx)
+            sample = self._sample_tensor(self.fake_sources[source_idx], t_idx, l_idx)
             if fake_category == "corrupted_forecast":
                 sample = self._apply_fake_corruption(sample)
             return sample, torch.tensor([0.0], dtype=torch.float32)
@@ -501,8 +530,8 @@ class WeatherDiscriminatorDataset(Dataset):
                 sample = self._sample_tensor(self.real_ds, t_idx, l_idx)
                 label = torch.tensor([1.0], dtype=torch.float32)
             else:
-                t_idx, l_idx = self._fake_indices(idx - self.total_real_samples)
-                sample = self._sample_tensor(self.fake_ds, t_idx, l_idx)
+                source_idx, t_idx, l_idx = self._fake_indices(idx - self.total_real_samples)
+                sample = self._sample_tensor(self.fake_sources[source_idx], t_idx, l_idx)
                 label = torch.tensor([0.0], dtype=torch.float32)
 
         if self.disturb_type is not None and self.disturb_level > 0:
@@ -596,7 +625,8 @@ def main(cfg: DictConfig):
         corruption_types=cfg.get("corruption_types"),
         corruption_severity_max=cfg.get("corruption_severity_max", 1.0),
         corruption_severity_power=cfg.get("corruption_severity_power", 2.0),
-        field_corruption_prob=cfg.get("field_corruption_prob", 0.5)
+        field_corruption_prob=cfg.get("field_corruption_prob", 0.5),
+        max_samples=cfg.get("max_samples", 0)
     )
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     

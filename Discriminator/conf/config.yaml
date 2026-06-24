@@ -119,6 +119,10 @@ project_name: "weather-discriminator"
 # Destination for model weights, plots, local CSV logs, and cache files.
 output_dir: "results"
 
+# Destination for temporal holdout experiment checkpoints. Plots remain under
+# `output_dir`.
+temporal_checkpoint_dir: "${output_dir}/temporal_holdout_checkpoints"
+
 # Named files used by comparison plots and k-fold training. Numerical models are
 # intentionally excluded from the neural-model training pool in scripts/train_kfold.py.
 comparison_files:
