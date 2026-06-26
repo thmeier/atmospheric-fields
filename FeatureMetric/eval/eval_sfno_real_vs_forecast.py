@@ -37,7 +37,6 @@ from eval.eval_real_vs_forecast import (
     build_era5_ref_pool,
     build_forecast_indices,
     cap_indices,
-    split_indices,
     SOURCE_COLORS,
     SOURCE_LABELS,
 )
@@ -56,8 +55,14 @@ CLUSTER_GRAPHCAST_PATH = Path("/cluster/courses/pmlr/teams/team07/data/sealevel_
 SOURCES = ["pangu", "graphcast"]
 
 
-def plot_metric_bars(results, plots_dir, run_tag, mmd_only):
+def plot_metric_bars(results, plots_dir, run_tag, mmd_only, cis=None, ci_level=95):
     """Grouped bars of FID/MMD: ERA5-self baseline vs each forecast source.
+
+    When ``cis`` is given (``{key: {metric: (lo, hi)}}``), each bar gets a
+    bootstrap confidence interval as an error bar, and the ERA5-self baseline is
+    drawn as a shaded null band (its split-distribution CI) rather than a bare
+    line. A forecast bar whose lower whisker clears the top of that band is
+    distinguishable from real fields beyond finite-sample noise.
 
     Drops the FID panel when FID is NaN (MMD-only runs).
     """
@@ -73,17 +78,39 @@ def plot_metric_bars(results, plots_dir, run_tag, mmd_only):
     if mmd_only:
         panels = [p for p in panels if p[0] != "fid"]
 
+    def _yerr(metric):
+        """Asymmetric (2, N) error array: distance from each point to its CI ends."""
+        lo, hi = [], []
+        for k, v in zip(keys, [results[k][metric] for k in keys]):
+            ci = cis.get(k, {}).get(metric) if cis else None
+            if ci is None or not np.isfinite(ci[0]) or not np.isfinite(v):
+                lo.append(0.0); hi.append(0.0)
+            else:
+                lo.append(max(0.0, v - ci[0])); hi.append(max(0.0, ci[1] - v))
+        return np.array([lo, hi])
+
     fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 4.5), squeeze=False)
     for ax, (metric, title) in zip(axes[0], panels):
         vals = [results[k][metric] for k in keys]
-        bars = ax.bar(labels, vals, color=colors, edgecolor="white", linewidth=0.5)
+        yerr = _yerr(metric) if cis else None
+        bars = ax.bar(labels, vals, color=colors, edgecolor="white", linewidth=0.5,
+                      yerr=yerr, capsize=4,
+                      error_kw=dict(ecolor="#333333", elinewidth=1.2))
         ax.set_title(title)
         ax.grid(True, axis="y", alpha=0.3)
-        # Baseline reference line.
+        # Baseline null band (shaded CI of the ERA5-vs-ERA5 split distribution)
+        # plus the mean as a dashed reference line.
+        base_ci = cis.get("era5_self", {}).get(metric) if cis else None
+        if base_ci is not None and np.isfinite(base_ci[0]):
+            ax.axhspan(base_ci[0], base_ci[1], color="#9e9e9e", alpha=0.18, zorder=0,
+                       label=f"baseline {ci_level}% band")
+            ax.legend(fontsize=8, loc="upper left")
         ax.axhline(results["era5_self"][metric], color="#9e9e9e",
                    linestyle="dashed", linewidth=1.2)
-        for b, v in zip(bars, vals):
-            ax.annotate(f"{v:.4g}", (b.get_x() + b.get_width() / 2, v),
+        # Annotate above the upper whisker so the text doesn't sit on the cap.
+        ups = yerr[1] if yerr is not None else [0.0] * len(bars)
+        for b, v, up in zip(bars, vals, ups):
+            ax.annotate(f"{v:.4g}", (b.get_x() + b.get_width() / 2, v + up),
                         ha="center", va="bottom", fontsize=9)
     fig.suptitle(f"SFNO embedding — real vs 24h forecast\nRun: {run_tag}", y=1.02)
     fig.tight_layout()
@@ -136,6 +163,64 @@ def plot_pca_scatter(feats, results, plots_dir, run_tag, mmd_only):
     print(f"Saved plot → {out}")
 
 
+def _nanmean(vals):
+    """Mean over finite entries, or NaN if none are finite (avoids RuntimeWarnings)."""
+    vals = np.asarray(vals, dtype=float)
+    finite = vals[np.isfinite(vals)]
+    return float(finite.mean()) if finite.size else float("nan")
+
+
+def _percentile_ci(vals, ci):
+    """(lo, hi) percentile interval over finite entries; (nan, nan) if all NaN."""
+    vals = np.asarray(vals, dtype=float)
+    if not np.isfinite(vals).any():
+        return (float("nan"), float("nan"))
+    lo_q, hi_q = (100 - ci) / 2.0, 100 - (100 - ci) / 2.0
+    return (float(np.nanpercentile(vals, lo_q)), float(np.nanpercentile(vals, hi_q)))
+
+
+def bootstrap_distances(a, b, dist_fn, n_boot, rng):
+    """Sampling distribution of the distance between feature pools ``a`` and ``b``.
+
+    Each iteration resamples the rows of ``a`` and ``b`` *independently, with
+    replacement* (sizes preserved) and recomputes the distance — the standard
+    bootstrap estimate of how much the FID/MMD point estimate would vary under a
+    different draw of the same size. Returns ``{metric: [values]}`` of length
+    ``n_boot``.
+    """
+    na, nb = a.shape[0], b.shape[0]
+    out = {"fid": [], "mmd": []}
+    for _ in range(n_boot):
+        ia = torch.from_numpy(rng.integers(0, na, size=na))
+        ib = torch.from_numpy(rng.integers(0, nb, size=nb))
+        d = dist_fn(a[ia], b[ib])
+        out["fid"].append(d["fid"])
+        out["mmd"].append(d["mmd"])
+    return out
+
+
+def split_distances(features, dist_fn, n_splits, rng):
+    """Noise-floor distribution from repeated disjoint 50/50 splits of one pool.
+
+    Both halves are genuinely real (ERA5), so this traces out the distance you
+    get purely from finite-sample noise when the two sides share a distribution —
+    the null band each forecast distance should clear. Splits are *without*
+    replacement (a fresh random partition each time). Returns ``{metric:
+    [values]}`` of length ``n_splits``.
+    """
+    n = features.shape[0]
+    half = n // 2
+    out = {"fid": [], "mmd": []}
+    for _ in range(n_splits):
+        perm = rng.permutation(n)
+        ia = torch.from_numpy(perm[:half])
+        ib = torch.from_numpy(perm[half:2 * half])
+        d = dist_fn(features[ia], features[ib])
+        out["fid"].append(d["fid"])
+        out["mmd"].append(d["mmd"])
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -166,6 +251,12 @@ def main():
     parser.add_argument("--max-dt-hours", type=int, default=6,
                         help="Tolerance for matching ERA5 hours-of-day to forecast valid times")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n-boot", type=int, default=200,
+                        help="Resamples for uncertainty bars: bootstrap CIs on each "
+                             "forecast bar and the repeated-split baseline null band. "
+                             "0 disables (single-split baseline, no error bars).")
+    parser.add_argument("--ci", type=float, default=95.0,
+                        help="Confidence level (percent) for the bootstrap/split intervals.")
     parser.add_argument("--sfno-repo", type=str, default=None,
                         help="Path to the SFNO-Embedding checkout (else $SFNO_REPO or sibling dir)")
     parser.add_argument("--output-dir", type=str, default=None,
@@ -201,9 +292,10 @@ def main():
         ref_idx[src], _ = cap_indices(ri, None, args.n_samples, rng)
         fc_idx[src], _ = cap_indices(fi, None, args.n_samples, rng)
 
-    # ERA5-self baseline: disjoint 50/50 split of the Pangu reference pool.
-    (base_a, _), (base_b, _) = split_indices(ref_idx["pangu"], None, rng)
-    n_base = len(base_a)
+    # ERA5-self baseline: repeated disjoint 50/50 splits of the Pangu reference
+    # pool (done in feature space below, after extraction). Each half is half the
+    # pool — that size sets the FID-validity floor.
+    n_base = len(ref_idx["pangu"]) // 2
 
     for src in SOURCES:
         print(f"  {src}: ERA5 ref={len(ref_idx[src])}  forecast={len(fc_idx[src])}")
@@ -239,17 +331,30 @@ def main():
     print("\nExtracting features...")
     f_ref = {src: feats(era5_ds, ref_idx[src]) for src in SOURCES}
     f_fc = {src: feats(fc_ds[src], fc_idx[src]) for src in SOURCES}
-    f_base_a = feats(era5_ds, base_a)
-    f_base_b = feats(era5_ds, base_b)
 
     def dist(a, b):
         if args.mmd_only:
             return {"fid": float("nan"), "mmd": mmd_rbf(a, b)}
         return compute_distances(a, b)
 
-    results = {"era5_self": dist(f_base_a, f_base_b)}
+    # --- Point estimates + uncertainty (bootstrap CIs / baseline null band) ---
+    # Forecast bars: full-sample point estimate, bootstrap CI for the whiskers.
+    # Baseline: repeated disjoint splits of the real pool define both the point
+    # (mean) and the shaded null band. n_boot=0 falls back to a single split.
+    results, cis = {}, {}
+    n_splits = args.n_boot if args.n_boot > 0 else 1
+    print(f"\nUncertainty: {args.n_boot} resamples per bar "
+          f"({'bootstrap CIs + baseline band' if args.n_boot > 0 else 'disabled — single-split baseline'})...")
+    base_samp = split_distances(f_ref["pangu"], dist, n_splits, rng)
+    results["era5_self"] = {m: _nanmean(base_samp[m]) for m in ("fid", "mmd")}
     for src in SOURCES:
         results[src] = dist(f_ref[src], f_fc[src])
+
+    if args.n_boot > 0:
+        cis["era5_self"] = {m: _percentile_ci(base_samp[m], args.ci) for m in ("fid", "mmd")}
+        for src in SOURCES:
+            samp = bootstrap_distances(f_ref[src], f_fc[src], dist, args.n_boot, rng)
+            cis[src] = {m: _percentile_ci(samp[m], args.ci) for m in ("fid", "mmd")}
 
     # --- Report ---
     def _fmt(v):
@@ -269,6 +374,11 @@ def main():
         d = results[src]
         print(f"  {('ERA5 vs ' + SOURCE_LABELS[src]):<28} {_fmt(d['fid'])} {d['mmd']:>14.6f}")
     print()
+    metric = "mmd" if args.mmd_only else "fid"
+    if args.n_boot > 0:
+        bl, bh = cis["era5_self"][metric]
+        print(f"  baseline {metric.upper()} {args.ci:g}% band: [{bl:.4g}, {bh:.4g}]  "
+              f"(from {args.n_boot} disjoint splits)")
     for src in SOURCES:
         d = results[src]
         if not args.mmd_only and b['fid']:
@@ -276,13 +386,18 @@ def main():
                   f"MMD-baseline = {d['mmd'] - b['mmd']:.6f}  (>1 / >0 ⇒ separated)")
         else:
             print(f"  {SOURCE_LABELS[src]}: MMD-baseline = {d['mmd'] - b['mmd']:.6f}  (>0 ⇒ separated)")
+        if args.n_boot > 0:
+            lo, hi = cis[src][metric]
+            sep = "clears baseline band" if lo > cis["era5_self"][metric][1] else "OVERLAPS baseline band"
+            print(f"           {metric.upper()} {args.ci:g}% CI [{lo:.4g}, {hi:.4g}] — {sep}")
     print("=" * 72)
 
     run_tag = f"{args.channels}c{res[0]}x{res[1]}_pool-{args.pooling}_n{args.n_samples}_seed{args.seed}"
     if args.mmd_only:
         run_tag += "_mmd"
     plots_dir = (Path(args.output_dir) / "plots" if args.output_dir else Path("plots")) / "sfno_real_vs_forecast"
-    plot_metric_bars(results, plots_dir, run_tag, args.mmd_only)
+    plot_metric_bars(results, plots_dir, run_tag, args.mmd_only,
+                     cis=cis or None, ci_level=args.ci)
     plot_pca_scatter(
         {"era5": f_ref["pangu"].numpy(),
          "pangu": f_fc["pangu"].numpy(),

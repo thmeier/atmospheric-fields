@@ -43,6 +43,7 @@ cd ~/atmospheric-fields/FeatureMetric
 export SFNO_REPO="${SFNO_REPO:-$HOME/SFNO-Embedding}"
 ERA5="${ERA5:-/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc}"
 N_SAMPLES="${N_SAMPLES:-1000}"     # real-vs-forecast: samples per pool
+N_BOOT="${N_BOOT:-200}"            # real-vs-forecast: resamples for error bars (0=off)
 CORRUPT_N="${CORRUPT_N:-500}"      # corruption sweep: reference samples
 CORRUPT_STEPS="${CORRUPT_STEPS:-9}"
 SEED="${SEED:-0}"
@@ -70,7 +71,7 @@ fi
 echo "Starting SFNO 4-field full eval suite on node: $(hostname)"
 nvidia-smi || true
 echo "SFNO_REPO=$SFNO_REPO  ERA5=$ERA5"
-echo "N_SAMPLES=$N_SAMPLES  CORRUPT_N=$CORRUPT_N  CORRUPT_STEPS=$CORRUPT_STEPS  SEED=$SEED"
+echo "N_SAMPLES=$N_SAMPLES  N_BOOT=$N_BOOT  CORRUPT_N=$CORRUPT_N  CORRUPT_STEPS=$CORRUPT_STEPS  SEED=$SEED"
 
 # Attempt every step regardless of individual failures; track exit status.
 set +e
@@ -88,12 +89,14 @@ run () {  # run "<label>" <command...>
 run "Run 1/4: real-vs-forecast 4c/15x28 flatten MMD" \
     python eval/eval_sfno_real_vs_forecast.py \
         --channels 4 --res 15 --pooling flatten --mmd-only \
-        --n-samples "$N_SAMPLES" --batch-size 16 --num-workers 2 --seed "$SEED"
+        --n-samples "$N_SAMPLES" --n-boot "$N_BOOT" \
+        --batch-size 16 --num-workers 2 --seed "$SEED"
 
 run "Run 2/4: real-vs-forecast 8c/31x60 max FID+MMD" \
     python eval/eval_sfno_real_vs_forecast.py \
         --channels 8 --res 31 --pooling max \
-        --n-samples "$N_SAMPLES" --batch-size 16 --num-workers 2 --seed "$SEED"
+        --n-samples "$N_SAMPLES" --n-boot "$N_BOOT" \
+        --batch-size 16 --num-workers 2 --seed "$SEED"
 
 # --- Corruption sweep (ERA5 vs 6 corruptions across a severity ladder) ---
 run "Run 3/4: corruption sweep 4c/15x28 flatten MMD" \
