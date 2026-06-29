@@ -47,19 +47,25 @@ MODEL_SIZE="${MODEL_SIZE:-twin}"
 N_EVAL="${N_EVAL:-1000}"
 N_BOOT="${N_BOOT:-200}"
 SEED="${SEED:-0}"
+# Loss weights (defaults rebalanced so realism dominates over VICReg invariance).
+W_INV="${W_INV:-0.5}"
+W_REAL="${W_REAL:-50}"
+W_COMP="${W_COMP:-1.0}"
 mkdir -p "$OUTDIR"
 
 echo "Realism pipeline on node: $(hostname)"
 nvidia-smi || true
 echo "RUN_TAG=$RUN_TAG OUTDIR=$OUTDIR EPOCHS=$EPOCHS BATCH=$BATCH LR=$LR"
 echo "MODEL_SIZE=$MODEL_SIZE N_EVAL=$N_EVAL N_BOOT=$N_BOOT SEED=$SEED"
+echo "W_INV=$W_INV W_REAL=$W_REAL W_COMP=$W_COMP"
 
 # Train first: it writes data_mean/std.npy into $OUTDIR, which the PSD step needs.
 echo ""
 echo "================ 1/3: Train realism metric ================"
 python train/train_realism.py \
     --epochs "$EPOCHS" --batch-size "$BATCH" --lr "$LR" \
-    --model-size "$MODEL_SIZE" --output-dir "$OUTDIR"
+    --model-size "$MODEL_SIZE" --output-dir "$OUTDIR" \
+    --w-inv "$W_INV" --w-real "$W_REAL" --w-comp "$W_COMP"
 
 echo ""
 echo "================ 2/3: PSD diagnostic (baseline) ================"

@@ -204,6 +204,10 @@ def compute_realism_losses(
         "loss_comp": l_comp.item(),
         "corruption": name,
         "strength": float(strength),
+        # Per-sample realism scores (detached) for monitoring clean-vs-corrupted
+        # discrimination AUC during training.
+        "r_clean": r1.detach(),
+        "r_corr": rc.detach(),
         **inv_logs,
     }
     return total, logs

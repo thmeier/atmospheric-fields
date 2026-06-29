@@ -21,10 +21,19 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from scipy.stats import mannwhitneyu
 
 from utils.dataset import AtmosphereDataset
 from utils.model_io import checkpoint_path
 from utils.realism import RealismMetric, compute_realism_losses
+
+
+def realism_auc(clean, corrupt):
+    """AUC = P(r(corrupted) > r(clean)); 0.5 = no discrimination, 1.0 = perfect."""
+    if len(clean) == 0 or len(corrupt) == 0:
+        return float("nan")
+    u, _ = mannwhitneyu(corrupt, clean, alternative="greater")
+    return float(u) / (len(clean) * len(corrupt))
 
 CLUSTER_DATA_PATH = Path("/cluster/courses/pmlr/teams/team07/data/era5_1.5deg_2004-01-01_2023-12-31.nc")
 LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local.nc"
@@ -32,9 +41,10 @@ LARGE_LOCAL_DATA_PATH = Path(__file__).parent.parent / "data" / "test_data_local
 
 
 def run_epoch(model, loader, optimizer, device, args, train=True):
-    """Run one epoch; returns mean total loss and mean per-term losses."""
+    """Run one epoch; returns mean losses + clean-vs-corrupted discrimination AUC."""
     model.train(train)
     sums = {"total": 0.0, "loss_inv": 0.0, "loss_real": 0.0, "loss_comp": 0.0}
+    r_clean_all, r_corr_all = [], []
     n = 0
     grad_ctx = torch.enable_grad() if train else torch.no_grad()
     with grad_ctx:
@@ -53,8 +63,14 @@ def run_epoch(model, loader, optimizer, device, args, train=True):
                 optimizer.step()
             for k in sums:
                 sums[k] += logs[k]
+            r_clean_all.append(logs["r_clean"].cpu().numpy())
+            r_corr_all.append(logs["r_corr"].cpu().numpy())
             n += 1
-    return {k: v / max(n, 1) for k, v in sums.items()}
+    means = {k: v / max(n, 1) for k, v in sums.items()}
+    means["auc"] = realism_auc(
+        np.concatenate(r_clean_all), np.concatenate(r_corr_all)
+    ) if n else float("nan")
+    return means
 
 
 def main():
@@ -72,8 +88,8 @@ def main():
     parser.add_argument("--embed-dim", type=int, default=None,
                         help="Override encoder embed_dim (auto-derives num_heads).")
     parser.add_argument("--proj-dim", type=int, default=128, help="VICReg projector output dim.")
-    parser.add_argument("--w-inv", type=float, default=1.0, help="Weight on the VICReg invariance loss.")
-    parser.add_argument("--w-real", type=float, default=10.0, help="Weight on the severity-regression loss.")
+    parser.add_argument("--w-inv", type=float, default=0.5, help="Weight on the VICReg invariance loss.")
+    parser.add_argument("--w-real", type=float, default=50.0, help="Weight on the severity-regression loss.")
     parser.add_argument("--w-comp", type=float, default=1.0, help="Weight on the compactness loss.")
     parser.add_argument("--margin", type=float, default=0.5, help="Severity margin for the compactness push.")
     parser.add_argument("--recompute-stats", action="store_true", help="Ignore cached normalization stats.")
@@ -143,31 +159,35 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
 
     ckpt_path = checkpoint_path("realism", args.model_size, stats_dir, embed_dim=args.embed_dim)
-    best_val = float("inf")
+    # Select on the realism signal (clean-vs-corrupted AUC), NOT total loss — the
+    # total is dominated by the VICReg invariance term, which is not what we care
+    # about for the realism metric.
+    best_auc = -1.0
     for epoch in range(epochs):
         tr = run_epoch(model, train_loader, optimizer, device, args, train=True)
         va = run_epoch(model, val_loader, optimizer, device, args, train=False)
         scheduler.step()
         print(
             f"Epoch {epoch + 1}/{epochs} | "
-            f"train {tr['total']:.4f} (inv {tr['loss_inv']:.3f} real {tr['loss_real']:.3f} comp {tr['loss_comp']:.3f}) | "
-            f"val {va['total']:.4f} (inv {va['loss_inv']:.3f} real {va['loss_real']:.3f} comp {va['loss_comp']:.3f})"
+            f"train {tr['total']:.4f} (inv {tr['loss_inv']:.3f} real {tr['loss_real']:.3f} comp {tr['loss_comp']:.3f}) auc {tr['auc']:.3f} | "
+            f"val {va['total']:.4f} (inv {va['loss_inv']:.3f} real {va['loss_real']:.3f} comp {va['loss_comp']:.3f}) auc {va['auc']:.3f}"
         )
-        if va["total"] < best_val:
-            best_val = va["total"]
+        if np.isfinite(va["auc"]) and va["auc"] > best_auc:
+            best_auc = va["auc"]
             torch.save(
                 {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
-                    "val_loss": best_val,
+                    "val_loss": va["total"],
+                    "val_auc": best_auc,
                     "config": vars(args),
                 },
                 ckpt_path,
             )
-            print(f"  ↳ saved best checkpoint to {ckpt_path} (val {best_val:.4f})")
+            print(f"  ↳ saved best checkpoint to {ckpt_path} (val auc {best_auc:.3f})")
 
-    print(f"Done. Best val total loss: {best_val:.4f}. Checkpoint: {ckpt_path}")
+    print(f"Done. Best val clean-vs-corrupted AUC: {best_auc:.3f}. Checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":
