@@ -292,6 +292,69 @@ def compute_distances(z_real, z_fake):
 
 
 # ---------------------------------------------------------------------------
+# Uncertainty (bootstrap CIs on forecast bars, repeated-split baseline band).
+# Shared home — the SFNO eval imports these.
+# ---------------------------------------------------------------------------
+
+def _nanmean(vals):
+    """Mean over finite entries, or NaN if none are finite (avoids RuntimeWarnings)."""
+    vals = np.asarray(vals, dtype=float)
+    finite = vals[np.isfinite(vals)]
+    return float(finite.mean()) if finite.size else float("nan")
+
+
+def _percentile_ci(vals, ci):
+    """(lo, hi) percentile interval over finite entries; (nan, nan) if all NaN."""
+    vals = np.asarray(vals, dtype=float)
+    if not np.isfinite(vals).any():
+        return (float("nan"), float("nan"))
+    lo_q, hi_q = (100 - ci) / 2.0, 100 - (100 - ci) / 2.0
+    return (float(np.nanpercentile(vals, lo_q)), float(np.nanpercentile(vals, hi_q)))
+
+
+def bootstrap_distances(a, b, dist_fn, n_boot, rng):
+    """Sampling distribution of the distance between feature pools ``a`` and ``b``.
+
+    Each iteration resamples the rows of ``a`` and ``b`` *independently, with
+    replacement* (sizes preserved) and recomputes the distance — the standard
+    bootstrap estimate of how much the FID/MMD point estimate would vary under a
+    different draw of the same size. Returns ``{metric: [values]}`` of length
+    ``n_boot``.
+    """
+    na, nb = a.shape[0], b.shape[0]
+    out = {"fid": [], "mmd": []}
+    for _ in range(n_boot):
+        ia = torch.from_numpy(rng.integers(0, na, size=na))
+        ib = torch.from_numpy(rng.integers(0, nb, size=nb))
+        d = dist_fn(a[ia], b[ib])
+        out["fid"].append(d["fid"])
+        out["mmd"].append(d["mmd"])
+    return out
+
+
+def split_distances(features, dist_fn, n_splits, rng):
+    """Noise-floor distribution from repeated disjoint 50/50 splits of one pool.
+
+    Both halves are genuinely real (ERA5), so this traces out the distance you
+    get purely from finite-sample noise when the two sides share a distribution —
+    the null band each forecast distance should clear. Splits are *without*
+    replacement (a fresh random partition each time). Returns ``{metric:
+    [values]}`` of length ``n_splits``.
+    """
+    n = features.shape[0]
+    half = n // 2
+    out = {"fid": [], "mmd": []}
+    for _ in range(n_splits):
+        perm = rng.permutation(n)
+        ia = torch.from_numpy(perm[:half])
+        ib = torch.from_numpy(perm[half:2 * half])
+        d = dist_fn(features[ia], features[ib])
+        out["fid"].append(d["fid"])
+        out["mmd"].append(d["mmd"])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -319,12 +382,33 @@ def print_metrics_table(results, models, sizes, device, label_suffix=""):
     print(hdr)
 
 
-def plot_metric_bars(results, models, plots_dir, run_tag):
-    """Bar chart of FID and MMD per model/forecast source, with the ERA5-self baseline line."""
+def plot_metric_bars(results, models, plots_dir, run_tag, cis=None, ci_level=95):
+    """Bar chart of FID and MMD per model/forecast source, with the ERA5-self baseline.
+
+    When ``cis`` is given (``{model: {key: {metric: (lo, hi)}}}``), each forecast
+    bar carries a bootstrap CI whisker and each model's ERA5-self baseline is drawn
+    as a shaded null band (its split-distribution CI) rather than a bare line. A
+    forecast bar whose lower whisker clears the top of that model's band is
+    distinguishable from real fields beyond finite-sample noise.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     sources = ["pangu", "graphcast"]
     x = np.arange(len(models))
     width = 0.35
+
+    def _yerr(source, metric_key):
+        """Asymmetric (2, n_models) error array for one source/metric, or None."""
+        if not cis:
+            return None
+        lo, hi = [], []
+        for m in models:
+            v = results[m][source][metric_key]
+            ci = cis.get(m, {}).get(source, {}).get(metric_key)
+            if ci is None or not np.isfinite(ci[0]) or not np.isfinite(v):
+                lo.append(0.0); hi.append(0.0)
+            else:
+                lo.append(max(0.0, v - ci[0])); hi.append(max(0.0, ci[1] - v))
+        return np.array([lo, hi])
 
     for ax, metric_key, metric_label in [
         (axes[0], "fid", "Fréchet Distance"),
@@ -332,33 +416,41 @@ def plot_metric_bars(results, models, plots_dir, run_tag):
     ]:
         for si, source in enumerate(sources):
             vals = [results[m][source][metric_key] for m in models]
+            yerr = _yerr(source, metric_key)
             bars = ax.bar(
                 x + (si - 0.5) * width, vals, width=width,
                 label=SOURCE_LABELS[source],
                 color=[MODEL_COLORS[m] for m in models],
                 hatch=SOURCE_HATCHES[source],
                 edgecolor="white", linewidth=0.5,
+                yerr=yerr, capsize=3, error_kw=dict(ecolor="#333333", elinewidth=1.1),
             )
-            for bar, val in zip(bars, vals):
+            ups = yerr[1] if yerr is not None else [0.0] * len(bars)
+            for bar, val, up in zip(bars, vals, ups):
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() * 1.02,
+                    bar.get_height() + up,
                     f"{val:.3f}", ha="center", va="bottom", fontsize=8,
                 )
 
-        # ERA5 self-baseline: one dashed horizontal line per model
+        # ERA5 self-baseline: a shaded null band (CI) + dashed mean line per model.
         for mi, model_name in enumerate(models):
             baseline = results[model_name].get("era5_self")
-            if baseline:
-                bval = baseline[metric_key]
-                x_left  = x[mi] - width
-                x_right = x[mi] + width
-                ax.hlines(bval, x_left, x_right,
-                          colors=MODEL_COLORS[model_name], linestyles="dashed",
-                          linewidth=1.5, label=f"ERA5 self ({MODEL_LABELS[model_name]})")
-                ax.text(x_right + 0.03, bval, f"{bval:.3f}",
-                        va="center", ha="left", fontsize=7,
-                        color=MODEL_COLORS[model_name])
+            if not baseline:
+                continue
+            bval = baseline[metric_key]
+            x_left  = x[mi] - width - width / 2
+            x_right = x[mi] + width + width / 2
+            base_ci = cis.get(model_name, {}).get("era5_self", {}).get(metric_key) if cis else None
+            if base_ci is not None and np.isfinite(base_ci[0]):
+                ax.fill_between([x_left, x_right], base_ci[0], base_ci[1],
+                                color=MODEL_COLORS[model_name], alpha=0.15, zorder=0)
+            ax.hlines(bval, x_left, x_right,
+                      colors=MODEL_COLORS[model_name], linestyles="dashed",
+                      linewidth=1.5, label=f"ERA5 self ({MODEL_LABELS[model_name]})")
+            ax.text(x_right + 0.03, bval, f"{bval:.3f}",
+                    va="center", ha="left", fontsize=7,
+                    color=MODEL_COLORS[model_name])
 
         ax.set_xticks(x)
         ax.set_xticklabels([MODEL_LABELS[m] for m in models])
@@ -440,6 +532,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n-boot", type=int, default=200,
+                        help="Resamples for uncertainty bars: bootstrap CIs on each "
+                             "forecast bar and the repeated-split baseline null band. "
+                             "0 disables (single-split baseline, no error bars).")
+    parser.add_argument("--ci", type=float, default=95.0,
+                        help="Confidence level (percent) for the bootstrap/split intervals.")
     parser.add_argument("--model-size", choices=["default", "twin", "tiny", "small"], default="twin",
                         help="Model size config to build for both MAE and IJEPA (default: twin).")
     parser.add_argument("--embed-dim", type=int, default=None,
@@ -597,6 +695,7 @@ def main():
     # Feature dict: {model: {source: tensor (N, D)}}
     all_feats = {}
     results   = {}
+    cis       = {}  # {model: {key: {metric: (lo, hi)}}} — bootstrap/baseline CIs
 
     label_suffix = ""
     if args.embed_dim is not None:
@@ -669,16 +768,35 @@ def main():
             print(f"  Extracting features: {name} ({len(loader.dataset)} samples)...")
             feats[name] = extract_features_for_loader(model, loader, device)
 
-        # Baseline = random 50/50 split of the (Pangu) ERA5 reference pool.
-        # The forecast comparison uses the full ref pool on the ERA5 side and
-        # the full forecast pool on the forecast side — no per-sample pairing.
+        # Baseline = random 50/50 split of the ERA5 reference pool (real-vs-real
+        # noise floor). The forecast comparison uses the full ref pool on the ERA5
+        # side and the full forecast pool on the forecast side — no per-sample
+        # pairing. With --n-boot>0 the baseline is the mean over many disjoint
+        # splits (stable point + a shaded band); n_boot=0 keeps a single split.
         print(f"  Computing FID/MMD: forecast (N_ref={n_ref_p}, N_fc={n_pangu}) and "
-              f"baseline (N={n_base} vs {n_base})...")
+              f"baseline (N={n_base} vs {n_base})"
+              f"{f'  + {args.n_boot}-resample uncertainty' if args.n_boot > 0 else ''}...")
+        base_full = torch.cat([feats["base_a"], feats["base_b"]], dim=0)
+        if args.n_boot > 0:
+            base_samp = split_distances(base_full, compute_distances, args.n_boot, rng)
+            era5_self = {k: _nanmean(base_samp[k]) for k in ("fid", "mmd")}
+        else:
+            base_samp = None
+            era5_self = compute_distances(feats["base_a"], feats["base_b"])
         results[model_name] = {
-            "era5_self": compute_distances(feats["base_a"],     feats["base_b"]),
+            "era5_self": era5_self,
             "pangu":     compute_distances(feats["era5_p_ref"], feats["pangu"]),
             "graphcast": compute_distances(feats["era5_g_ref"], feats["graphcast"]),
         }
+        if args.n_boot > 0:
+            p_samp = bootstrap_distances(feats["era5_p_ref"], feats["pangu"],
+                                         compute_distances, args.n_boot, rng)
+            g_samp = bootstrap_distances(feats["era5_g_ref"], feats["graphcast"],
+                                         compute_distances, args.n_boot, rng)
+            cis[model_name] = {
+                key: {k: _percentile_ci(samp[k], args.ci) for k in ("fid", "mmd")}
+                for key, samp in (("era5_self", base_samp), ("pangu", p_samp), ("graphcast", g_samp))
+            }
         all_feats[model_name] = {
             "era5":      feats["era5_p_ref"].numpy(),   # representative ERA5 distribution
             "pangu":     feats["pangu"].numpy(),
@@ -688,6 +806,20 @@ def main():
     sizes = {"n_ref_p": n_ref_p, "n_ref_g": n_ref_g,
              "n_pangu": n_pangu, "n_gc": n_gc, "n_base": n_base}
     print_metrics_table(results, models_to_run, sizes, device, label_suffix=label_suffix)
+
+    # Uncertainty summary: does each forecast CI clear that model's baseline band?
+    if args.n_boot > 0:
+        print(f"  Uncertainty ({args.n_boot} resamples, {args.ci:g}% intervals):")
+        for model_name in models_to_run:
+            for metric in ("fid", "mmd"):
+                bl, bh = cis[model_name]["era5_self"][metric]
+                print(f"  {MODEL_LABELS[model_name]} {metric.upper()}  "
+                      f"baseline band [{bl:.4g}, {bh:.4g}]")
+                for source in ("pangu", "graphcast"):
+                    lo, hi = cis[model_name][source][metric]
+                    sep = "clears band" if lo > bh else "OVERLAPS band"
+                    print(f"      {SOURCE_LABELS[source]:<14} CI [{lo:.4g}, {hi:.4g}] — {sep}")
+        print("  " + "=" * 78)
 
     tag_parts = [args.model_size]
     if args.embed_dim is not None:
@@ -705,7 +837,8 @@ def main():
         plots_dir = Path(args.output_dir) / "plots" / "real_vs_forecast"
     else:
         plots_dir = Path("plots/real_vs_forecast")
-    plot_metric_bars(results, models_to_run, plots_dir, run_tag)
+    plot_metric_bars(results, models_to_run, plots_dir, run_tag,
+                     cis=cis or None, ci_level=args.ci)
     plot_pca_scatter(all_feats, results, models_to_run, plots_dir, run_tag, model_label_suffix=label_suffix)
 
 

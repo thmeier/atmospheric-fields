@@ -30,13 +30,18 @@ from torch.utils.data import DataLoader, Subset
 
 from utils.features import extract_features_for_loader
 from utils.sfno_embedding import SFNOEmbedding, RawFourVarDataset
-# Reuse the exact distance + index-alignment logic from the MAE/I-JEPA eval.
+# Reuse the exact distance + index-alignment + uncertainty logic from the
+# MAE/I-JEPA eval (single source of truth for these helpers).
 from eval.eval_real_vs_forecast import (
     compute_distances,
     mmd_rbf,
     build_era5_ref_pool,
     build_forecast_indices,
     cap_indices,
+    bootstrap_distances,
+    split_distances,
+    _percentile_ci,
+    _nanmean,
     SOURCE_COLORS,
     SOURCE_LABELS,
 )
@@ -161,64 +166,6 @@ def plot_pca_scatter(feats, results, plots_dir, run_tag, mmd_only):
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved plot → {out}")
-
-
-def _nanmean(vals):
-    """Mean over finite entries, or NaN if none are finite (avoids RuntimeWarnings)."""
-    vals = np.asarray(vals, dtype=float)
-    finite = vals[np.isfinite(vals)]
-    return float(finite.mean()) if finite.size else float("nan")
-
-
-def _percentile_ci(vals, ci):
-    """(lo, hi) percentile interval over finite entries; (nan, nan) if all NaN."""
-    vals = np.asarray(vals, dtype=float)
-    if not np.isfinite(vals).any():
-        return (float("nan"), float("nan"))
-    lo_q, hi_q = (100 - ci) / 2.0, 100 - (100 - ci) / 2.0
-    return (float(np.nanpercentile(vals, lo_q)), float(np.nanpercentile(vals, hi_q)))
-
-
-def bootstrap_distances(a, b, dist_fn, n_boot, rng):
-    """Sampling distribution of the distance between feature pools ``a`` and ``b``.
-
-    Each iteration resamples the rows of ``a`` and ``b`` *independently, with
-    replacement* (sizes preserved) and recomputes the distance — the standard
-    bootstrap estimate of how much the FID/MMD point estimate would vary under a
-    different draw of the same size. Returns ``{metric: [values]}`` of length
-    ``n_boot``.
-    """
-    na, nb = a.shape[0], b.shape[0]
-    out = {"fid": [], "mmd": []}
-    for _ in range(n_boot):
-        ia = torch.from_numpy(rng.integers(0, na, size=na))
-        ib = torch.from_numpy(rng.integers(0, nb, size=nb))
-        d = dist_fn(a[ia], b[ib])
-        out["fid"].append(d["fid"])
-        out["mmd"].append(d["mmd"])
-    return out
-
-
-def split_distances(features, dist_fn, n_splits, rng):
-    """Noise-floor distribution from repeated disjoint 50/50 splits of one pool.
-
-    Both halves are genuinely real (ERA5), so this traces out the distance you
-    get purely from finite-sample noise when the two sides share a distribution —
-    the null band each forecast distance should clear. Splits are *without*
-    replacement (a fresh random partition each time). Returns ``{metric:
-    [values]}`` of length ``n_splits``.
-    """
-    n = features.shape[0]
-    half = n // 2
-    out = {"fid": [], "mmd": []}
-    for _ in range(n_splits):
-        perm = rng.permutation(n)
-        ia = torch.from_numpy(perm[:half])
-        ib = torch.from_numpy(perm[half:2 * half])
-        d = dist_fn(features[ia], features[ib])
-        out["fid"].append(d["fid"])
-        out["mmd"].append(d["mmd"])
-    return out
 
 
 def main():

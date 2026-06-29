@@ -218,6 +218,42 @@ def apply_wind_patch_shuffle(x, severity, patch_size=16):
     return _finalize_like_input(x, work_x)
 
 
+def apply_spectral_lowpass(x, severity, min_cutoff_ratio=0.1):
+    """Attenuate high spatial wavenumbers — the *forecast-direction* corruption.
+
+    ML weather models systematically lose small-scale (high-wavenumber) power
+    relative to ERA5. This corruption mimics that by multiplying each channel's
+    2-D spatial spectrum by a smooth Gaussian low-pass whose cutoff shrinks as
+    ``severity`` grows.
+
+    x: torch tensor of shape (N, C, H, W).
+    severity: float in [0, 1]. 0 = identity; larger removes more high-freq power.
+    min_cutoff_ratio: cutoff at severity=1, as a fraction of the Nyquist freq.
+    """
+    if severity <= 0:
+        return x
+
+    work_x = _crop_interior(x) if _is_model_padded_shape(x) else x
+    _, _, H, W = work_x.shape
+
+    # Radial wavenumber grid (cycles/pixel); Nyquist = 0.5.
+    fy = torch.fft.fftfreq(H, device=work_x.device)
+    fx = torch.fft.fftfreq(W, device=work_x.device)
+    kr = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
+
+    # Cutoff decreases geometrically from Nyquist (mild) to nyq*min_ratio (strong).
+    nyq = 0.5
+    cutoff = nyq * (min_cutoff_ratio ** float(severity))
+    filt = torch.exp(-0.5 * (kr / cutoff) ** 2).to(work_x.dtype)
+
+    spec = torch.fft.fft2(work_x)
+    corrupted = torch.fft.ifft2(spec * filt).real.to(work_x.dtype)
+
+    if _is_model_padded_shape(x):
+        return _repad_like_dataset(corrupted)
+    return corrupted
+
+
 def apply_wind_channel_rotation(x, severity):
     """
     Leaves temperature and pressure untouched while rotating every wind vector.
@@ -238,6 +274,43 @@ def apply_wind_channel_rotation(x, severity):
     return _finalize_like_input(x, work_x)
 
 
+# ---------------------------------------------------------------------------
+# Contrastive realism training: a *subtle* corruption suite (~10x weaker than
+# the eval ladder) sized to the real↔forecast gap rather than gross corruption.
+# Spans BOTH directions so the embedding learns "realism = the right amount of
+# structure" (a band): under-resolved (lowpass, blur) AND over-resolved (noise,
+# grf, pixel_replace), plus a mild wind rotation. wind_patch_shuffle is excluded.
+# Each entry is (fn, max_severity); the lowpass cap is retuned from the PSD
+# diagnostic once the forecast spectral deficit is measured.
+# ---------------------------------------------------------------------------
+CONTRASTIVE_CORRUPTION_SPECS = {
+    "lowpass":       (apply_spectral_lowpass,      0.50),
+    "blur":          (apply_gaussian_blur,         0.20),
+    "noise":         (apply_high_freq_noise,       0.20),
+    "grf":           (apply_gaussian_field_noise,  0.20),
+    "pixel_replace": (apply_random_pixel_replace,  0.20),
+    "wind_rotation": (apply_wind_channel_rotation, 0.333),  # ≈ 30° max rotation
+}
+
+
+def sample_contrastive_corruption(x, generator=None, types=None):
+    """Apply one randomly chosen subtle corruption to the whole batch ``x``.
+
+    Picks a corruption type (uniformly from ``types`` or all
+    ``CONTRASTIVE_CORRUPTION_SPECS`` keys) and a severity ``U(0, max_severity)``.
+    Returns ``(x_corrupted, strength, name)`` where ``strength = severity /
+    max_severity`` is the normalized target in [0, 1] (comparable across types).
+    One type+severity per call; variety accumulates across training batches.
+    """
+    names = list(CONTRASTIVE_CORRUPTION_SPECS.keys()) if types is None else list(types)
+    name = names[int(torch.randint(len(names), (1,), generator=generator).item())]
+    fn, max_sev = CONTRASTIVE_CORRUPTION_SPECS[name]
+    severity = float(torch.rand(1, generator=generator).item()) * max_sev
+    x_corrupted = fn(x, severity)
+    strength = severity / max_sev if max_sev > 0 else 0.0
+    return x_corrupted, strength, name
+
+
 if __name__ == "__main__":
     dummy_input = torch.randn(2, 4, 128, 256)
     blurred = apply_gaussian_blur(dummy_input, severity=0.5)
@@ -246,8 +319,12 @@ if __name__ == "__main__":
     pixel_replaced = apply_random_pixel_replace(dummy_input, severity=0.5)
     wind_shuffled = apply_wind_patch_shuffle(dummy_input, severity=0.5)
     wind_rotated = apply_wind_channel_rotation(dummy_input, severity=0.5)
+    lowpassed = apply_spectral_lowpass(dummy_input, severity=0.5)
+    corr, strength, name = sample_contrastive_corruption(dummy_input)
 
     print(f"Clean std: {dummy_input.std():.3f}")
+    print(f"Low-pass std: {lowpassed.std():.3f}")
+    print(f"Sampled contrastive corruption: {name} (strength={strength:.3f}), std: {corr.std():.3f}")
     print(f"Blurred std: {blurred.std():.3f}")
     print(f"High-freq noised std: {noised.std():.3f}")
     print(f"GRF noised std: {grf_noised.std():.3f}")
