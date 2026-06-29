@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=realism
-#SBATCH --time=06:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=pmlr_jobs
 #SBATCH --mem=32G
 #SBATCH --gpus=1
