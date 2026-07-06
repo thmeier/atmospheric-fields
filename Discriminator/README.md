@@ -326,18 +326,18 @@ The two poster discriminators:
 The k-fold runs use a different split principle from the poster train/test-time
 split above. Each leave-one-neural-model-out discriminator is trained with the
 held-out forecast model removed from the fake training pool; the other neural
-forecast model files are used. ERA5/reference data is not folded by model and,
-for these k-fold runs, should be understood as using the whole available ERA5
-data range configured for the experiment.
+forecast model files are used. Their filename date spans are merged into one
+model-time union. Forecast fake samples are drawn from that union, while
+ERA5/reference real samples are drawn from the complement of that union within
+the available ERA5 file span.
 
 The full-pool k-fold discriminator keeps all neural forecast model files in the
 fake training pool and is used for numerical-model comparisons.
 
-Because the k-fold setup uses the whole available ERA5/reference range, its
-configured train and test time ranges can overlap. Standard test accuracy/loss
-from `scripts/evaluate_discriminator.py` should therefore not be interpreted as
-independent held-out metrics for these k-fold checkpoints. The meaningful
-holdout axis is the omitted forecast model, not a disjoint ERA5 time split.
+For plotting, `test_real_ranges` and `test_fake_range` use the model-time union.
+This means the discriminator sees ERA5 real samples only outside the forecast
+evaluation periods during training, then scores ERA5 and forecast samples on the
+same model-time union at test time.
 
 Training sample composition:
 
@@ -467,7 +467,6 @@ unless the change is intentional.
   setup.
 - The k-fold workflow assumes the configured neural forecast files can be
   resolved by filename convention. For leave-one-model-out folds, only the
-  held-out model is removed from the fake training pool; the remaining model
-  files and the configured full ERA5/reference range are used.
-- K-fold train/test time ranges may overlap, so test accuracy/loss is not a
-  meaningful held-out metric for those checkpoints.
+  held-out model is removed from the fake training pool.
+- K-fold training uses the union of the remaining fake-file date spans for fake
+  samples and the complement of that union for ERA5/reference samples.

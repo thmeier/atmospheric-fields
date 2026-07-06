@@ -117,13 +117,13 @@ def configured_real_file(cfg):
 
 
 def configured_real_ranges(cfg):
-    """Return real ranges with data, falling back when k-fold placeholders are empty."""
+    """Return the configured ERA5/reference ranges for k-fold evaluation."""
     return cfg.get("test_real_ranges", cfg.train_real_range)
 
 
 def select_fake_test_data(ds, cfg, label):
-    """Select fake test data, falling back to all times for k-fold placeholders."""
-    test_ds = ds.sel(time=slice(cfg.test_fake_range[0], cfg.test_fake_range[1]))
+    """Select fake test data from the configured k-fold model-time union."""
+    test_ds = select_time_ranges(ds, cfg.test_fake_range)
     if test_ds.sizes.get("time", 0) > 0:
         return test_ds
     print(

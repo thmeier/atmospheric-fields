@@ -40,21 +40,30 @@ selected_variable: "temperature"
 level: 850
 
 # Real/reference time ranges used for training and normalization statistics.
-# Multiple disjoint intervals are allowed.
+# For k-fold, this is the complement of the forecast-model time union below, so
+# ERA5 samples from forecast evaluation periods are not seen as real training
+# examples.
 train_real_range:
-  - ["2004-01-01", "2023-12-31"]
+  - ["2004-01-01", "2017-12-31"]
+  - ["2019-01-01", "2019-12-31"]
+  - ["2021-01-01", "2023-12-31"]
 
-# Forecast initialization-time range used for fake training samples.
-train_fake_range: ["2014-01-01", "2023-12-31"]
+# Forecast initialization-time ranges used for fake training samples. These are
+# the union of the configured forecast-model files.
+train_fake_range:
+  - ["2018-01-01", "2018-12-31"]
+  - ["2020-01-01", "2020-12-31"]
 
-# Real/reference holdout ranges. These do not define meaningful k-fold metrics;
-# the k-fold holdout axis is the forecast model, not ERA5 time.
+# Real/reference holdout ranges use the same model-time union, so test-time
+# ERA5 covers the periods that were excluded from real training samples.
 test_real_ranges:
-  - ["2001-01-01", "2001-12-31"]
+  - ["2018-01-01", "2018-12-31"]
+  - ["2020-01-01", "2020-12-31"]
 
-# Forecast initialization-time holdout range. This is a placeholder for k-fold
-# runs where train/test time metrics are not the meaningful holdout.
-test_fake_range: ["2001-01-01", "2001-12-31"]
+# Forecast-model test ranges also use the model-time union.
+test_fake_range:
+  - ["2018-01-01", "2018-12-31"]
+  - ["2020-01-01", "2020-12-31"]
 
 # Forecast lead times, in hours, to include from files with a
 # prediction_timedelta dimension.
