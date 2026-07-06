@@ -187,6 +187,36 @@ download/download_dynamical_surface_forecasts.sh
 
 To use `uv` instead of the active conda environment, set `RUNNER=uv`.
 
+## SLURM Wrapper
+
+For cluster runs, use the sbatch-friendly wrapper. It activates conda from an
+explicit `CONDA_SH` path, then calls the staged download/regrid wrapper:
+
+```bash
+sbatch --export=ALL,\
+CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh,\
+CONDA_ENV_NAME=pmlr,\
+WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py,\
+SCRATCH_DIR=/scratch/$USER/dynamical_native,\
+OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical,\
+MODE=gfs \
+download/sbatch_dynamical_surface_forecasts.sh
+```
+
+GEFS control-member smoke run:
+
+```bash
+sbatch --export=ALL,\
+CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh,\
+CONDA_ENV_NAME=pmlr,\
+WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py,\
+SCRATCH_DIR=/scratch/$USER/dynamical_native,\
+OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical,\
+MODE=gefs,\
+GEFS_ENSEMBLE_MEMBERS=0 \
+download/sbatch_dynamical_surface_forecasts.sh
+```
+
 ## Dynamical Catalog Caveats
 
 Small metadata samples confirmed that both Dynamical datasets have compatible
