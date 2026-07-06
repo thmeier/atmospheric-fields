@@ -189,32 +189,26 @@ To use `uv` instead of the active conda environment, set `RUNNER=uv`.
 
 ## SLURM Wrapper
 
-For cluster runs, use the sbatch-friendly wrapper. It activates conda from an
-explicit `CONDA_SH` path, then calls the staged download/regrid wrapper:
+For cluster runs, use the sbatch-friendly wrapper. It has defaults for the ETH
+PMLR paths currently used here:
+
+- `CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh`
+- `CONDA_ENV_NAME=pmlr`
+- `WB2_REGRID_SCRIPT=/home/yelberkennou/weatherbench2/scripts/regrid.py`
+- `SCRATCH_DIR=/work/scratch/yelberkennou/dynamical_native`
+- `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical`
+- `MODE=gfs`
 
 ```bash
-sbatch --export=ALL,\
-CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh,\
-CONDA_ENV_NAME=pmlr,\
-WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py,\
-SCRATCH_DIR=/scratch/$USER/dynamical_native,\
-OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical,\
-MODE=gfs \
-download/sbatch_dynamical_surface_forecasts.sh
+sbatch -A pmlr_jobs -t 02:00 download/sbatch_dynamical_surface_forecasts.sh
 ```
 
-GEFS control-member smoke run:
+Override only what changes. For example, GEFS control-member smoke run:
 
 ```bash
-sbatch --export=ALL,\
-CONDA_SH=$HOME/miniconda3/etc/profile.d/conda.sh,\
-CONDA_ENV_NAME=pmlr,\
-WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py,\
-SCRATCH_DIR=/scratch/$USER/dynamical_native,\
-OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical,\
-MODE=gefs,\
-GEFS_ENSEMBLE_MEMBERS=0 \
-download/sbatch_dynamical_surface_forecasts.sh
+MODE=gefs GEFS_ENSEMBLE_MEMBERS=0 \
+sbatch -A pmlr_jobs -t 02:00 --export=ALL \
+  download/sbatch_dynamical_surface_forecasts.sh
 ```
 
 ## Dynamical Catalog Caveats

@@ -10,12 +10,11 @@
 
 # SLURM wrapper for download_dynamical_surface_forecasts.sh.
 #
-# Required sbatch exports:
+# Defaults are set for the ETH PMLR cluster account/user paths below. Override
+# with sbatch exports only when needed:
 #   CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh
 #   CONDA_ENV_NAME=pmlr
 #   WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py
-#
-# Optional sbatch exports:
 #   MODE=all|gfs|gefs
 #   SCRATCH_DIR=/scratch/$USER/dynamical_native
 #   OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical
@@ -27,14 +26,14 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CONDA_SH="${CONDA_SH:-}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-}"
-MODE="${MODE:-all}"
-SCRATCH_DIR="${SCRATCH_DIR:-/scratch/${USER}/dynamical_native}"
+CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
+MODE="${MODE:-gfs}"
+SCRATCH_DIR="${SCRATCH_DIR:-/work/scratch/yelberkennou/dynamical_native}"
 OUTPUT_DIR="${OUTPUT_DIR:-/cluster/courses/pmlr/teams/team07/data/dynamical}"
 CONVERT_NETCDF="${CONVERT_NETCDF:-1}"
 GEFS_ENSEMBLE_MEMBERS="${GEFS_ENSEMBLE_MEMBERS:-all}"
-WB2_REGRID_SCRIPT="${WB2_REGRID_SCRIPT:-}"
+WB2_REGRID_SCRIPT="${WB2_REGRID_SCRIPT:-/home/yelberkennou/weatherbench2/scripts/regrid.py}"
 
 if [[ -z "${CONDA_SH}" ]]; then
   echo "Set CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh" >&2
