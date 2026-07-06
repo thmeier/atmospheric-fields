@@ -9,6 +9,8 @@
 #   SCRATCH_DIR=data/dynamical/scratch
 #   OUTPUT_DIR=data/dynamical/regridded
 #   MODE=all|gfs|gefs
+#   TIME_START=2024-01-01T00
+#   TIME_END=2024-12-31T23:59:59
 #   CONVERT_NETCDF=1|0
 #   GEFS_ENSEMBLE_MEMBERS=all|0|0,1,...
 #   PYTHON=python
@@ -22,11 +24,21 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SCRATCH_DIR="${SCRATCH_DIR:-${REPO_DIR}/data/dynamical/scratch}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/data/dynamical/regridded}"
 MODE="${MODE:-all}"
+TIME_START="${TIME_START:-}"
+TIME_END="${TIME_END:-}"
 CONVERT_NETCDF="${CONVERT_NETCDF:-1}"
 GEFS_ENSEMBLE_MEMBERS="${GEFS_ENSEMBLE_MEMBERS:-all}"
 PYTHON="${PYTHON:-python}"
 RUNNER="${RUNNER:-conda}"
 WB2_REGRID_SCRIPT="${WB2_REGRID_SCRIPT:-}"
+TIME_TAG="${TIME_TAG:-}"
+if [[ -z "${TIME_TAG}" ]]; then
+  if [[ -n "${TIME_START}" ]]; then
+    TIME_TAG="${TIME_START:0:4}"
+  else
+    TIME_TAG="full"
+  fi
+fi
 
 LEAD_HOURS=(6 12 24 48 96 192)
 
@@ -110,12 +122,21 @@ regrid_surface() {
 }
 
 download_gfs() {
-  local native_zarr="${SCRATCH_DIR}/gfs_native_surface_6steps_to_2023.zarr"
-  local regridded_zarr="${OUTPUT_DIR}/gfs_surface_6steps_240x121_conservative_to_2023.zarr"
-  local regridded_nc="${OUTPUT_DIR}/gfs_surface_6steps_240x121_conservative_to_2023.nc"
+  local native_zarr="${SCRATCH_DIR}/gfs_native_surface_6steps_${TIME_TAG}.zarr"
+  local regridded_zarr="${OUTPUT_DIR}/gfs_surface_6steps_240x121_conservative_${TIME_TAG}.zarr"
+  local regridded_nc="${OUTPUT_DIR}/gfs_surface_6steps_240x121_conservative_${TIME_TAG}.nc"
+  local time_args=()
+
+  if [[ -n "${TIME_START}" ]]; then
+    time_args+=(--time-start "${TIME_START}")
+  fi
+  if [[ -n "${TIME_END}" ]]; then
+    time_args+=(--time-end "${TIME_END}")
+  fi
 
   run_data_python "${SCRIPT_DIR}/download_gfs_dynamical_netcdf.py" \
     "${native_zarr}" \
+    "${time_args[@]}" \
     --lead-hours "${LEAD_HOURS[@]}"
 
   regrid_surface "${native_zarr}" "${regridded_zarr}" "init_time=1"
@@ -123,17 +144,25 @@ download_gfs() {
 }
 
 download_gefs() {
-  local native_zarr="${SCRATCH_DIR}/gefs_native_surface_6steps_to_2023.zarr"
-  local regridded_zarr="${OUTPUT_DIR}/gefs_surface_6steps_240x121_conservative_to_2023.zarr"
-  local regridded_nc="${OUTPUT_DIR}/gefs_surface_6steps_240x121_conservative_to_2023.nc"
+  local native_zarr="${SCRATCH_DIR}/gefs_native_surface_6steps_${TIME_TAG}.zarr"
+  local regridded_zarr="${OUTPUT_DIR}/gefs_surface_6steps_240x121_conservative_${TIME_TAG}.zarr"
+  local regridded_nc="${OUTPUT_DIR}/gefs_surface_6steps_240x121_conservative_${TIME_TAG}.nc"
+  local time_args=()
   local member_args=()
 
+  if [[ -n "${TIME_START}" ]]; then
+    time_args+=(--time-start "${TIME_START}")
+  fi
+  if [[ -n "${TIME_END}" ]]; then
+    time_args+=(--time-end "${TIME_END}")
+  fi
   if [[ "${GEFS_ENSEMBLE_MEMBERS}" != "all" ]]; then
     member_args=(--ensemble-members "${GEFS_ENSEMBLE_MEMBERS}")
   fi
 
   run_data_python "${SCRIPT_DIR}/download_gefs_dynamical_netcdf.py" \
     "${native_zarr}" \
+    "${time_args[@]}" \
     --lead-hours "${LEAD_HOURS[@]}" \
     "${member_args[@]}"
 

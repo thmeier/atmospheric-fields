@@ -197,7 +197,9 @@ PMLR paths currently used here:
 - `WB2_REGRID_SCRIPT=/home/yelberkennou/weatherbench2/scripts/regrid.py`
 - `SCRATCH_DIR=/work/scratch/yelberkennou/dynamical_native`
 - `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical`
-- `MODE=gfs`
+- `MODE=all`
+- `TIME_START=2024-01-01T00`
+- `TIME_END=2024-12-31T23:59:59`
 
 ```bash
 sbatch -A pmlr_jobs -t 02:00 download/sbatch_dynamical_surface_forecasts.sh

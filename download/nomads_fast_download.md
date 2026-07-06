@@ -72,6 +72,37 @@ sbatch -A pmlr_jobs -t 02:00 --export=ALL \
   download/sbatch_nomads_gfs_fast.sh
 ```
 
+## GEFS
+
+GEFS uses the same byte-range approach against the NOAA GEFS S3 archive:
+
+```text
+https://noaa-gefs-pds.s3.amazonaws.com
+```
+
+Control member from `2020-10-01` through the end of 2023:
+
+```bash
+sbatch -A pmlr_jobs -t 02:00 download/sbatch_nomads_gefs_fast.sh
+```
+
+The GEFS sbatch wrapper defaults to:
+
+- `START_DATE=20201001`
+- `END_DATE=20231231`
+- `CYCLES="00"`
+- `MEMBERS="0"`
+- `LEAD_HOURS="6 12 24 48 96 192"`
+- `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/gefs_fast`
+
+All GEFS members:
+
+```bash
+MEMBERS=all \
+sbatch -A pmlr_jobs -t 02:00 --export=ALL \
+  download/sbatch_nomads_gefs_fast.sh
+```
+
 For a range:
 
 ```bash

@@ -16,6 +16,8 @@
 #   CONDA_ENV_NAME=pmlr
 #   WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py
 #   MODE=all|gfs|gefs
+#   TIME_START=2024-01-01T00
+#   TIME_END=2024-12-31T23:59:59
 #   SCRATCH_DIR=/scratch/$USER/dynamical_native
 #   OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical
 #   CONVERT_NETCDF=1|0
@@ -28,7 +30,9 @@ SCRIPT_DIR="${REPO_DIR}/download"
 
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
-MODE="${MODE:-gfs}"
+MODE="${MODE:-all}"
+TIME_START="${TIME_START:-2024-01-01T00}"
+TIME_END="${TIME_END:-2024-12-31T23:59:59}"
 SCRATCH_DIR="${SCRATCH_DIR:-/work/scratch/yelberkennou/dynamical_native}"
 OUTPUT_DIR="${OUTPUT_DIR:-/cluster/courses/pmlr/teams/team07/data/dynamical}"
 CONVERT_NETCDF="${CONVERT_NETCDF:-1}"
@@ -62,6 +66,8 @@ cd "${REPO_DIR}"
 RUNNER=conda \
 PYTHON=python \
 MODE="${MODE}" \
+TIME_START="${TIME_START}" \
+TIME_END="${TIME_END}" \
 SCRATCH_DIR="${SCRATCH_DIR}" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
 CONVERT_NETCDF="${CONVERT_NETCDF}" \
