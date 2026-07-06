@@ -11,7 +11,8 @@
 #   MODE=all|gfs|gefs
 #   CONVERT_NETCDF=1|0
 #   GEFS_ENSEMBLE_MEMBERS=all|0|0,1,...
-#   UV=uv
+#   PYTHON=python
+#   RUNNER=conda|uv
 
 set -eo pipefail
 
@@ -23,7 +24,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/data/dynamical/regridded}"
 MODE="${MODE:-all}"
 CONVERT_NETCDF="${CONVERT_NETCDF:-1}"
 GEFS_ENSEMBLE_MEMBERS="${GEFS_ENSEMBLE_MEMBERS:-all}"
-UV="${UV:-uv}"
+PYTHON="${PYTHON:-python}"
+RUNNER="${RUNNER:-conda}"
 WB2_REGRID_SCRIPT="${WB2_REGRID_SCRIPT:-}"
 
 LEAD_HOURS=(6 12 24 48 96 192)
@@ -44,6 +46,28 @@ UV_REGRID_DEPS=(
   --with netcdf4
 )
 
+run_data_python() {
+  if [[ "${RUNNER}" == "uv" ]]; then
+    uv run "${UV_DATA_DEPS[@]}" python "$@"
+  elif [[ "${RUNNER}" == "conda" ]]; then
+    "${PYTHON}" "$@"
+  else
+    echo "Unsupported RUNNER=${RUNNER}. Use conda or uv." >&2
+    exit 2
+  fi
+}
+
+run_regrid_python() {
+  if [[ "${RUNNER}" == "uv" ]]; then
+    uv run "${UV_REGRID_DEPS[@]}" python "$@"
+  elif [[ "${RUNNER}" == "conda" ]]; then
+    "${PYTHON}" "$@"
+  else
+    echo "Unsupported RUNNER=${RUNNER}. Use conda or uv." >&2
+    exit 2
+  fi
+}
+
 require_regrid_script() {
   if [[ -z "${WB2_REGRID_SCRIPT}" ]]; then
     echo "Set WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py" >&2
@@ -63,14 +87,9 @@ convert_to_netcdf() {
     return
   fi
 
-  "${UV}" run \
-    --with xarray \
-    --with zarr \
-    --with dask \
-    --with netcdf4 \
-    python "${SCRIPT_DIR}/zarr_to_netcdf.py" \
-      "${input_zarr}" \
-      "${output_nc}"
+  run_data_python "${SCRIPT_DIR}/zarr_to_netcdf.py" \
+    "${input_zarr}" \
+    "${output_nc}"
 }
 
 regrid_surface() {
@@ -78,7 +97,7 @@ regrid_surface() {
   local output_zarr="$2"
   local output_chunks="$3"
 
-  "${UV}" run "${UV_REGRID_DEPS[@]}" python "${WB2_REGRID_SCRIPT}" \
+  run_regrid_python "${WB2_REGRID_SCRIPT}" \
     --input_path="${input_zarr}" \
     --output_path="${output_zarr}" \
     --output_chunks="${output_chunks}" \
@@ -95,7 +114,7 @@ download_gfs() {
   local regridded_zarr="${OUTPUT_DIR}/gfs_surface_6steps_240x121_conservative_to_2023.zarr"
   local regridded_nc="${OUTPUT_DIR}/gfs_surface_6steps_240x121_conservative_to_2023.nc"
 
-  "${UV}" run "${UV_DATA_DEPS[@]}" python "${SCRIPT_DIR}/download_gfs_dynamical_netcdf.py" \
+  run_data_python "${SCRIPT_DIR}/download_gfs_dynamical_netcdf.py" \
     "${native_zarr}" \
     --lead-hours "${LEAD_HOURS[@]}"
 
@@ -113,7 +132,7 @@ download_gefs() {
     member_args=(--ensemble-members "${GEFS_ENSEMBLE_MEMBERS}")
   fi
 
-  "${UV}" run "${UV_DATA_DEPS[@]}" python "${SCRIPT_DIR}/download_gefs_dynamical_netcdf.py" \
+  run_data_python "${SCRIPT_DIR}/download_gefs_dynamical_netcdf.py" \
     "${native_zarr}" \
     --lead-hours "${LEAD_HOURS[@]}" \
     "${member_args[@]}"

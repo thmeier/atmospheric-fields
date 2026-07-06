@@ -148,6 +148,15 @@ scratch-staged workflow:
 This keeps the intermediate data and the exact WeatherBench2 command visible for
 reproducibility.
 
+The wrapper defaults to the currently active Python environment
+(`RUNNER=conda`, `PYTHON=python`). Install the required packages in that
+environment before running:
+
+```bash
+pip install "dynamical-catalog>=0.5.0" xarray zarr dask netCDF4
+pip install "git+https://github.com/google-research/weatherbench2"
+```
+
 ```bash
 WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py \
 SCRATCH_DIR=/scratch/$USER/dynamical_native \
@@ -175,6 +184,8 @@ WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py \
 CONVERT_NETCDF=0 \
 download/download_dynamical_surface_forecasts.sh
 ```
+
+To use `uv` instead of the active conda environment, set `RUNNER=uv`.
 
 ## Dynamical Catalog Caveats
 
