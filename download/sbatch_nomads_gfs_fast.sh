@@ -15,6 +15,7 @@
 #   END_DATE=YYYYMMDD
 #   CYCLES="00 06 12 18"
 #   LEAD_HOURS="6 12 24 48 96 192"
+#   BASE_URL=https://noaa-gfs-bdp-pds.s3.amazonaws.com
 #   OUTPUT_DIR=/work/scratch/yelberkennou/nomads_gfs_fast
 #   CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh
 #   CONDA_ENV_NAME=pmlr
@@ -26,6 +27,7 @@ REPO_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
 OUTPUT_DIR="${OUTPUT_DIR:-/work/scratch/yelberkennou/nomads_gfs_fast}"
+BASE_URL="${BASE_URL:-https://noaa-gfs-bdp-pds.s3.amazonaws.com}"
 DATE="${DATE:-}"
 START_DATE="${START_DATE:-}"
 END_DATE="${END_DATE:-}"
@@ -46,6 +48,7 @@ conda activate "${CONDA_ENV_NAME}"
 cd "${REPO_DIR}"
 
 OUTPUT_DIR="${OUTPUT_DIR}" \
+BASE_URL="${BASE_URL}" \
 DATE="${DATE}" \
 START_DATE="${START_DATE}" \
 END_DATE="${END_DATE}" \

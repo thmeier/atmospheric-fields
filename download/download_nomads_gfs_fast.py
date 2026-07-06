@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast selective GFS GRIB2 downloads from NOMADS using .idx byte ranges.
+"""Fast selective GFS GRIB2 downloads using .idx byte ranges.
 
 This follows the NOMADS "fast downloading" pattern: read the small wgrib2 index
 file, select only wanted inventory rows, then request just those byte ranges
@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-DEFAULT_BASE_URL = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"
+DEFAULT_BASE_URL = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
 DEFAULT_LEAD_HOURS = (6, 12, 24, 48, 96, 192)
 FIELD_PATTERN = re.compile(
     r":(?:PRMSL:mean sea level|TMP:2 m above ground|"

@@ -8,6 +8,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PYTHON="${PYTHON:-python}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/data/nomads_gfs_fast}"
+BASE_URL="${BASE_URL:-https://noaa-gfs-bdp-pds.s3.amazonaws.com}"
 DATE="${DATE:-}"
 START_DATE="${START_DATE:-}"
 END_DATE="${END_DATE:-}"
@@ -15,7 +16,7 @@ CYCLES="${CYCLES:-00 06 12 18}"
 LEAD_HOURS="${LEAD_HOURS:-6 12 24 48 96 192}"
 OVERWRITE="${OVERWRITE:-0}"
 
-args=("${OUTPUT_DIR}" --cycles ${CYCLES} --lead-hours ${LEAD_HOURS})
+args=("${OUTPUT_DIR}" --base-url "${BASE_URL}" --cycles ${CYCLES} --lead-hours ${LEAD_HOURS})
 
 if [[ -n "${DATE}" ]]; then
   args+=(--date "${DATE}")
