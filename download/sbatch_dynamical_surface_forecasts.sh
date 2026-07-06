@@ -23,8 +23,8 @@
 
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+SCRIPT_DIR="${REPO_DIR}/download"
 
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
@@ -52,7 +52,7 @@ if [[ -z "${WB2_REGRID_SCRIPT}" ]]; then
   exit 2
 fi
 
-mkdir -p "${REPO_DIR}/logs" "${SCRATCH_DIR}" "${OUTPUT_DIR}"
+mkdir -p "${SCRATCH_DIR}" "${OUTPUT_DIR}"
 
 source "${CONDA_SH}"
 conda activate "${CONDA_ENV_NAME}"
