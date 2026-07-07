@@ -67,9 +67,23 @@ The sbatch wrapper has cluster-friendly defaults and activates the `pmlr` conda
 environment.
 
 ```bash
-DATE=20260706 CYCLES="00" \
-sbatch -A pmlr_jobs -t 02:00 --export=ALL \
-  download/sbatch_nomads_gfs_fast.sh
+sbatch -A pmlr_jobs -t 02:00 download/sbatch_nomads_gfs_fast.sh
+```
+
+The GFS sbatch wrapper defaults to:
+
+- `START_DATE=20210501`
+- `END_DATE=20231231`
+- `CYCLES="00 06 12 18"`
+- `LEAD_HOURS="6 12 24 48 96 192"`
+- `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/gfs_fast`
+
+To turn the downloaded GFS GRIB2 files into native selected-field Zarr,
+WeatherBench2-regridded Zarr, and final NetCDF:
+
+```bash
+MODEL=gfs sbatch -A pmlr_jobs -t 04:00 --export=ALL \
+  download/sbatch_process_fast_surface_forecasts.sh
 ```
 
 ## GEFS
@@ -103,13 +117,17 @@ sbatch -A pmlr_jobs -t 02:00 --export=ALL \
   download/sbatch_nomads_gefs_fast.sh
 ```
 
-For a range:
+To turn the downloaded GEFS GRIB2 files into native selected-field Zarr,
+WeatherBench2-regridded Zarr, and final NetCDF:
 
 ```bash
-START_DATE=20260701 END_DATE=20260706 CYCLES="00 06 12 18" \
-sbatch -A pmlr_jobs -t 02:00 --export=ALL \
-  download/sbatch_nomads_gfs_fast.sh
+MODEL=gefs sbatch -A pmlr_jobs -t 04:00 --export=ALL \
+  download/sbatch_process_fast_surface_forecasts.sh
 ```
+
+The processing wrapper uses `cfgrib`/`xarray` to make a native selected-field
+Zarr, calls WeatherBench2's `scripts/regrid.py` with conservative regridding to
+`240x121`, then converts the regridded Zarr to NetCDF by default.
 
 ## Backend Choice
 
