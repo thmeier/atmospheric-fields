@@ -15,7 +15,7 @@
 #   CYCLES="00"
 #   LEAD_HOURS="6 12 24 48 96 192"
 #   MEMBERS="0"       # use "all" for control + 30 perturbed members
-#   OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/gefs_fast
+#   OUTPUT_DIR=/work/scratch/yelberkennou/gefs_fast
 #   CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh
 #   CONDA_ENV_NAME=pmlr
 
@@ -25,7 +25,7 @@ REPO_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
-OUTPUT_DIR="${OUTPUT_DIR:-/cluster/courses/pmlr/teams/team07/data/gefs_fast}"
+OUTPUT_DIR="${OUTPUT_DIR:-/work/scratch/yelberkennou/gefs_fast}"
 BASE_URL="${BASE_URL:-https://noaa-gefs-pds.s3.amazonaws.com}"
 DATE="${DATE:-}"
 START_DATE="${START_DATE:-20201001}"

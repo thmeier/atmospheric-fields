@@ -76,7 +76,7 @@ The GFS sbatch wrapper defaults to:
 - `END_DATE=20231231`
 - `CYCLES="00 06 12 18"`
 - `LEAD_HOURS="6 12 24 48 96 192"`
-- `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/gfs_fast`
+- `OUTPUT_DIR=/work/scratch/yelberkennou/gfs_fast`
 
 To turn the downloaded GFS GRIB2 files into native selected-field Zarr,
 WeatherBench2-regridded Zarr, and final NetCDF:
@@ -107,7 +107,7 @@ The GEFS sbatch wrapper defaults to:
 - `CYCLES="00"`
 - `MEMBERS="0"`
 - `LEAD_HOURS="6 12 24 48 96 192"`
-- `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/gefs_fast`
+- `OUTPUT_DIR=/work/scratch/yelberkennou/gefs_fast`
 
 All GEFS members:
 
@@ -128,6 +128,16 @@ MODEL=gefs sbatch -A pmlr_jobs -t 04:00 --export=ALL \
 The processing wrapper uses `cfgrib`/`xarray` to make a native selected-field
 Zarr, calls WeatherBench2's `scripts/regrid.py` with conservative regridding to
 `240x121`, then converts the regridded Zarr to NetCDF by default.
+
+By default, the processing wrapper also writes to scratch:
+
+- GFS input GRIB2: `/work/scratch/yelberkennou/gfs_fast`
+- GFS processed outputs: `/work/scratch/yelberkennou/gfs_fast_processed`
+- GEFS input GRIB2: `/work/scratch/yelberkennou/gefs_fast`
+- GEFS processed outputs: `/work/scratch/yelberkennou/gefs_fast_processed`
+
+Override `OUTPUT_DIR` explicitly only for artifacts that should be copied to
+the shared course data directory.
 
 ## Backend Choice
 
