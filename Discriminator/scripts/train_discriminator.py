@@ -83,6 +83,10 @@ def validate_no_train_test_overlap(cfg):
         ("fake", cfg.get("train_fake_range"), cfg.get("test_fake_range")),
     ]
     for name, train_ranges, test_ranges in checks:
+        # K-fold reuses forecast periods as fake train/test data, but ERA5
+        # train/test overlap should still fail so real test samples stay masked.
+        if name == "fake" and cfg.get("allow_fake_train_test_overlap", False):
+            continue
         for train_range in _as_time_ranges(train_ranges):
             for test_range in _as_time_ranges(test_ranges):
                 if _time_ranges_overlap(train_range, test_range):
@@ -287,7 +291,7 @@ class WeatherDiscriminatorDataset(Dataset):
                  augment=False, augment_prob=0.5, disturb_type=None, disturb_level=0.0,
                  corruption_types=None, corruption_severity_max=1.0,
                  corruption_severity_power=2.0, field_corruption_prob=0.5,
-                 max_samples=0, exclude_real_from_fake_timeframes=False):
+                 max_samples=0):
         self.variables = variables
         self.balanced = balanced
         self.augment = augment
@@ -320,12 +324,9 @@ class WeatherDiscriminatorDataset(Dataset):
             self.fake_sources = [self.fake_ds]
             self.fake_range_applied = False
 
-        if exclude_real_from_fake_timeframes:
-            self.real_ds = self._exclude_real_timeframes_from_fake_sources(self.real_ds, self.fake_sources)
-
         self.real_times = self.real_ds.time.values
         if len(self.real_times) == 0:
-            raise ValueError("No real samples remain after applying time range and fake-timeframe exclusion.")
+            raise ValueError("No real samples remain after applying train_real_range.")
 
         missing_real = [v for v in self.variables if v not in self.real_ds.data_vars]
         missing_fake_by_source = [
@@ -440,70 +441,6 @@ class WeatherDiscriminatorDataset(Dataset):
             return ds
         indices = np.linspace(0, n_time - 1, max_samples, dtype=int)
         return ds.isel(time=indices)
-
-    @staticmethod
-    def _timeframe(ds):
-        """Return the inclusive time span covered by a non-empty dataset."""
-        if "time" not in ds.coords or ds.sizes.get("time", 0) == 0:
-            return None
-        times = ds.time.values
-        return times.min(), times.max()
-
-    @classmethod
-    def _merged_timeframes(cls, datasets):
-        """Return the union of time spans covered by several datasets."""
-        spans = [cls._timeframe(ds) for ds in datasets]
-        spans = sorted((span for span in spans if span is not None), key=lambda span: span[0])
-        if not spans:
-            return []
-
-        merged = [spans[0]]
-        for start, end in spans[1:]:
-            current_start, current_end = merged[-1]
-            if start <= current_end:
-                merged[-1] = (current_start, max(current_end, end))
-            else:
-                merged.append((start, end))
-        return merged
-
-    @classmethod
-    def _exclude_real_timeframes_from_fake_sources(cls, real_ds, fake_sources):
-        """Remove ERA5 times that overlap the fake-source time spans.
-
-        K-fold holdout is about leaving out a forecast model, but the configured
-        fake files may still include 2018/2020 verification periods. Excluding
-        the union of those fake timeframes from ERA5 prevents the discriminator
-        from seeing real samples from periods later used as forecast test data.
-        """
-        if "time" not in real_ds.coords:
-            return real_ds
-
-        keep_mask = np.ones(real_ds.sizes.get("time", 0), dtype=bool)
-        excluded_spans = []
-        real_times = real_ds.time.values
-
-        for start, end in cls._merged_timeframes(fake_sources):
-            in_fake_span = (real_times >= start) & (real_times <= end)
-            if np.any(in_fake_span):
-                keep_mask &= ~in_fake_span
-                excluded_spans.append((start, end, int(np.count_nonzero(in_fake_span))))
-
-        if not excluded_spans:
-            print("Real-timeframe exclusion enabled, but no ERA5 times overlapped fake data.")
-            return real_ds
-
-        before = real_ds.sizes.get("time", 0)
-        filtered = real_ds.isel(time=keep_mask)
-        after = filtered.sizes.get("time", 0)
-        span_summary = "; ".join(
-            f"{start} to {end} ({count} ERA5 steps)"
-            for start, end, count in excluded_spans
-        )
-        print(
-            "Excluded ERA5/reference samples overlapping fake-source timeframes: "
-            f"{before - after} removed, {after} kept. Spans: {span_summary}"
-        )
-        return filtered
 
     def __len__(self):
         if self.balanced:
@@ -699,7 +636,6 @@ def main(cfg: DictConfig):
         corruption_severity_power=cfg.get("corruption_severity_power", 2.0),
         field_corruption_prob=cfg.get("field_corruption_prob", 0.5),
         max_samples=cfg.get("max_samples", 0),
-        exclude_real_from_fake_timeframes=cfg.get("exclude_real_from_fake_timeframes", False),
     )
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     

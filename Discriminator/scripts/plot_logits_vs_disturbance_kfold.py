@@ -9,69 +9,26 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from scipy.ndimage import gaussian_filter
 from omegaconf import DictConfig
 
 try:
     from .analysis_utils import normalization_stats
-    from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+    from .corruptions import get_corruption_ladder
+    from .train_discriminator import (
+        WeatherDiscriminator,
+        apply_configured_corruption,
+        safe_open_dataset,
+        select_time_ranges,
+    )
 except ImportError:
     from analysis_utils import normalization_stats
-    from train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
-
-
-# These analysis-only disturbances include probes that the discriminator may not
-# have seen during training, so they should be interpreted as sensitivity tests.
-def apply_gaussian_blur(data, sigma):
-    """Blur one 2D field with a Gaussian filter of width `sigma`."""
-    if sigma == 0: return data
-    return gaussian_filter(data, sigma=sigma)
-
-def apply_hf_noise(data, std_dev):
-    """Add independent Gaussian noise to every grid cell."""
-    if std_dev == 0: return data
-    noise = np.random.normal(0, std_dev, data.shape)
-    return data + noise
-
-def apply_grf_noise(data, amplitude, length_scale=2.0):
-    """Add smooth spatially correlated Gaussian noise to one field."""
-    if amplitude == 0: return data
-    white_noise = np.random.normal(0, 1, data.shape)
-    grf = gaussian_filter(white_noise, sigma=length_scale)
-    grf = (grf - grf.mean()) / (grf.std() + 1e-8)
-    return data + amplitude * grf
-
-def apply_pixel_replace(data, fraction):
-    """Replace a random fraction of grid cells with field-scale Gaussian draws."""
-    if fraction == 0: return data
-    flat_data = data.flatten()
-    n_replace = int(fraction * len(flat_data))
-    indices = np.random.choice(len(flat_data), n_replace, replace=False)
-    flat_data[indices] = np.random.normal(np.mean(data), np.std(data), n_replace)
-    return flat_data.reshape(data.shape)
-
-def apply_patch_dropout(data, fraction, patch_size=8):
-    """Set a random fraction of square patches to the field mean."""
-    if fraction == 0: return data
-    h, w = data.shape
-    data_out = data.copy()
-    n_h, n_w = h // patch_size, w // patch_size
-    n_total = n_h * n_w
-    n_drop = int(fraction * n_total)
-    indices = np.random.choice(n_total, n_drop, replace=False)
-    for idx in indices:
-        r, c = (idx // n_w) * patch_size, (idx % n_w) * patch_size
-        data_out[r:r+patch_size, c:c+patch_size] = np.mean(data)
-    return data_out
-
-def apply_quantization(data, n_levels):
-    """Quantize a field to `n_levels` evenly spaced values."""
-    if n_levels >= 256 or n_levels <= 0: return data
-    d_min, d_max = data.min(), data.max()
-    if d_max == d_min: return data
-    data_norm = (data - d_min) / (d_max - d_min)
-    data_q = np.round(data_norm * (n_levels - 1)) / (n_levels - 1)
-    return data_q * (d_max - d_min) + d_min
+    from corruptions import get_corruption_ladder
+    from train_discriminator import (
+        WeatherDiscriminator,
+        apply_configured_corruption,
+        safe_open_dataset,
+        select_time_ranges,
+    )
 
 class DisturbanceInferenceDataset(Dataset):
     """Apply one disturbance level to ERA5 samples before discriminator scoring."""
@@ -108,29 +65,14 @@ class DisturbanceInferenceDataset(Dataset):
         for v in self.variables:
             if v in ds_slice.data_vars:
                 raw_data = ds_slice[v].values.astype(np.float32)
-                
-                if self.disturbance_type == "blur":
-                    disturbed = apply_gaussian_blur(raw_data, self.severity)
-                elif self.disturbance_type == "noise":
-                    disturbed = apply_hf_noise(raw_data, self.severity * self.stds[v])
-                elif self.disturbance_type == "grf":
-                    disturbed = apply_grf_noise(raw_data, self.severity * self.stds[v])
-                elif self.disturbance_type == "replace":
-                    disturbed = apply_pixel_replace(raw_data, self.severity)
-                elif self.disturbance_type == "patch":
-                    disturbed = apply_patch_dropout(raw_data, self.severity)
-                elif self.disturbance_type == "quant":
-                    disturbed = apply_quantization(raw_data, self.severity)
-                else:
-                    disturbed = raw_data
-                
-                norm = (disturbed - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0)
+                norm = (raw_data - self.means[v]) / (self.stds[v] if self.stds[v] > 1e-8 else 1.0)
                 channels.append(np.nan_to_num(norm, nan=0.0))
             else:
                 ref_shape = ds_slice.temperature.shape if 'temperature' in ds_slice.data_vars else list(ds_slice.data_vars.values())[0].shape
                 channels.append(np.zeros(ref_shape, dtype=np.float32))
 
-        return torch.tensor(np.stack(channels), dtype=torch.float32)
+        sample = torch.tensor(np.stack(channels), dtype=torch.float32)
+        return apply_configured_corruption(sample, self.disturbance_type, self.severity)
 
 def get_mean_logit(dataset, model, cfg, device):
     """Return mean and standard deviation of discriminator logits."""
@@ -145,25 +87,23 @@ def get_mean_logit(dataset, model, cfg, device):
 
 
 DISTURBANCE_CATALOG = {
-    "blur": {"name": "Gaussian Blur", "levels": [0, 0.5, 1.5, 3.0, 5.0], "xlabel": "Sigma"},
-    "noise": {"name": "HF Noise", "levels": [0, 0.1, 0.3, 0.6, 1.0], "xlabel": "Amplitude (rel to std)"},
-    "grf": {"name": "GRF Noise", "levels": [0, 0.1, 0.3, 0.6, 1.0], "xlabel": "Amplitude (rel to std)"},
-    "replace": {"name": "Pixel Replace", "levels": [0, 0.05, 0.15, 0.3, 0.5], "xlabel": "Fraction"},
-    "patch": {"name": "Patch Replace", "levels": [0, 0.05, 0.15, 0.3, 0.5], "xlabel": "Fraction"},
-    "quant": {"name": "Quantization", "levels": [256, 64, 32, 16, 8, 4], "xlabel": "Levels"},
+    "gaussian_blur": {"name": "Gaussian Blur", "xlabel": "Severity"},
+    "grf": {"name": "GRF Noise", "xlabel": "Severity"},
+    "pixel_replace": {"name": "Pixel Replace", "xlabel": "Severity"},
+    "wind_patch_shuffle": {"name": "Wind Patch Shuffle", "xlabel": "Severity"},
+    "hf_noise": {"name": "HF Noise", "xlabel": "Severity"},
+    "wind_rotation": {"name": "Wind Vector Rotation", "xlabel": "Severity"},
 }
 
 DISTURBANCE_ALIASES = {
-    "gaussian_blur": "blur",
-    "hf_noise": "noise",
-    "high_freq_noise": "noise",
+    "blur": "gaussian_blur",
+    "noise": "hf_noise",
+    "high_freq_noise": "hf_noise",
     "grf_noise": "grf",
     "gaussian_field_noise": "grf",
-    "pixel_replace": "replace",
-    "random_pixel_replace": "replace",
-    "patch_replace": "patch",
-    "patch_dropout": "patch",
-    "quantization": "quant",
+    "random_pixel_replace": "pixel_replace",
+    "wind_shuffled": "wind_patch_shuffle",
+    "wind_rotated": "wind_rotation",
 }
 
 
@@ -226,6 +166,7 @@ def configured_disturbances(cfg):
         if dtype not in DISTURBANCE_CATALOG or dtype in disturbances:
             continue
         dinfo = dict(DISTURBANCE_CATALOG[dtype])
+        dinfo["levels"] = get_corruption_ladder(dtype, n_steps=int(cfg.get("corruption_kfold_plot_steps", 7)))
         dinfo["held_out"] = dtype in held_out_set
         if dinfo["held_out"]:
             dinfo["name"] = f"{dinfo['name']} (Holdout)"
@@ -343,7 +284,17 @@ def main(cfg: DictConfig):
     v = cfg.selected_variable
     plot_configs = {'u_component_of_wind': 'viridis', 'v_component_of_wind': 'viridis', 'wind_speed': 'viridis', 'temperature': 'inferno', 'specific_humidity': 'GnBu'}
     cmap = plot_configs.get(v, 'viridis')
-    raw_sample = sample_ds[v].values.astype(np.float32)
+    channel_idx = model_vars.index(v) if v in model_vars else 0
+    sample_channels = []
+    for variable in model_vars:
+        if variable in sample_ds.data_vars:
+            raw = sample_ds[variable].values.astype(np.float32)
+            scale = stds[variable] if stds[variable] > 1e-8 else 1.0
+            sample_channels.append(np.nan_to_num((raw - means[variable]) / scale, nan=0.0))
+        else:
+            ref = sample_ds[v] if v in sample_ds.data_vars else list(sample_ds.data_vars.values())[0]
+            sample_channels.append(np.zeros(ref.shape, dtype=np.float32))
+    clean_sample = torch.tensor(np.stack(sample_channels), dtype=torch.float32)
     n_types, n_levels = len(disturbances), 5
     fig_vis, axes_vis = plt.subplots(n_types, n_levels, figsize=(4 * n_levels, 4 * n_types), subplot_kw={'projection': ccrs.PlateCarree()})
     axes_vis = np.asarray(axes_vis).reshape(n_types, n_levels)
@@ -351,13 +302,9 @@ def main(cfg: DictConfig):
         levels = dinfo["levels"][:n_levels]
         for j, level in enumerate(levels):
             ax = axes_vis[i, j]
-            if dtype == "blur": data = apply_gaussian_blur(raw_sample, level)
-            elif dtype == "noise": data = apply_hf_noise(raw_sample, level * stds[v])
-            elif dtype == "grf": data = apply_grf_noise(raw_sample, level * stds[v])
-            elif dtype == "replace": data = apply_pixel_replace(raw_sample, level)
-            elif dtype == "patch": data = apply_patch_dropout(raw_sample, level)
-            elif dtype == "quant": data = apply_quantization(raw_sample, level)
-            else: data = raw_sample
+            corrupted = apply_configured_corruption(clean_sample.clone(), dtype, float(level))
+            scale = stds[v] if stds[v] > 1e-8 else 1.0
+            data = corrupted[channel_idx].detach().cpu().numpy().astype(np.float32) * scale + means[v]
             da_plot = sample_ds[v].copy(deep=True, data=data)
             da_plot.plot(ax=ax, x="longitude", y="latitude", transform=ccrs.PlateCarree(), cmap=cmap, add_colorbar=False, robust=True)
             ax.coastlines(); ax.add_feature(cfeature.BORDERS, alpha=0.5)

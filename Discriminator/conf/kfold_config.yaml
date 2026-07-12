@@ -100,18 +100,124 @@ augment_prob: 0.5
 # At least one channel is always corrupted.
 field_corruption_prob: 0.5
 
-# Training-time augmentation corruption pool. These names are consumed by
-# scripts/train_discriminator.py.
+# Training-time augmentation corruption pool for the model k-fold experiment.
+# These names are consumed by scripts/train_discriminator.py. HF noise and wind
+# vector rotation are deliberately excluded here and listed below as held-out
+# corruption probes.
 corruption_types:
+  - "gaussian_blur"
+  - "grf"
+  - "pixel_replace"
+  - "wind_patch_shuffle"
+
+# Corruption families intentionally held out from training-time augmentation.
+held_out_corruption_types:
+  - "hf_noise"
+  - "wind_rotation"
+
+# Leave-one-corruption-group-out experiment. These must be train-time
+# corruptions from scripts/train_discriminator.py. The wind corruptions assume
+# U/V channels are present in `variables`.
+corruption_kfold_types:
   - "gaussian_blur"
   - "hf_noise"
   - "grf"
   - "pixel_replace"
+  - "wind_patch_shuffle"
+  - "wind_rotation"
 
-# Corruption families intentionally held out from training-time augmentation.
-held_out_corruption_types:
-  - "patch_replace"
-  - "quantization"
+# Each entry is one fold's held-out corruption list. The model for that fold is
+# trained on `corruption_kfold_types` minus this list.
+corruption_kfold_holdouts:
+  - ["hf_noise", "wind_rotation"]
+  - ["gaussian_blur", "grf"]
+  - ["pixel_replace", "wind_patch_shuffle"]
+
+# Number of corruption strengths evaluated per corruption family.
+corruption_kfold_plot_steps: 7
+
+# ERA5 samples per corruption-strength point during plotting.
+corruption_kfold_eval_samples: 100
+
+# Distributional spatial-realism metric baseline. These compare candidate
+# sample distributions against the ERA5/reference distribution, without
+# per-sample forecast/truth pairing.
+standard_metric_real_nc_file: "${data_dir}/nonsurf/era5-gt_1.5deg_2004-01-01_2023-12-31.nc"
+standard_metric_comparison_files:
+  "GraphCast": "${data_dir}/nonsurf/graphcast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "Pangu-Weather": "${data_dir}/nonsurf/pangu_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "FuXi": "${data_dir}/nonsurf/fuxi_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "Keisler": "${data_dir}/nonsurf/keisler_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "NeuralGCM": "${data_dir}/nonsurf/neuralgcm_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "SphericalCNN": "${data_dir}/nonsurf/sphericalcnn_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "IFS HRES": "${data_dir}/nonsurf/ifs-hres_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+  "ERA5 Forecast": "${data_dir}/nonsurf/era5-forecast_6steps_1.5deg_2020-01-01_2020-12-31.nc"
+standard_metric_test_fake_range:
+  - ["2020-01-01", "2020-12-31"]
+standard_metric_test_real_ranges:
+  - ["2020-01-01", "2020-12-31"]
+standard_metrics:
+  - "mean_bias"
+  - "std_ratio_error"
+  - "crps_like_field_energy"
+  # This is the expensive metric: one zonal FFT per sample/field.
+  - "zonal_energy_spectrum_l2"
+  - "sliced_wasserstein"
+  - "sliced_wasserstein_lon_corrected"
+  - "mmd_rbf"
+  - "scwd"
+
+# Defaults to `variables` when null.
+standard_metric_variables: null
+
+# Forecast/ERA5 samples per lead or corruption-strength point.
+standard_metric_eval_samples: 100
+
+# Drop invalid fields such as all-zero or near-constant forecast samples before
+# computing distribution baselines. This protects against zero-filled missing
+# fields in forecast files.
+standard_metric_filter_invalid_fields: true
+standard_metric_invalid_zero_atol: 1e-12
+standard_metric_invalid_min_std: 1e-12
+
+# Scalar field values retained per variable for mean and standard-deviation
+# summaries.
+standard_metric_value_samples: 20000
+
+# CRPS-like field energy uses pairwise cosine-latitude-weighted L1 distances
+# between complete fields. Smaller chunks reduce memory at the cost of runtime.
+standard_metric_field_energy_chunk_size: 4
+
+# Sliced-Wasserstein settings. `standard_metric_swd_pixels` caps the flattened
+# spatial dimensions used per field; `standard_metric_swd_projections` controls
+# the number of random 1D projections.
+standard_metric_swd_pixels: 4096
+standard_metric_swd_projections: 64
+standard_metric_swd_seed: 0
+
+# RBF-MMD settings. The default null bandwidth uses the pooled median-distance
+# heuristic on ERA5-standardized, cosine-latitude-weighted field vectors.
+standard_metric_mmd_bandwidth: null
+standard_metric_mmd_standardize: true
+
+# SCWD settings following Garrett et al. (2024): a 60x120 convolution-center
+# grid, 361x720 nearest-neighbor approximation grid, 1000 km compact Wendland
+# radius, r=2, and 200 quantiles. For multi-field metrics, each spatial filter
+# is paired with random unit channel weights so it maps the joint state to a
+# scalar response before the usual 1D Wasserstein/quantile comparison.
+standard_metric_scwd_anchor_lat_points: 60
+standard_metric_scwd_anchor_lon_points: 120
+standard_metric_scwd_domain_lat_points: 361
+standard_metric_scwd_domain_lon_points: 720
+standard_metric_scwd_radius_km: 1000.0
+standard_metric_scwd_order: 2.0
+standard_metric_scwd_quantiles: 200
+standard_metric_scwd_channel_projections: 16
+
+# Defaults to `corruption_kfold_types` when null.
+standard_metric_corruptions: null
+standard_metric_corruption_steps: 7
+standard_metric_corruption_max_severity: 2.0
 
 # Maximum sampled corruption severity.
 corruption_severity_max: 1.0
@@ -143,6 +249,10 @@ output_dir: "results"
 # Destination for k-fold discriminator checkpoints. Plots remain under
 # `output_dir`.
 kfold_checkpoint_dir: "${output_dir}/kfold_checkpoints"
+
+# Destination for leave-one-corruption-out checkpoints. Plots remain under
+# `output_dir`.
+corruption_kfold_checkpoint_dir: "${output_dir}/corruption_kfold_checkpoints"
 
 # Named files used by comparison plots and k-fold training. Numerical models are
 # intentionally excluded from the neural-model training pool in scripts/train_kfold.py.

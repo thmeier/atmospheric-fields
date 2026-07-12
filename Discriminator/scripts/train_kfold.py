@@ -165,11 +165,18 @@ def fake_file_union_ranges(train_files):
 
 
 def kfold_time_ranges(cfg, train_files):
-    """Return fake model-time union and ERA5 complement for one k-fold subrun."""
-    fake_union_ranges = fake_file_union_ranges(train_files)
+    """Return train/test ranges for one k-fold subrun.
+
+    The forecast files define the k-fold test period.  Forecast fake samples are
+    trained and tested on that model-time union, while ERA5/reference training
+    samples use the complement so the discriminator never sees ground-truth
+    samples from the test period as real training examples.
+    """
+    test_ranges = fake_file_union_ranges(train_files)
     real_available_range = [file_timeframe(cfg.real_nc_file)]
-    real_complement_ranges = complement_time_ranges(real_available_range, fake_union_ranges)
-    return fake_union_ranges, real_complement_ranges
+    train_real_ranges = complement_time_ranges(real_available_range, test_ranges)
+    train_fake_ranges = test_ranges
+    return train_fake_ranges, train_real_ranges, test_ranges
 
 
 def kfold_checkpoint_dir(cfg):
@@ -180,7 +187,7 @@ def kfold_checkpoint_dir(cfg):
 def build_train_command(cfg, train_files, output_filename):
     """Build a Hydra override command for one discriminator training run."""
     train_files_arg = "[" + ",".join(train_files) + "]"
-    fake_union_ranges, real_complement_ranges = kfold_time_ranges(cfg, train_files)
+    train_fake_ranges, train_real_ranges, test_ranges = kfold_time_ranges(cfg, train_files)
     return [
         sys.executable,
         "-u",
@@ -199,11 +206,11 @@ def build_train_command(cfg, train_files, output_filename):
         f"++num_workers={cfg.num_workers}",
         f"++max_samples={cfg.get('max_samples', 0)}",
         f"++precision={cfg.precision}",
-        f"++train_fake_range={hydra_ranges_arg(fake_union_ranges)}",
-        f"++train_real_range={hydra_ranges_arg(real_complement_ranges)}",
-        f"++test_fake_range={hydra_ranges_arg(fake_union_ranges)}",
-        f"++test_real_ranges={hydra_ranges_arg(fake_union_ranges)}",
-        "++skip_train_test_overlap_check=true",
+        f"++train_fake_range={hydra_ranges_arg(train_fake_ranges)}",
+        f"++train_real_range={hydra_ranges_arg(train_real_ranges)}",
+        f"++test_fake_range={hydra_ranges_arg(test_ranges)}",
+        f"++test_real_ranges={hydra_ranges_arg(test_ranges)}",
+        "++allow_fake_train_test_overlap=true",
         "++augment=true",
     ]
 
@@ -278,10 +285,10 @@ def main(cfg: DictConfig):
             continue
 
         print(f"Training on AI Pool: {[os.path.basename(f) for f in train_files]}")
-        fake_union_ranges, real_complement_ranges = kfold_time_ranges(cfg, train_files)
-        print(f"Training fake ranges: {fake_union_ranges}")
-        print(f"Training ERA5 ranges: {real_complement_ranges}")
-        print(f"Testing ranges: {fake_union_ranges}")
+        train_fake_ranges, train_real_ranges, test_ranges = kfold_time_ranges(cfg, train_files)
+        print(f"Training fake ranges: {train_fake_ranges}")
+        print(f"Training ERA5 ranges: {train_real_ranges}")
+        print(f"Testing ranges masked from ERA5 training: {test_ranges}")
 
         cmd = build_train_command(cfg, train_files, output_filename)
 
@@ -305,10 +312,10 @@ def main(cfg: DictConfig):
     require_train_files(train_files, "full-pool k-fold training")
     
     if train_files_key not in trained_models:
-        fake_union_ranges, real_complement_ranges = kfold_time_ranges(cfg, train_files)
-        print(f"Training fake ranges: {fake_union_ranges}")
-        print(f"Training ERA5 ranges: {real_complement_ranges}")
-        print(f"Testing ranges: {fake_union_ranges}")
+        train_fake_ranges, train_real_ranges, test_ranges = kfold_time_ranges(cfg, train_files)
+        print(f"Training fake ranges: {train_fake_ranges}")
+        print(f"Training ERA5 ranges: {train_real_ranges}")
+        print(f"Testing ranges masked from ERA5 training: {test_ranges}")
         cmd = build_train_command(cfg, train_files, output_filename)
         print(f"Executing command: {' '.join(cmd)}")
         subprocess.run(cmd, check=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
