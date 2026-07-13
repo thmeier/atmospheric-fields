@@ -107,6 +107,247 @@ Train k-fold holdout discriminators:
 python scripts/train_kfold.py
 ```
 
+### K-Fold Experiment
+
+The k-fold experiment is configured by `conf/kfold_config.yaml`. It trains one
+discriminator per neural forecast model by holding that model out and training
+on all configured non-held-out neural forecast files in `fake_nc_file`. It also
+trains a full-pool discriminator for numerical-model comparisons. The current
+multi-field configuration uses `temperature`, `u_component_of_wind`, and
+`v_component_of_wind`, so checkpoint names use the `all_fields` tag.
+Training-time augmentation uses the configured `corruption_types`; the current
+model k-fold setup trains on `gaussian_blur`, `grf`, `pixel_replace`, and
+`wind_patch_shuffle`, while leaving `hf_noise` and `wind_rotation` as held-out
+corruption probes. These held-out corruptions do not define the k-fold split;
+the k-fold split is still the forecast model holdout.
+
+On the cluster, run:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 02:00 bash run_finetune_kfold.sh
+```
+
+For a quick smoke test:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+MAX_SAMPLES=128 EPOCHS=1 BATCH_SIZE=8 NUM_WORKERS=0 \
+srun -A pmlr -t 00:10 bash run_finetune_kfold.sh
+```
+
+K-fold checkpoints are written to:
+
+```text
+results/kfold_checkpoints/
+```
+
+Generate the lead-time comparison plot:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_lead_time_kfold.py
+```
+
+Generate the disturbance sensitivity plots:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_disturbance_kfold.py
+```
+
+This evaluates all model-holdout k-fold checkpoints against every configured
+training corruption plus the held-out corruption probes, labeling the held-out
+probe curves in the plot title.
+
+### Corruption K-Fold Experiment
+
+The corruption k-fold experiment uses the same forecast/ERA5 time split as the
+model k-fold experiment, but the fold axis is a configured list of synthetic
+corruptions. Each entry in `corruption_kfold_holdouts` is a list of corruption
+families held out together; the corresponding discriminator is trained on
+`corruption_kfold_types` minus that list.
+
+Run the grouped corruption-holdout training:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 02:00 bash run_corruption_kfold.sh
+```
+
+For a quick smoke test:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+MAX_SAMPLES=128 EPOCHS=1 BATCH_SIZE=8 NUM_WORKERS=0 \
+srun -A pmlr -t 00:10 bash run_corruption_kfold.sh
+```
+
+Checkpoints are written to:
+
+```text
+results/corruption_kfold_checkpoints/
+```
+
+Plot logits versus corruption strength. This writes three views: all curves,
+trained-on corruption curves only, and held-out corruption curves only.
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_corruption_kfold.py
+```
+
+### Standard Metric Baselines
+
+The standard baseline experiment computes distributional spatial-realism scores
+on the same lead-time and synthetic-corruption axes used by the discriminator
+plots. It compares candidate sample distributions against an ERA5/reference
+distribution; it does not use paired forecast/ground-truth samples. The basic
+summary metrics are `mean_bias`, `std_ratio_error`,
+`crps_like_field_energy`, and `zonal_energy_spectrum_l2`.
+`crps_like_field_energy` is the CRPS-style half-energy distance
+`E d(X,Y) - 0.5 E d(X,X') - 0.5 E d(Y,Y')`, where `d` is a
+cosine-latitude-weighted mean absolute difference between complete fields. Lower
+`standard_metric_field_energy_chunk_size` if this metric uses too much memory.
+The config also enables `sliced_wasserstein` and `sliced_wasserstein_lon_corrected`,
+which compare flattened spatial-field distributions with random 1D projections.
+The uncorrected version treats every latitude-longitude grid point equally. The
+`sliced_wasserstein_lon_corrected` name is kept for compatibility, but it now
+means surface-Jacobian corrected: vectors are weighted by `sqrt(cos(latitude))`
+before projection so equal areas on the sphere contribute equally. No sample is
+rotated or longitude-aligned. The config also
+enables `mmd_rbf`, a Gaussian-kernel maximum mean discrepancy on the same
+cosine-latitude-weighted field vectors. By default the MMD vectors are
+standardized with ERA5/reference moments and the RBF bandwidth is chosen by the
+pooled median-distance heuristic; override with `standard_metric_mmd_bandwidth`
+only when intentionally tuning the kernel scale. The config also enables
+`scwd`, following the Spherical Convolutional Wasserstein Distance
+algorithm from Garrett et al. (2024): compact Wendland kernels over chordal
+sphere distance, a regular 60x120 convolution-center grid, a 1000 km kernel
+radius, r=2, 200 quantiles, and a 361x720 nearest-neighbor approximation grid
+that is sparsely aggregated back to the loaded data grid. For multi-field
+metrics, each spatial filter is paired with random unit channel weights so the
+joint field is reduced directly to one scalar response before the usual 1D
+Wasserstein/quantile comparison. Adjust
+`standard_metric_scwd_anchor_lat_points`,
+`standard_metric_scwd_anchor_lon_points`, `standard_metric_scwd_domain_lat_points`,
+`standard_metric_scwd_domain_lon_points`, or `standard_metric_scwd_quantiles` only
+when intentionally trading comparability for runtime.
+
+Run the baseline metrics:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_standard_metric_baselines.py
+```
+
+The default command uses `conf/kfold_config.yaml` and therefore the `nonsurf/`
+files. To run the same baseline on the surface files in `conf/config.yaml`, use:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_standard_metric_baselines.py --config-name config
+```
+
+Outputs:
+
+```text
+results/standard_distribution_metric_baselines.csv
+results/standard_distribution_metrics_vs_lead_time_all_fields.png
+results/standard_distribution_<metric>_vs_corruption_strength_all_fields.png
+results/standard_distribution_metrics_vs_corruption_strength_all_fields.png
+results/standard_distribution_<metric>_vs_corruption_strength_all_fields_combined.png
+```
+
+The configured variables are treated as one joint sample space. With multiple
+fields configured, the CSV and plots use `variable=all_fields`; to run a
+single-field metric baseline, set `standard_metric_variables` or `variables` to
+only that field. The joint metrics standardize each field with ERA5/reference
+moments before combining variables, so one unit-heavy field does not dominate
+the multi-field distances. `sliced_wasserstein`, `sliced_wasserstein_lon_corrected`,
+`mmd_rbf`, and the CRPS-like field-energy score operate on concatenated
+same-sample field states. The joint SCWD path uses random multi-channel
+spherical filters that map each standardized joint field to scalar responses,
+then compares those response distributions with the same 1D quantile
+Wasserstein step as scalar SCWD. SCWD does not rotate or longitude-align samples.
+
+The plots intentionally omit error bars. The CSV stores point estimates and the
+`n_samples` count only; uncertainty intervals should be added with an explicit
+bootstrap or other documented estimator.
+All-zero and near-constant fields are dropped by default via
+`standard_metric_filter_invalid_fields: true`; the CSV `n_samples` column shows
+how many valid samples remained for each point.
+
+Corruption-strength baselines use `standard_metric_corruption_steps` evenly
+spaced severities from 0 to `standard_metric_corruption_max_severity: 2.0` by
+default.
+
+To inspect the Keisler temperature outliers visually, generate side-by-side
+Keisler/ERA5/difference maps for the 12 h lead:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/visualize_keisler_temperature.py
+```
+
+By default this plots the five samples with largest absolute spatial-mean
+temperature bias. Override with `++visualize_sample_mode=even`,
+`++visualize_samples=5`, or `++visualize_lead_hour=12`. The visualizer skips
+all-zero or near-constant Keisler fields by default; pass
+`++visualize_include_invalid=true` to include them.
+
+Sliced-Wasserstein runtime is controlled by:
+
+```yaml
+standard_metric_swd_pixels: 4096
+standard_metric_swd_projections: 64
+standard_metric_swd_seed: 0
+```
+
+Train temporal holdout discriminators, one per forecast model with matching
+train/test-period files:
+
+```bash
+python scripts/train_temporal_holdout.py
+```
+
+### Temporal Holdout Experiment
+
+The temporal holdout experiment is configured by `conf/config.yaml`. It trains
+one discriminator per forecast model using that model's training-period forecast
+file as fake data and ERA5 from `train_real_range` as real data. It then
+evaluates each discriminator on the same forecast model's test-period file,
+using `test_fake_range` and the configured real test ranges. With the default
+multi-field config, checkpoint names use the `all_fields` tag.
+
+On the cluster, run:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 02:00 bash run_temporal_holdout.sh
+```
+
+For a quick smoke test:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+MAX_SAMPLES=128 EPOCHS=1 BATCH_SIZE=8 NUM_WORKERS=0 \
+srun -A pmlr -t 00:10 bash run_temporal_holdout.sh
+```
+
+Temporal holdout checkpoints are written to:
+
+```text
+results/temporal_holdout_checkpoints/
+```
+
+Generate the lead-time comparison plot:
+
+```bash
+DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
+srun -A pmlr -t 00:10 python scripts/plot_logits_vs_lead_time_temporal_holdout.py
+```
+
 Evaluate one trained discriminator:
 
 ```bash
@@ -118,6 +359,7 @@ Plot lead-time degradation:
 ```bash
 python scripts/plot_logits_vs_lead_time.py
 python scripts/plot_logits_vs_lead_time_kfold.py
+python scripts/plot_logits_vs_lead_time_temporal_holdout.py
 ```
 
 Plot sensitivity to synthetic disturbances:
@@ -237,18 +479,18 @@ The two poster discriminators:
 The k-fold runs use a different split principle from the poster train/test-time
 split above. Each leave-one-neural-model-out discriminator is trained with the
 held-out forecast model removed from the fake training pool; the other neural
-forecast model files are used. ERA5/reference data is not folded by model and,
-for these k-fold runs, should be understood as using the whole available ERA5
-data range configured for the experiment.
+forecast model files are used. Their filename date spans are merged into one
+model-time union. Forecast fake samples are drawn from that union, while
+ERA5/reference real samples are drawn from the complement of that union within
+the available ERA5 file span.
 
 The full-pool k-fold discriminator keeps all neural forecast model files in the
 fake training pool and is used for numerical-model comparisons.
 
-Because the k-fold setup uses the whole available ERA5/reference range, its
-configured train and test time ranges can overlap. Standard test accuracy/loss
-from `scripts/evaluate_discriminator.py` should therefore not be interpreted as
-independent held-out metrics for these k-fold checkpoints. The meaningful
-holdout axis is the omitted forecast model, not a disjoint ERA5 time split.
+For plotting, `test_real_ranges` and `test_fake_range` use the model-time union.
+This means the discriminator sees ERA5 real samples only outside the forecast
+evaluation periods during training, then scores ERA5 and forecast samples on the
+same model-time union at test time.
 
 Training sample composition:
 
@@ -353,8 +595,14 @@ results/weather_discriminator_<model_name>_<variable_tag>_lightning.pth
 K-fold training writes:
 
 ```text
-results/discriminator_<model_name>_<selected_variable>_exclude_<model>.pth
-results/discriminator_<model_name>_<selected_variable>_full_pool.pth
+results/kfold_checkpoints/discriminator_<model_name>_<variable_tag>_exclude_<model>.pth
+results/kfold_checkpoints/discriminator_<model_name>_<variable_tag>_full_pool.pth
+```
+
+Temporal holdout training writes:
+
+```text
+results/temporal_holdout_checkpoints/discriminator_<model_name>_<variable_tag>_temporal_<model>.pth
 ```
 
 Because normalization statistics are recomputed from the configured real-data
@@ -372,7 +620,6 @@ unless the change is intentional.
   setup.
 - The k-fold workflow assumes the configured neural forecast files can be
   resolved by filename convention. For leave-one-model-out folds, only the
-  held-out model is removed from the fake training pool; the remaining model
-  files and the configured full ERA5/reference range are used.
-- K-fold train/test time ranges may overlap, so test accuracy/loss is not a
-  meaningful held-out metric for those checkpoints.
+  held-out model is removed from the fake training pool.
+- K-fold training uses the union of the remaining fake-file date spans for fake
+  samples and the complement of that union for ERA5/reference samples.

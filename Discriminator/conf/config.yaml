@@ -119,6 +119,61 @@ project_name: "weather-discriminator"
 # Destination for model weights, plots, local CSV logs, and cache files.
 output_dir: "results"
 
+# Destination for temporal holdout experiment checkpoints. Plots remain under
+# `output_dir`.
+temporal_checkpoint_dir: "${output_dir}/temporal_holdout_checkpoints"
+
+# Distributional spatial-realism metric baseline on the surface files listed in
+# DATA_DIR. These compare candidate sample distributions against the
+# ERA5/reference distribution, without per-sample forecast/truth pairing.
+standard_metric_real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"
+standard_metric_comparison_files:
+  "GraphCast": "${data_dir}/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+  "Pangu-Weather": "${data_dir}/pangu_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+  "FuXi": "${data_dir}/fuxi_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+  "IFS HRES": "${data_dir}/ifs_hres_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+  "ERA5 Forecast": "${data_dir}/era5_forecast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+standard_metric_test_fake_range:
+  - ["2020-01-01", "2020-12-31"]
+standard_metric_test_real_ranges:
+  - ["2020-01-01", "2020-12-31"]
+standard_metrics:
+  - "mean_bias"
+  - "std_ratio_error"
+  - "crps_like_field_energy"
+  - "zonal_energy_spectrum_l2"
+  - "sliced_wasserstein"
+  - "sliced_wasserstein_lon_corrected"
+  - "mmd_rbf"
+  - "scwd"
+standard_metric_variables: null
+standard_metric_eval_samples: 100
+standard_metric_filter_invalid_fields: true
+standard_metric_invalid_zero_atol: 1e-12
+standard_metric_invalid_min_std: 1e-12
+standard_metric_value_samples: 20000
+standard_metric_field_energy_chunk_size: 4
+standard_metric_swd_pixels: 4096
+standard_metric_swd_projections: 64
+standard_metric_swd_seed: 0
+standard_metric_mmd_bandwidth: null
+standard_metric_mmd_standardize: true
+standard_metric_scwd_anchor_lat_points: 60
+standard_metric_scwd_anchor_lon_points: 120
+standard_metric_scwd_domain_lat_points: 361
+standard_metric_scwd_domain_lon_points: 720
+standard_metric_scwd_radius_km: 1000.0
+standard_metric_scwd_order: 2.0
+standard_metric_scwd_quantiles: 200
+standard_metric_scwd_channel_projections: 16
+standard_metric_corruptions:
+  - "blur"
+  - "grf"
+  - "pixel_replace"
+  - "wind_patch_shuffle"
+standard_metric_corruption_steps: 7
+standard_metric_corruption_max_severity: 2.0
+
 # Named files used by comparison plots and k-fold training. Numerical models are
 # intentionally excluded from the neural-model training pool in scripts/train_kfold.py.
 comparison_files:
