@@ -38,6 +38,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 try:
+    from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
         apply_configured_corruption,
         normalize_prediction_timedelta,
@@ -45,6 +46,7 @@ try:
         select_time_ranges,
     )
 except ImportError:
+    from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
         apply_configured_corruption,
         normalize_prediction_timedelta,
@@ -58,6 +60,7 @@ DEFAULT_METRICS = [
     "std_ratio_error",
     "crps_like_field_energy",
     "zonal_energy_spectrum_l2",
+    "zonal_energy_spectrum_log_l2",
     "sliced_wasserstein",
     "sliced_wasserstein_lon_corrected",
     "mmd_rbf",
@@ -71,6 +74,7 @@ AVAILABLE_METRICS = {
     "std_abs_diff",
     "crps_like_field_energy",
     "zonal_energy_spectrum_l2",
+    "zonal_energy_spectrum_log_l2",
     "sliced_wasserstein",
     "sliced_wasserstein_lon_corrected",
     "sliced_cramer_wold",
@@ -80,6 +84,7 @@ AVAILABLE_METRICS = {
 }
 
 _SCWD_WEIGHT_CACHE = {}
+_SCWD_TORCH_WEIGHT_CACHE = {}
 _FIELD_SELF_DISTANCE_CACHE = {}
 
 
@@ -87,6 +92,41 @@ def cfg_get(cfg, key, default):
     """Return a config value, treating explicit YAML null as missing."""
     value = cfg.get(key)
     return default if value is None else value
+
+
+def torch_metric_device(cfg):
+    """Return the configured Torch metric device, or None for NumPy metrics."""
+    if cfg is None:
+        return None
+    backend = str(cfg_get(cfg, "standard_metric_backend", "auto")).lower()
+    if backend in {"numpy", "np", "cpu"}:
+        return None
+    if backend not in {"auto", "torch", "cuda", "gpu"}:
+        raise ValueError("standard_metric_backend must be one of: auto, torch, cuda, gpu, numpy")
+    if backend == "auto" and not torch.cuda.is_available():
+        return None
+    configured_device = cfg_get(cfg, "standard_metric_device", None)
+    if configured_device is None:
+        configured_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(configured_device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        return None
+    return device
+
+
+def torch_metric_dtype(cfg):
+    """Return the floating dtype for Torch metric kernels."""
+    dtype_name = str(cfg_get(cfg, "standard_metric_dtype", "float32")).lower()
+    if dtype_name in {"float64", "double"}:
+        return torch.float64
+    if dtype_name in {"float32", "single"}:
+        return torch.float32
+    raise ValueError("standard_metric_dtype must be float32 or float64")
+
+
+def torch_tensor(values, device, dtype):
+    """Move a NumPy-like array to the metric device."""
+    return torch.as_tensor(np.asarray(values), dtype=dtype, device=device)
 
 
 def variables_from_config(cfg):
@@ -182,6 +222,22 @@ def zonal_energy_spectrum(values, latitudes):
     return np.average(power, axis=0, weights=latitude_weights(latitudes))
 
 
+def zonal_energy_spectrum_log_l2(candidate_spectrum, reference_spectrum, cfg):
+    """Root mean squared difference between log-power spectra."""
+    common_spectrum_len = min(candidate_spectrum.size, reference_spectrum.size)
+    if not common_spectrum_len:
+        return np.nan
+    candidate_values = np.maximum(np.asarray(candidate_spectrum[:common_spectrum_len], dtype=np.float64), 0.0)
+    reference_values = np.maximum(np.asarray(reference_spectrum[:common_spectrum_len], dtype=np.float64), 0.0)
+    finite_reference = reference_values[np.isfinite(reference_values)]
+    positive_reference = finite_reference[finite_reference > 0.0]
+    reference_scale = float(np.max(positive_reference)) if positive_reference.size else 1.0
+    eps_factor = float(cfg_get(cfg, "standard_metric_spectrum_log_eps_factor", 1e-12))
+    eps = max(reference_scale * eps_factor, np.finfo(np.float64).tiny)
+    diff = np.log(candidate_values + eps) - np.log(reference_values + eps)
+    return float(np.sqrt(np.nanmean(diff * diff))) if diff.size else np.nan
+
+
 def canonical_latlon(values, latitudes):
     """Return a 2D field in latitude-longitude order."""
     values = np.nan_to_num(np.asarray(values, dtype=np.float64))
@@ -238,8 +294,12 @@ def unweighted_field_vector(values, latitudes, max_pixels):
     return flat[indices]
 
 
-def sliced_wasserstein_distance(candidate_vectors, reference_vectors, n_projections, seed):
+def sliced_wasserstein_distance(candidate_vectors, reference_vectors, n_projections, seed, cfg=None):
     """Approximate Wasserstein distance with random 1D projections."""
+    device = torch_metric_device(cfg)
+    if device is not None:
+        return sliced_wasserstein_distance_torch(candidate_vectors, reference_vectors, n_projections, seed, cfg, device)
+
     candidate = np.asarray(candidate_vectors, dtype=np.float64)
     reference = np.asarray(reference_vectors, dtype=np.float64)
     if candidate.size == 0 or reference.size == 0:
@@ -268,6 +328,47 @@ def sliced_wasserstein_distance(candidate_vectors, reference_vectors, n_projecti
         reference_values = np.interp(reference_q, np.arange(reference_proj.size), reference_proj)
         distances.append(float(np.mean(np.abs(candidate_values - reference_values))))
     return float(np.mean(distances)) if distances else np.nan
+
+
+def sliced_wasserstein_distance_torch(candidate_vectors, reference_vectors, n_projections, seed, cfg, device):
+    """Approximate sliced Wasserstein with batched Torch projections."""
+    candidate = np.asarray(candidate_vectors, dtype=np.float64)
+    reference = np.asarray(reference_vectors, dtype=np.float64)
+    if candidate.size == 0 or reference.size == 0:
+        return np.nan
+    if candidate.ndim != 2 or reference.ndim != 2:
+        return np.nan
+    n_dim = min(candidate.shape[1], reference.shape[1])
+    if n_dim == 0:
+        return np.nan
+    candidate = candidate[:, :n_dim]
+    reference = reference[:, :n_dim]
+
+    rng = np.random.default_rng(seed)
+    directions = rng.normal(size=(int(n_projections), n_dim))
+    norms = np.linalg.norm(directions, axis=1)
+    keep = norms > 1e-12
+    if not np.any(keep):
+        return np.nan
+    directions = directions[keep] / norms[keep, None]
+
+    dtype = torch_metric_dtype(cfg)
+    candidate_t = torch_tensor(candidate, device, dtype)
+    reference_t = torch_tensor(reference, device, dtype)
+    directions_t = torch_tensor(directions.T, device, dtype)
+    quantiles = torch.linspace(
+        0.0,
+        1.0,
+        min(candidate_t.shape[0], reference_t.shape[0]),
+        dtype=dtype,
+        device=device,
+    )
+
+    candidate_proj = candidate_t @ directions_t
+    reference_proj = reference_t @ directions_t
+    candidate_q = torch.quantile(candidate_proj, quantiles, dim=0)
+    reference_q = torch.quantile(reference_proj, quantiles, dim=0)
+    return float(torch.mean(torch.abs(candidate_q - reference_q)).detach().cpu())
 
 
 def aligned_vector_sets(candidate_vectors, reference_vectors):
@@ -330,11 +431,53 @@ def mmd_rbf_distance(candidate_vectors, reference_vectors, cfg):
     candidate, reference = standardize_for_mmd(candidate_vectors, reference_vectors, cfg)
     if candidate is None:
         return np.nan
+    device = torch_metric_device(cfg)
+    if device is not None:
+        return mmd_rbf_distance_torch(candidate, reference, cfg, device)
     bandwidth = mmd_rbf_bandwidth(candidate, reference, cfg_get(cfg, "standard_metric_mmd_bandwidth", None))
     k_xx = rbf_kernel_mean(candidate, candidate, bandwidth)
     k_yy = rbf_kernel_mean(reference, reference, bandwidth)
     k_xy = rbf_kernel_mean(candidate, reference, bandwidth)
     return float(np.sqrt(max(k_xx + k_yy - 2.0 * k_xy, 0.0)))
+
+
+def squared_euclidean_distances_torch(left, right):
+    """Compute pairwise squared Euclidean distances in Torch."""
+    left_norm = torch.sum(left * left, dim=1, keepdim=True)
+    right_norm = torch.sum(right * right, dim=1, keepdim=True).T
+    return torch.clamp(left_norm + right_norm - 2.0 * (left @ right.T), min=0.0)
+
+
+def mmd_rbf_bandwidth_torch(candidate, reference, configured_bandwidth):
+    """Choose an RBF bandwidth on the metric device."""
+    if configured_bandwidth is not None and float(configured_bandwidth) > 0:
+        return torch.as_tensor(float(configured_bandwidth), dtype=candidate.dtype, device=candidate.device)
+    pooled = torch.cat([candidate, reference], dim=0)
+    distances = squared_euclidean_distances_torch(pooled, pooled)
+    positive = distances[distances > 1e-12]
+    if positive.numel() == 0:
+        return torch.as_tensor(1.0, dtype=candidate.dtype, device=candidate.device)
+    return torch.sqrt(torch.quantile(positive, 0.5))
+
+
+def rbf_kernel_mean_torch(left, right, bandwidth):
+    """Mean Gaussian RBF kernel value between two vector samples in Torch."""
+    distances = squared_euclidean_distances_torch(left, right)
+    scale = 2.0 * torch.clamp(bandwidth, min=1e-12) ** 2
+    return torch.mean(torch.exp(-distances / scale))
+
+
+def mmd_rbf_distance_torch(candidate, reference, cfg, device):
+    """Biased RBF-MMD distance with Torch pairwise distances."""
+    dtype = torch_metric_dtype(cfg)
+    candidate_t = torch_tensor(candidate, device, dtype)
+    reference_t = torch_tensor(reference, device, dtype)
+    bandwidth = mmd_rbf_bandwidth_torch(candidate_t, reference_t, cfg_get(cfg, "standard_metric_mmd_bandwidth", None))
+    k_xx = rbf_kernel_mean_torch(candidate_t, candidate_t, bandwidth)
+    k_yy = rbf_kernel_mean_torch(reference_t, reference_t, bandwidth)
+    k_xy = rbf_kernel_mean_torch(candidate_t, reference_t, bandwidth)
+    value = torch.sqrt(torch.clamp(k_xx + k_yy - 2.0 * k_xy, min=0.0))
+    return float(value.detach().cpu())
 
 
 def features_by_key(features):
@@ -559,6 +702,131 @@ def scwd_weight_vectors(reference, cfg):
     return weights
 
 
+def scwd_sparse_weight_matrix_torch(weights, n_pixels, cfg, device):
+    """Return a cached sparse anchor-by-pixel SCWD weight matrix."""
+    dtype = torch_metric_dtype(cfg)
+    cache_key = (id(weights), int(n_pixels), str(device), str(dtype))
+    if cache_key in _SCWD_TORCH_WEIGHT_CACHE:
+        return _SCWD_TORCH_WEIGHT_CACHE[cache_key]
+
+    rows = []
+    cols = []
+    values = []
+    row_idx = 0
+    for support, support_weights in weights:
+        if support.size == 0:
+            continue
+        rows.append(np.full(support.size, row_idx, dtype=np.int64))
+        cols.append(np.asarray(support, dtype=np.int64))
+        values.append(np.asarray(support_weights, dtype=np.float64))
+        row_idx += 1
+
+    if not rows:
+        matrix = None
+    else:
+        row_values = np.concatenate(rows)
+        col_values = np.concatenate(cols)
+        weight_values = np.concatenate(values)
+        indices = torch.as_tensor(np.stack([row_values, col_values]), dtype=torch.long, device=device)
+        data = torch.as_tensor(weight_values, dtype=dtype, device=device)
+        matrix = torch.sparse_coo_tensor(indices, data, size=(row_idx, int(n_pixels)), device=device).coalesce()
+
+    _SCWD_TORCH_WEIGHT_CACHE[cache_key] = matrix
+    return matrix
+
+
+def scwd_filter_responses_torch(fields, weight_matrix, cfg, device):
+    """Apply all SCWD spatial filters to a batch of fields."""
+    dtype = torch_metric_dtype(cfg)
+    fields_t = torch_tensor(fields, device, dtype).reshape(fields.shape[0], -1)
+    return torch.sparse.mm(weight_matrix, fields_t.T).T
+
+
+def spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device):
+    """Torch SCWD implementation for scalar fields."""
+    candidate_fields = np.asarray(candidate["fields"], dtype=np.float64)
+    reference_fields = np.asarray(reference["fields"], dtype=np.float64)
+    if candidate_fields.size == 0 or reference_fields.size == 0:
+        return np.nan
+    if candidate_fields.ndim != 3 or reference_fields.ndim != 3:
+        return np.nan
+    if candidate_fields.shape[1:] != reference_fields.shape[1:]:
+        return np.nan
+
+    weights = scwd_weight_vectors(reference, cfg)
+    weight_matrix = scwd_sparse_weight_matrix_torch(weights, candidate_fields.shape[1] * candidate_fields.shape[2], cfg, device)
+    if weight_matrix is None or weight_matrix.shape[0] == 0:
+        return np.nan
+
+    dtype = torch_metric_dtype(cfg)
+    r = float(cfg_get(cfg, "standard_metric_scwd_order", 2.0))
+    n_quantiles = int(cfg_get(cfg, "standard_metric_scwd_quantiles", 200))
+    quantiles = torch.linspace(0.0, 1.0, n_quantiles, dtype=dtype, device=device)
+
+    candidate_response = scwd_filter_responses_torch(candidate_fields, weight_matrix, cfg, device)
+    reference_response = scwd_filter_responses_torch(reference_fields, weight_matrix, cfg, device)
+    candidate_quantiles = torch.quantile(candidate_response, quantiles, dim=0)
+    reference_quantiles = torch.quantile(reference_response, quantiles, dim=0)
+    total = torch.sum(torch.abs(candidate_quantiles - reference_quantiles) ** r)
+    denom = float(weight_matrix.shape[0] * n_quantiles)
+    return float(((total / denom) ** (1.0 / r)).detach().cpu())
+
+
+def joint_spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device):
+    """Torch SCWD implementation for projected multi-channel fields."""
+    candidate_fields = np.asarray(candidate["channel_fields"], dtype=np.float64)
+    reference_fields = np.asarray(reference["channel_fields"], dtype=np.float64)
+    if candidate_fields.size == 0 or reference_fields.size == 0:
+        return np.nan
+    if candidate_fields.ndim != 4 or reference_fields.ndim != 4:
+        return np.nan
+    if candidate_fields.shape[1:] != reference_fields.shape[1:]:
+        return np.nan
+
+    weights = scwd_weight_vectors(reference, cfg)
+    n_pixels = candidate_fields.shape[2] * candidate_fields.shape[3]
+    weight_matrix = scwd_sparse_weight_matrix_torch(weights, n_pixels, cfg, device)
+    if weight_matrix is None or weight_matrix.shape[0] == 0:
+        return np.nan
+
+    dtype = torch_metric_dtype(cfg)
+    n_samples, n_channels = candidate_fields.shape[:2]
+    candidate_flat = torch_tensor(candidate_fields, device, dtype).reshape(n_samples, n_channels, n_pixels)
+    reference_flat = torch_tensor(reference_fields, device, dtype).reshape(reference_fields.shape[0], n_channels, n_pixels)
+
+    candidate_by_channel = torch.stack(
+        [torch.sparse.mm(weight_matrix, candidate_flat[:, channel_idx, :].T).T for channel_idx in range(n_channels)],
+        dim=1,
+    )
+    reference_by_channel = torch.stack(
+        [torch.sparse.mm(weight_matrix, reference_flat[:, channel_idx, :].T).T for channel_idx in range(n_channels)],
+        dim=1,
+    )
+
+    n_channel_projections = int(cfg_get(cfg, "standard_metric_scwd_channel_projections", 16))
+    seed = int(cfg_get(cfg, "standard_metric_swd_seed", 0))
+    rng = np.random.default_rng(seed)
+    channel_weights = rng.normal(size=(max(1, n_channel_projections), n_channels))
+    norms = np.linalg.norm(channel_weights, axis=1)
+    keep = norms > 1e-12
+    if not np.any(keep):
+        return np.nan
+    channel_weights = channel_weights[keep] / norms[keep, None]
+    channel_weights_t = torch_tensor(channel_weights, device, dtype)
+
+    candidate_slices = torch.einsum("sca,pc->psa", candidate_by_channel, channel_weights_t)
+    reference_slices = torch.einsum("sca,pc->psa", reference_by_channel, channel_weights_t)
+
+    r = float(cfg_get(cfg, "standard_metric_scwd_order", 2.0))
+    n_quantiles = int(cfg_get(cfg, "standard_metric_scwd_quantiles", 200))
+    quantiles = torch.linspace(0.0, 1.0, n_quantiles, dtype=dtype, device=device)
+    candidate_quantiles = torch.quantile(candidate_slices, quantiles, dim=1)
+    reference_quantiles = torch.quantile(reference_slices, quantiles, dim=1)
+    total = torch.sum(torch.abs(candidate_quantiles - reference_quantiles) ** r)
+    denom = float(channel_weights_t.shape[0] * weight_matrix.shape[0] * n_quantiles)
+    return float(((total / denom) ** (1.0 / r)).detach().cpu())
+
+
 def spherical_convolutional_wasserstein(candidate, reference, cfg):
     """Approximate SCWD using the quantile algorithm from Garrett et al. (2024)."""
     if np.asarray(candidate.get("channel_fields", [])).ndim == 4:
@@ -584,6 +852,10 @@ def spherical_convolutional_wasserstein(candidate, reference, cfg):
     weights = scwd_weight_vectors(reference, cfg)
     if not weights:
         return np.nan
+
+    device = torch_metric_device(cfg)
+    if device is not None:
+        return spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device)
 
     r = float(cfg_get(cfg, "standard_metric_scwd_order", 2.0))
     n_quantiles = int(cfg_get(cfg, "standard_metric_scwd_quantiles", 200))
@@ -622,6 +894,10 @@ def joint_spherical_convolutional_wasserstein(candidate, reference, cfg):
     weights = scwd_weight_vectors(reference, cfg)
     if not weights:
         return np.nan
+
+    device = torch_metric_device(cfg)
+    if device is not None:
+        return joint_spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device)
 
     n_channel_projections = int(cfg_get(cfg, "standard_metric_scwd_channel_projections", 16))
     seed = int(cfg_get(cfg, "standard_metric_swd_seed", 0))
@@ -896,47 +1172,66 @@ def distribution_features(
     return finalize_features(features, max_values)
 
 
-def distribution_metric_values(candidate, reference, cfg):
+def distribution_metric_values(candidate, reference, cfg, metric_names=None):
     """Compute scalar distributional metrics from candidate/reference features."""
-    candidate_spectrum = candidate["spectrum"]
-    reference_spectrum = reference["spectrum"]
-    common_spectrum_len = min(candidate_spectrum.size, reference_spectrum.size)
-    if common_spectrum_len:
-        spectrum_l2 = float(
-            np.linalg.norm(candidate_spectrum[:common_spectrum_len] - reference_spectrum[:common_spectrum_len])
-            / (np.linalg.norm(reference_spectrum[:common_spectrum_len]) + 1e-12)
-        )
-    else:
-        spectrum_l2 = np.nan
-
+    requested = set(metric_names or AVAILABLE_METRICS)
     n_projections = int(cfg_get(cfg, "standard_metric_swd_projections", 64))
     seed = int(cfg_get(cfg, "standard_metric_swd_seed", 0))
     cramer_wold_bandwidth = cfg_get(cfg, "standard_metric_cramer_wold_bandwidth", None)
     candidate_unweighted = candidate.get("unweighted_vectors", candidate["vectors"])
     reference_unweighted = reference.get("unweighted_vectors", reference["vectors"])
 
-    return {
-        "mean_bias": candidate["mean"] - reference["mean"],
-        "mean_abs_diff": abs(candidate["mean"] - reference["mean"]),
-        "std_ratio_error": candidate["std"] / (reference["std"] + 1e-12) - 1.0,
-        "std_abs_diff": abs(candidate["std"] - reference["std"]),
-        "crps_like_field_energy": crps_like_field_energy(candidate, reference, cfg),
-        "zonal_energy_spectrum_l2": spectrum_l2,
-        "sliced_wasserstein": sliced_wasserstein_distance(
-            candidate_unweighted, reference_unweighted, n_projections, seed
-        ),
-        "sliced_wasserstein_lon_corrected": sliced_wasserstein_distance(
-            candidate["vectors"], reference["vectors"], n_projections, seed
-        ),
-        "sliced_cramer_wold": sliced_cramer_wold_distance(
+    metrics = {}
+    if "mean_bias" in requested:
+        metrics["mean_bias"] = candidate["mean"] - reference["mean"]
+    if "mean_abs_diff" in requested:
+        metrics["mean_abs_diff"] = abs(candidate["mean"] - reference["mean"])
+    if "std_ratio_error" in requested:
+        metrics["std_ratio_error"] = candidate["std"] / (reference["std"] + 1e-12) - 1.0
+    if "std_abs_diff" in requested:
+        metrics["std_abs_diff"] = abs(candidate["std"] - reference["std"])
+    if "crps_like_field_energy" in requested:
+        metrics["crps_like_field_energy"] = crps_like_field_energy(candidate, reference, cfg)
+    if {"zonal_energy_spectrum_l2", "zonal_energy_spectrum_log_l2"} & requested:
+        candidate_spectrum = candidate["spectrum"]
+        reference_spectrum = reference["spectrum"]
+        common_spectrum_len = min(candidate_spectrum.size, reference_spectrum.size)
+        if "zonal_energy_spectrum_l2" in requested:
+            metrics["zonal_energy_spectrum_l2"] = (
+                float(
+                    np.linalg.norm(
+                        candidate_spectrum[:common_spectrum_len] - reference_spectrum[:common_spectrum_len]
+                    )
+                    / (np.linalg.norm(reference_spectrum[:common_spectrum_len]) + 1e-12)
+                )
+                if common_spectrum_len
+                else np.nan
+            )
+        if "zonal_energy_spectrum_log_l2" in requested:
+            metrics["zonal_energy_spectrum_log_l2"] = zonal_energy_spectrum_log_l2(
+                candidate_spectrum, reference_spectrum, cfg
+            )
+    if "sliced_wasserstein" in requested:
+        metrics["sliced_wasserstein"] = sliced_wasserstein_distance(
+            candidate_unweighted, reference_unweighted, n_projections, seed, cfg
+        )
+    if "sliced_wasserstein_lon_corrected" in requested:
+        metrics["sliced_wasserstein_lon_corrected"] = sliced_wasserstein_distance(
+            candidate["vectors"], reference["vectors"], n_projections, seed, cfg
+        )
+    if "sliced_cramer_wold" in requested:
+        metrics["sliced_cramer_wold"] = sliced_cramer_wold_distance(
             candidate_unweighted, reference_unweighted, n_projections, seed, cramer_wold_bandwidth
-        ),
-        "sliced_cramer_wold_lon_corrected": sliced_cramer_wold_distance(
+        )
+    if "sliced_cramer_wold_lon_corrected" in requested:
+        metrics["sliced_cramer_wold_lon_corrected"] = sliced_cramer_wold_distance(
             candidate["vectors"], reference["vectors"], n_projections, seed, cramer_wold_bandwidth
-        ),
-        "mmd_rbf": mmd_rbf_distance(candidate["vectors"], reference["vectors"], cfg),
-        "scwd": spherical_convolutional_wasserstein(candidate, reference, cfg),
-    }
+        )
+    if "mmd_rbf" in requested:
+        metrics["mmd_rbf"] = mmd_rbf_distance(candidate["vectors"], reference["vectors"], cfg)
+    if "scwd" in requested:
+        metrics["scwd"] = spherical_convolutional_wasserstein(candidate, reference, cfg)
+    return metrics
 
 
 def single_sample_feature(features, sample_idx):
@@ -968,11 +1263,108 @@ def single_sample_feature(features, sample_idx):
     return sample
 
 
+def resampled_distribution_features(features, indices):
+    """Return a feature dictionary resampled along the sample axis."""
+    indices = np.asarray(indices, dtype=int)
+    sample_values = [features["sample_values"][idx] for idx in indices]
+    fields = features["fields"][indices] if features["fields"].size else np.empty((0, 0, 0), dtype=np.float64)
+    channel_fields = (
+        features["channel_fields"][indices]
+        if "channel_fields" in features and features["channel_fields"].size
+        else np.empty((0, 0, 0, 0), dtype=np.float64)
+    )
+    vectors = features["vectors"][indices] if features["vectors"].size else np.empty((0, 0), dtype=np.float64)
+    unweighted_vectors = (
+        features.get("unweighted_vectors", vectors)[indices]
+        if features.get("unweighted_vectors", vectors).size
+        else np.empty((0, 0), dtype=np.float64)
+    )
+    spectra = features["spectra"][indices] if features["spectra"].size else np.empty((0, 0), dtype=np.float64)
+    values = np.concatenate(sample_values) if sample_values else np.array([], dtype=np.float64)
+    sample_keys = features.get("sample_keys", [])
+    return {
+        "values": values,
+        "sample_values": sample_values,
+        "spectrum": np.nanmean(spectra, axis=0) if spectra.size else np.array([], dtype=np.float64),
+        "spectra": spectra,
+        "fields": fields,
+        "channel_fields": channel_fields,
+        "vectors": vectors,
+        "unweighted_vectors": unweighted_vectors,
+        "sample_keys": [sample_keys[idx] if idx < len(sample_keys) else int(idx) for idx in indices],
+        "n_valid_samples": int(fields.shape[0]) if fields.ndim == 3 else 0,
+        "latitudes": features["latitudes"],
+        "longitudes": features["longitudes"],
+        "mean_field": np.nanmean(fields, axis=0) if fields.size else np.array([], dtype=np.float64),
+        "channel_mean_fields": np.nanmean(channel_fields, axis=0) if channel_fields.size else np.array([], dtype=np.float64),
+        "mean": float(np.nanmean(values)) if values.size else np.nan,
+        "std": float(np.nanstd(values)) if values.size else np.nan,
+    }
+
+
+def bootstrap_metric_uncertainty(candidate, reference, metric_names, cfg):
+    """Estimate metric uncertainty by bootstrapping candidate/reference samples."""
+    n_bootstrap = standard_metric_bootstrap_samples(cfg)
+    if n_bootstrap <= 0:
+        return {}
+    candidate_n = int(candidate.get("n_valid_samples", 0))
+    reference_n = int(reference.get("n_valid_samples", 0))
+    if candidate_n <= 1 or reference_n <= 1:
+        return {
+            f"{metric_name}_{suffix}": np.nan
+            for metric_name in metric_names
+            for suffix in ("stderr", "ci_low", "ci_high")
+        }
+
+    seed = int(cfg_get(cfg, "standard_metric_bootstrap_seed", cfg_get(cfg, "standard_metric_swd_seed", 0)))
+    rng = np.random.default_rng(seed)
+    values = {metric_name: [] for metric_name in metric_names}
+    for _ in range(n_bootstrap):
+        candidate_indices = rng.integers(0, candidate_n, size=candidate_n)
+        reference_indices = rng.integers(0, reference_n, size=reference_n)
+        candidate_sample = resampled_distribution_features(candidate, candidate_indices)
+        reference_sample = resampled_distribution_features(reference, reference_indices)
+        metrics = distribution_metric_values(candidate_sample, reference_sample, cfg, metric_names)
+        for metric_name in metric_names:
+            values[metric_name].append(metrics.get(metric_name, np.nan))
+
+    intervals = {}
+    alpha = float(cfg_get(cfg, "standard_metric_bootstrap_ci", 0.95))
+    lower_q = 50.0 * (1.0 - alpha)
+    upper_q = 100.0 - lower_q
+    for metric_name, metric_values in values.items():
+        finite = np.asarray(metric_values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size <= 1:
+            stderr = np.nan
+            ci_low = np.nan
+            ci_high = np.nan
+        else:
+            stderr = float(np.std(finite, ddof=1))
+            ci_low = float(np.percentile(finite, lower_q))
+            ci_high = float(np.percentile(finite, upper_q))
+        intervals[f"{metric_name}_stderr"] = stderr
+        intervals[f"{metric_name}_ci_low"] = ci_low
+        intervals[f"{metric_name}_ci_high"] = ci_high
+    return intervals
+
+
 def selected_distribution_metric_values(candidate, reference, metric_names, cfg):
     """Compute selected full-distribution metrics."""
-    metrics = distribution_metric_values(candidate, reference, cfg)
+    metrics = distribution_metric_values(candidate, reference, cfg, metric_names)
     metrics["n_samples"] = int(candidate.get("n_valid_samples", 0))
     return metrics
+
+
+def add_metric_uncertainty(row, candidate, reference, metric_names, cfg):
+    """Attach bootstrap uncertainty columns to a metric row."""
+    row.update(bootstrap_metric_uncertainty(candidate, reference, metric_names, cfg))
+    return row
+
+
+def standard_metric_bootstrap_samples(cfg):
+    """Return configured bootstrap replicate count."""
+    return int(cfg_get(cfg, "standard_metric_bootstrap_samples", 0))
 
 
 def joint_variable_name(variables):
@@ -1049,6 +1441,7 @@ def evaluate_lead_metrics(cfg, reference_features, variables, metric_names):
             row = dict(base_row)
             row.update({metric_name: metrics[metric_name] for metric_name in metric_names})
             row["n_samples"] = metrics["n_samples"]
+            add_metric_uncertainty(row, candidate_joint, reference_joint, metric_names, cfg)
             if row["n_samples"] == 0:
                 print(f"Warning: no valid joint samples for {label} lead={lead_hour} variables={variables}")
             results.append(row)
@@ -1065,6 +1458,53 @@ def corruption_types_from_config(cfg):
         cfg_get(cfg, "corruption_kfold_types", cfg_get(cfg, "corruption_types", [])),
     )
     return [str(value) for value in values]
+
+
+def is_u_wind_variable(variable):
+    """Return true when a variable name looks like a 10m U-wind component."""
+    normalized = str(variable).lower()
+    return (
+        "10m_u_component" in normalized
+        or normalized in {"u10", "10u", "u_component_of_wind"}
+        or normalized.endswith("_u_component_of_wind")
+    )
+
+
+def is_v_wind_variable(variable):
+    """Return true when a variable name looks like a 10m V-wind component."""
+    normalized = str(variable).lower()
+    return (
+        "10m_v_component" in normalized
+        or normalized in {"v10", "10v", "v_component_of_wind"}
+        or normalized.endswith("_v_component_of_wind")
+    )
+
+
+def can_apply_wind_vector_corruption(variables):
+    """Return whether variables match the channel layout used by wind corruptions."""
+    return (
+        len(variables) > V10_CHANNEL
+        and is_u_wind_variable(variables[U10_CHANNEL])
+        and is_v_wind_variable(variables[V10_CHANNEL])
+    )
+
+
+def compatible_corruption_types(corruption_types, variables):
+    """Drop standard metric corruption probes that are incompatible with variables."""
+    fixed_wind_corruptions = {"wind_patch_shuffle", "wind_shuffled", "wind_rotation", "wind_rotated"}
+    compatible = []
+    skipped = []
+    for corruption_type in corruption_types:
+        if corruption_type in fixed_wind_corruptions and not can_apply_wind_vector_corruption(variables):
+            skipped.append(corruption_type)
+            continue
+        compatible.append(corruption_type)
+    if skipped:
+        print(
+            "Skipping standard metric corruption(s) incompatible with variables "
+            f"{variables}: {', '.join(skipped)}"
+        )
+    return compatible
 
 
 def corruption_levels(corruption_type, cfg):
@@ -1101,7 +1541,7 @@ def evaluate_corruption_metrics(cfg, truth_ds, reference_features, variables, me
     time_indices = list(range(eval_ds.sizes.get("time", 0)))
     means, stds = normalization_stats_for_corruptions(cfg, truth_ds, variables)
 
-    for corruption_type in corruption_types_from_config(cfg):
+    for corruption_type in compatible_corruption_types(corruption_types_from_config(cfg), variables):
         levels = corruption_levels(corruption_type, cfg)
         for severity in tqdm(levels, desc=f"{corruption_type} distribution metrics"):
             candidate_features = distribution_features(
@@ -1133,6 +1573,7 @@ def evaluate_corruption_metrics(cfg, truth_ds, reference_features, variables, me
             row = dict(base_row)
             row.update({metric_name: metrics[metric_name] for metric_name in metric_names})
             row["n_samples"] = metrics["n_samples"]
+            add_metric_uncertainty(row, candidate_joint, reference_joint, metric_names, cfg)
             if row["n_samples"] == 0:
                 print(
                     "Warning: no valid joint samples for "
@@ -1145,15 +1586,29 @@ def evaluate_corruption_metrics(cfg, truth_ds, reference_features, variables, me
 
 def write_csv(rows, metric_names, output_path):
     """Write metric rows to CSV."""
+    uncertainty_fields = [
+        f"{metric_name}_{suffix}"
+        for metric_name in metric_names
+        for suffix in ("stderr", "ci_low", "ci_high")
+    ]
     fieldnames = (
         ["experiment", "label", "variable", "lead_hour", "corruption", "severity", "n_samples"]
         + metric_names
+        + uncertainty_fields
     )
     with open(output_path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def metric_yerr(series, metric_name):
+    """Return stderr values for a plotted metric, or None when unavailable."""
+    stderr = np.asarray([row.get(f"{metric_name}_stderr", np.nan) for row in series], dtype=np.float64)
+    if not np.any(np.isfinite(stderr)):
+        return None
+    return np.where(np.isfinite(stderr), stderr, 0.0)
 
 
 def plot_lead_metrics(rows, metric_names, variables, cfg):
@@ -1180,9 +1635,11 @@ def plot_lead_metrics(rows, metric_names, variables, cfg):
                 )
                 x_values = [row["lead_hour"] for row in series]
                 y_values = [row[metric_name] for row in series]
-                ax.plot(
+                ax.errorbar(
                     x_values,
                     y_values,
+                    yerr=metric_yerr(series, metric_name),
+                    capsize=3,
                     marker="o",
                     linewidth=1.8,
                     color=color,
@@ -1228,9 +1685,11 @@ def plot_corruption_metrics(rows, metric_names, variables, cfg):
                 )
                 x_values = [row["severity"] for row in series]
                 y_values = [row[metric_name] for row in series]
-                ax.plot(
+                ax.errorbar(
                     x_values,
                     y_values,
+                    yerr=metric_yerr(series, metric_name),
+                    capsize=3,
                     marker="o",
                     linewidth=1.8,
                 )
@@ -1249,9 +1708,11 @@ def plot_corruption_metrics(rows, metric_names, variables, cfg):
             plt.close(fig)
             print(f"Saved corruption metric plot to: {output_path}")
 
+        plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg, variable)
+
     if len(variables) > 1:
         plot_combined_corruption_metrics(corruption_rows, metric_names, cfg)
-        plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg)
+        plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg, "all_fields")
 
 
 def plot_combined_corruption_metrics(corruption_rows, metric_names, cfg):
@@ -1271,9 +1732,11 @@ def plot_combined_corruption_metrics(corruption_rows, metric_names, cfg):
             )
             x_values = [row["severity"] for row in series]
             y_values = [row[metric_name] for row in series]
-            ax.plot(
+            ax.errorbar(
                 x_values,
                 y_values,
+                yerr=metric_yerr(series, metric_name),
+                capsize=3,
                 marker="o",
                 linewidth=1.8,
                 color=color,
@@ -1292,9 +1755,9 @@ def plot_combined_corruption_metrics(corruption_rows, metric_names, cfg):
         print(f"Saved combined all-fields corruption metric plot to: {output_path}")
 
 
-def plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg):
-    """Plot all all-fields corruption metrics in one lead-time-style panel."""
-    variable_rows = [row for row in corruption_rows if row["variable"] == "all_fields"]
+def plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg, variable):
+    """Plot all corruption metrics for one variable in one lead-time-style panel."""
+    variable_rows = [row for row in corruption_rows if row["variable"] == variable]
     if not variable_rows:
         return
 
@@ -1311,9 +1774,11 @@ def plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg):
             )
             x_values = [row["severity"] for row in series]
             y_values = [row[metric_name] for row in series]
-            ax.plot(
+            ax.errorbar(
                 x_values,
                 y_values,
+                yerr=metric_yerr(series, metric_name),
+                capsize=3,
                 marker="o",
                 linewidth=1.8,
                 color=color,
@@ -1325,12 +1790,12 @@ def plot_combined_corruption_metric_panel(corruption_rows, metric_names, cfg):
         ax.grid(True, alpha=0.3)
 
     axes[0, 0].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9)
-    fig.suptitle("Distributional Metrics vs Corruption Strength: all_fields", fontsize=15)
+    fig.suptitle(f"Distributional Metrics vs Corruption Strength: {variable}", fontsize=15)
     fig.tight_layout(rect=[0, 0, 0.82, 0.96])
-    output_path = Path(cfg.output_dir) / "standard_distribution_metrics_vs_corruption_strength_all_fields.png"
+    output_path = Path(cfg.output_dir) / f"standard_distribution_metrics_vs_corruption_strength_{variable}.png"
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved combined all-fields corruption metric panel to: {output_path}")
+    print(f"Saved combined corruption metric panel to: {output_path}")
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="kfold_config")
@@ -1338,6 +1803,7 @@ def main(cfg: DictConfig):
     """Run distributional spatial-realism metric baselines."""
     variables = variables_from_config(cfg)
     metric_names = metric_names_from_config(cfg)
+    print(f"Standard metric bootstrap samples: {standard_metric_bootstrap_samples(cfg)}")
 
     real_ds = select_level(safe_open_dataset(standard_real_file(cfg)), cfg.get("level"))
     missing = [variable for variable in variables if variable not in real_ds.data_vars]

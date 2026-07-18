@@ -162,13 +162,16 @@ standard_metrics:
   - "crps_like_field_energy"
   # This is the expensive metric: one zonal FFT per sample/field.
   - "zonal_energy_spectrum_l2"
+  - "zonal_energy_spectrum_log_l2"
   - "sliced_wasserstein"
   - "sliced_wasserstein_lon_corrected"
   - "mmd_rbf"
   - "scwd"
 
-# Defaults to `variables` when null.
-standard_metric_variables: null
+# Defaults metric baselines to a single scalar temperature field. Override with
+# a list of variables to evaluate multi-field metric extensions.
+standard_metric_variables:
+  - "temperature"
 
 # Forecast/ERA5 samples per lead or corruption-strength point.
 standard_metric_eval_samples: 100
@@ -188,12 +191,26 @@ standard_metric_value_samples: 20000
 # between complete fields. Smaller chunks reduce memory at the cost of runtime.
 standard_metric_field_energy_chunk_size: 4
 
+# Metric kernel backend for the expensive distribution metrics. `auto` uses
+# CUDA Torch kernels when available and falls back to NumPy otherwise.
+standard_metric_backend: "auto"
+standard_metric_device: null
+standard_metric_dtype: "float32"
+
+# Bootstrap resamples used for metric error bars and percentile CIs. Set samples
+# to 0 to disable when doing quick smoke runs.
+# Use 0 for routine baseline runs; set to 32 or more for final error-bar plots.
+standard_metric_bootstrap_samples: 0
+standard_metric_bootstrap_seed: 0
+standard_metric_bootstrap_ci: 0.95
+
 # Sliced-Wasserstein settings. `standard_metric_swd_pixels` caps the flattened
 # spatial dimensions used per field; `standard_metric_swd_projections` controls
 # the number of random 1D projections.
 standard_metric_swd_pixels: 4096
 standard_metric_swd_projections: 64
 standard_metric_swd_seed: 0
+standard_metric_spectrum_log_eps_factor: 1e-12
 
 # RBF-MMD settings. The default null bandwidth uses the pooled median-distance
 # heuristic on ERA5-standardized, cosine-latitude-weighted field vectors.

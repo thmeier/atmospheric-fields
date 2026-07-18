@@ -259,17 +259,17 @@ results/standard_distribution_metrics_vs_corruption_strength_all_fields.png
 results/standard_distribution_<metric>_vs_corruption_strength_all_fields_combined.png
 ```
 
-The configured variables are treated as one joint sample space. With multiple
-fields configured, the CSV and plots use `variable=all_fields`; to run a
-single-field metric baseline, set `standard_metric_variables` or `variables` to
-only that field. The joint metrics standardize each field with ERA5/reference
-moments before combining variables, so one unit-heavy field does not dominate
-the multi-field distances. `sliced_wasserstein`, `sliced_wasserstein_lon_corrected`,
-`mmd_rbf`, and the CRPS-like field-energy score operate on concatenated
-same-sample field states. The joint SCWD path uses random multi-channel
-spherical filters that map each standardized joint field to scalar responses,
-then compares those response distributions with the same 1D quantile
-Wasserstein step as scalar SCWD. SCWD does not rotate or longitude-align samples.
+Metric baselines default to temperature only via `standard_metric_variables`
+(`2m_temperature` for surface config, `temperature` for k-fold/non-surface
+config). This keeps SCWD on the scalar-field setting used by Garrett et al.
+(2024). To intentionally evaluate a joint multi-field distribution, override
+`standard_metric_variables` with multiple fields. With multiple fields, the CSV
+and plots use `variable=all_fields`; the joint metrics standardize each field
+with ERA5/reference moments before combining variables, so one unit-heavy field
+does not dominate the distances. The joint SCWD path is a repo extension: it
+uses random multi-channel spherical filters that map each standardized joint
+field to scalar responses before the usual 1D quantile Wasserstein step. SCWD
+does not rotate or longitude-align samples.
 
 The plots intentionally omit error bars. The CSV stores point estimates and the
 `n_samples` count only; uncertainty intervals should be added with an explicit

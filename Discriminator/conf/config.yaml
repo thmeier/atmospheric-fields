@@ -142,20 +142,34 @@ standard_metrics:
   - "std_ratio_error"
   - "crps_like_field_energy"
   - "zonal_energy_spectrum_l2"
+  - "zonal_energy_spectrum_log_l2"
   - "sliced_wasserstein"
   - "sliced_wasserstein_lon_corrected"
   - "mmd_rbf"
   - "scwd"
-standard_metric_variables: null
+standard_metric_variables:
+  - "2m_temperature"
 standard_metric_eval_samples: 100
 standard_metric_filter_invalid_fields: true
 standard_metric_invalid_zero_atol: 1e-12
 standard_metric_invalid_min_std: 1e-12
 standard_metric_value_samples: 20000
 standard_metric_field_energy_chunk_size: 4
+# Metric kernel backend for the expensive distribution metrics. `auto` uses
+# CUDA Torch kernels when available and falls back to NumPy otherwise.
+standard_metric_backend: "auto"
+standard_metric_device: null
+standard_metric_dtype: "float32"
+# Bootstrap resamples used for metric error bars and percentile CIs. Set samples
+# to 0 to disable when doing quick smoke runs.
+#standard_metric_bootstrap_samples: 32
+standard_metric_bootstrap_samples: 0
+standard_metric_bootstrap_seed: 0
+standard_metric_bootstrap_ci: 0.95
 standard_metric_swd_pixels: 4096
 standard_metric_swd_projections: 64
 standard_metric_swd_seed: 0
+standard_metric_spectrum_log_eps_factor: 1e-12
 standard_metric_mmd_bandwidth: null
 standard_metric_mmd_standardize: true
 standard_metric_scwd_anchor_lat_points: 60
