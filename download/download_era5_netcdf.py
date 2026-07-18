@@ -1,11 +1,127 @@
-"""
-Heavy inspiration from https://github.com/joeloskarsson/era5_data_handling/blob/main/download_era5.py
-"""
 #!/usr/bin/env python3
+"""Select a WeatherBench2 Zarr time window and write it as NetCDF.
+
+This helper is intentionally not a regridder. Use an already suitable
+WeatherBench2 source, for example a 240x121 1.5-degree store when downstream
+code expects the WeatherBench2 paper/evaluation grid.
+"""
+
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-import xarray as xr
+from typing import Iterable
+
 import numpy as np
+from zarr_to_netcdf import _sanitize_dataset_attrs
+
+
+DEFAULT_LEAD_HOURS = (6, 12, 24, 48, 96, 192)
+LEAD_TIME_CANDIDATES = (
+    "prediction_timedelta",
+    "lead_time",
+    "lead_times",
+    "step",
+    "forecast_hour",
+    "time_delta",
+)
+
+
+def _open_zarr(source: str):
+    import xarray as xr
+
+    storage_options = {"token": "anon"} if source.startswith("gs://") else None
+    return xr.open_zarr(source, chunks={}, storage_options=storage_options)
+
+
+def _available_hours(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values)
+    if np.issubdtype(values.dtype, np.timedelta64):
+        return values.astype("timedelta64[h]").astype(int)
+    if np.issubdtype(values.dtype, np.number):
+        return values.astype(float).round().astype(int)
+
+    hours = []
+    for value in values:
+        text = str(value)
+        if text.endswith("h"):
+            hours.append(int(text[:-1]))
+        else:
+            hours.append(int(text))
+    return np.asarray(hours, dtype=int)
+
+
+def _find_lead_coord(ds) -> str | None:
+    for name in LEAD_TIME_CANDIDATES:
+        if name in ds.dims or name in ds.coords:
+            return name
+    for name in list(ds.dims) + list(ds.coords):
+        lower = name.lower()
+        if any(candidate in lower for candidate in LEAD_TIME_CANDIDATES):
+            return name
+    return None
+
+
+def _select_variables(ds, variables: list[str] | None):
+    if not variables:
+        return ds
+
+    missing = [name for name in variables if name not in ds]
+    if missing:
+        raise SystemExit(
+            f"Variables not found: {missing}. Available variables: {list(ds.data_vars)}"
+        )
+    return ds[variables]
+
+
+def _select_levels(ds, levels: list[float] | None):
+    if not levels:
+        return ds
+    if "level" not in ds.dims and "level" not in ds.coords:
+        raise SystemExit("--level was supplied, but the dataset has no 'level' coordinate.")
+
+    selected = int(levels[0]) if len(levels) == 1 and levels[0].is_integer() else levels
+    print(f"Filtering level to {selected}")
+    return ds.sel(level=selected)
+
+
+def _select_lead_times(ds, lead_hours: list[int] | None):
+    lead_coord = _find_lead_coord(ds)
+    if lead_coord is None:
+        print("No lead time dimension detected. Proceeding without lead-time filtering.")
+        return ds
+    if not lead_hours:
+        print(f"Detected {lead_coord}; keeping all lead times.")
+        return ds
+
+    values = ds[lead_coord].values
+    hours = _available_hours(values)
+    selected_values = []
+    missing = []
+    for lead_hour in lead_hours:
+        matches = np.where(hours == lead_hour)[0]
+        if len(matches) == 0:
+            missing.append(lead_hour)
+        else:
+            selected_values.append(values[int(matches[0])])
+
+    if missing:
+        print(f"Warning: requested lead times not found: {missing}h")
+    if not selected_values:
+        raise SystemExit(
+            f"None of the requested lead times {lead_hours}h are available. "
+            f"Available lead times: {hours.tolist()}h"
+        )
+
+    selected_hours = _available_hours(np.asarray(selected_values)).tolist()
+    print(f"Filtering {lead_coord} to lead times: {selected_hours}h")
+    return ds.sel({lead_coord: selected_values})
+
+
+def _parse_lead_hours(value: str) -> list[int] | None:
+    if value.lower() in {"all", "none"}:
+        return None
+    return [int(part) for part in value.replace(",", " ").split() if part]
 
 
 def download_era5_netcdf(
@@ -14,77 +130,62 @@ def download_era5_netcdf(
     variables: list[str] | None,
     time_start: str,
     time_end: str,
+    levels: list[float] | None,
+    lead_hours: list[int] | None,
 ):
     print(f"Opening {source}...")
-    ds = xr.open_zarr(source, chunks="auto", storage_options={'token': 'anon'})
+    ds = _open_zarr(source)
+    print(f"Available variables: {list(ds.data_vars)}")
+    print(f"Dimensions: {dict(ds.dims)}")
 
-    # Select variables
-    if variables:
-        ds = ds[variables]
-
-    # Time slice
+    ds = _select_variables(ds, variables)
     ds = ds.sel(time=slice(time_start, time_end))
+    ds = _select_levels(ds, levels)
+    ds = _select_lead_times(ds, lead_hours)
 
-    if ds.time.size == 0:
-        raise SystemExit("No data in specified time range.")
+    if "time" in ds.sizes and ds.sizes["time"] == 0:
+        raise SystemExit(f"No data in time range {time_start} through {time_end}.")
 
-    # Lead time filtering
-    lead_time_dims = [d for d in ds.dims if "timedelta" in d or "lead_time" in d]
-    if lead_time_dims:
-        lt_dim = lead_time_dims[0]
-        print(f"Detected lead time dimension: {lt_dim}")
-
-        target_hours = [6, 12, 24, 48, 96, 192]
-        target_lt = np.array(target_hours, dtype="timedelta64[h]").astype(
-            "timedelta64[ns]"
-        )
-
-        available_lt = ds[lt_dim].values
-        valid_lt = [lt for lt in target_lt if lt in available_lt]
-        missing_lt = [lt for lt in target_lt if lt not in available_lt]
-
-        if missing_lt:
-            missing_hours = [
-                int(lt.astype("timedelta64[h]").astype(int)) for lt in missing_lt
-            ]
-            print(f"Warning: Requested lead times {missing_hours}h not found in dataset.")
-
-        if not valid_lt:
-            print(f"Error: None of the requested lead times {target_hours}h are available.")
-            if len(available_lt) > 0:
-                print(f"Available lead times (first 10): {available_lt[:10]}")
-            raise SystemExit("No matching lead times found.")
-
-        valid_hours = [int(lt.astype("timedelta64[h]").astype(int)) for lt in valid_lt]
-        print(f"Filtering for lead times: {valid_hours}h")
-        ds = ds.sel({lt_dim: valid_lt})
-    else:
-        print("No lead time dimension detected. Proceeding with full dataset.")
-
-    print(f"Saving {ds.time.size} timesteps to {output_path}")
-
-    # Save as NetCDF
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ds = _sanitize_dataset_attrs(ds)
+    print(f"Saving to {output_path}")
     ds.to_netcdf(output_path, format="NETCDF4")
-
     print("Done!")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source")
-    parser.add_argument("output", type=Path)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", help="WeatherBench2 Zarr path or URL")
+    parser.add_argument("output", type=Path, help="Output .nc/.netcdf file")
     parser.add_argument("-v", "--variables", nargs="+")
     parser.add_argument("-s", "--time-start", required=True)
     parser.add_argument("-e", "--time-end", required=True)
-
+    parser.add_argument(
+        "--level",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Optional pressure level(s) to select, e.g. --level 850.",
+    )
+    parser.add_argument(
+        "--lead-hours",
+        type=_parse_lead_hours,
+        default=list(DEFAULT_LEAD_HOURS),
+        help=(
+            "Forecast lead hours to keep, as a quoted space/comma-separated list. "
+            "Use 'all' to keep all lead times. Default: 6 12 24 48 96 192."
+        ),
+    )
     args = parser.parse_args()
 
     download_era5_netcdf(
-        args.output,
-        args.source,
-        args.variables,
-        args.time_start,
-        args.time_end,
+        output_path=args.output,
+        source=args.source,
+        variables=args.variables,
+        time_start=args.time_start,
+        time_end=args.time_end,
+        levels=args.level,
+        lead_hours=args.lead_hours,
     )
 
 
