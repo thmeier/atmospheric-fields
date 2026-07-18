@@ -136,17 +136,52 @@ uv run \
     data/gefs_6steps_240x121_conservative_to_2023.nc
 ```
 
+### AIFS
+
+AIFS uses the Dynamical dataset id `ecmwf-aifs-single-forecast`. The repository
+wrapper processes 2025 month by month because the native 0.25-degree archive is
+large and the remote chunks are organized by single init time.
+
+```bash
+WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py \
+SCRATCH_DIR=/scratch/$USER/dynamical_native \
+OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical \
+download/download_aifs_surface_forecasts.sh
+```
+
+On the ETH cluster, the sbatch wrapper has the same defaults filled in:
+
+```bash
+sbatch -A pmlr_jobs -t 24:00 download/sbatch_aifs_surface_forecasts.sh
+```
+
+The AIFS source stores `temperature_2m` in degree Celsius. The downloader
+renames it to `2m_temperature` and converts it to Kelvin by default so it
+matches the repo's WeatherBench-style surface files. Set `KEEP_SOURCE_UNITS=1`
+or pass `--keep-source-units` to the Python downloader to preserve Celsius.
+The wrapper defaults to `SKIP_EXISTING=1`, so reruns skip months whose final
+NetCDF already exists. If `CONVERT_NETCDF=0`, it skips months whose regridded
+Zarr already exists.
+
 ## Shell Wrapper
 
 The repository wrapper runs the wanted surface-only downloads with an explicit
 scratch-staged workflow:
 
-1. Download native-resolution Dynamical Zarr into `SCRATCH_DIR`.
-2. Call WeatherBench2's `scripts/regrid.py`.
-3. Write regridded outputs into `OUTPUT_DIR`.
+1. Download native-resolution Dynamical Zarr into `SCRATCH_DIR`, month by month
+   when `TIME_START` and `TIME_END` are set.
+2. Call WeatherBench2's `scripts/regrid.py` and write regridded Zarr into
+   `SCRATCH_DIR`.
+3. Write only final NetCDF files into `OUTPUT_DIR`.
 
 This keeps the intermediate data and the exact WeatherBench2 command visible for
 reproducibility.
+The wrapper defaults to `SKIP_EXISTING=1`, so reruns skip completed monthly
+NetCDF files. Set `CONVERT_NETCDF=0` to skip based on completed regridded Zarr
+outputs instead, or set `SKIP_EXISTING=0` to force reruns.
+GFS and GEFS source temperatures are converted from Celsius to Kelvin by
+default to match the repo's WeatherBench-style surface files. Set
+`KEEP_SOURCE_UNITS=1` to preserve source Celsius values.
 
 The wrapper defaults to the currently active Python environment
 (`RUNNER=conda`, `PYTHON=python`). Install the required packages in that
@@ -198,8 +233,8 @@ PMLR paths currently used here:
 - `SCRATCH_DIR=/work/scratch/yelberkennou/dynamical_native`
 - `OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical`
 - `MODE=all`
-- `TIME_START=2024-01-01T00`
-- `TIME_END=2024-12-31T23:59:59`
+- `TIME_START=2025-01-01T00`
+- `TIME_END=2025-12-31T23:59:59`
 
 ```bash
 sbatch -A pmlr_jobs -t 02:00 download/sbatch_dynamical_surface_forecasts.sh
