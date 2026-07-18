@@ -1,6 +1,7 @@
 #!/bin/bash
-# Convert fast-downloaded selected GRIB2 files to native Zarr, regrid with
-# WeatherBench2's scripts/regrid.py, and optionally convert to NetCDF.
+# Convert fast-downloaded selected GRIB2 files to native Zarr, regrid to
+# scratch with WeatherBench2's scripts/regrid.py, and optionally convert to
+# final NetCDF in OUTPUT_DIR.
 
 set -eo pipefail
 
@@ -37,18 +38,19 @@ if [[ ! -f "${WB2_REGRID_SCRIPT}" ]]; then
   echo "WB2_REGRID_SCRIPT does not exist: ${WB2_REGRID_SCRIPT}" >&2
   exit 2
 fi
+WB2_REPO_DIR="$(cd "$(dirname "${WB2_REGRID_SCRIPT}")/.." && pwd)"
 
 mkdir -p "${SCRATCH_DIR}" "${OUTPUT_DIR}"
 
 if [[ "${MODEL}" == "gfs" ]]; then
   native_zarr="${SCRATCH_DIR}/gfs_native_surface_fast_${START_DATE}_${END_DATE}.zarr"
-  regridded_zarr="${OUTPUT_DIR}/gfs_surface_fast_240x121_conservative_${START_DATE}_${END_DATE}.zarr"
+  regridded_zarr="${SCRATCH_DIR}/gfs_surface_fast_240x121_conservative_${START_DATE}_${END_DATE}.zarr"
   regridded_nc="${OUTPUT_DIR}/gfs_surface_fast_240x121_conservative_${START_DATE}_${END_DATE}.nc"
   output_chunks="init_time=1"
   member_args=()
 else
   native_zarr="${SCRATCH_DIR}/gefs_native_surface_fast_${START_DATE}_${END_DATE}.zarr"
-  regridded_zarr="${OUTPUT_DIR}/gefs_surface_fast_240x121_conservative_${START_DATE}_${END_DATE}.zarr"
+  regridded_zarr="${SCRATCH_DIR}/gefs_surface_fast_240x121_conservative_${START_DATE}_${END_DATE}.zarr"
   regridded_nc="${OUTPUT_DIR}/gefs_surface_fast_240x121_conservative_${START_DATE}_${END_DATE}.nc"
   output_chunks="init_time=1,ensemble_member=1"
   member_args=(--members ${MEMBERS})
@@ -70,7 +72,7 @@ fi
   "${member_args[@]}" \
   "${overwrite_args[@]}"
 
-"${PYTHON}" "${WB2_REGRID_SCRIPT}" \
+PYTHONPATH="${WB2_REPO_DIR}:${PYTHONPATH:-}" "${PYTHON}" "${WB2_REGRID_SCRIPT}" \
   --input_path="${native_zarr}" \
   --output_path="${regridded_zarr}" \
   --output_chunks="${output_chunks}" \

@@ -66,6 +66,11 @@ def main():
         action="store_true",
         help="Do not rename Dynamical source variables to repo-compatible names.",
     )
+    parser.add_argument(
+        "--keep-source-units",
+        action="store_true",
+        help="Do not convert GEFS 2m temperature from Celsius to Kelvin.",
+    )
     args = parser.parse_args()
 
     download_dynamical_forecast(
@@ -76,6 +81,7 @@ def main():
         lead_hours=args.lead_hours,
         ensemble_members=args.ensemble_members,
         keep_source_names=args.keep_source_names,
+        keep_source_units=args.keep_source_units,
     )
 
 

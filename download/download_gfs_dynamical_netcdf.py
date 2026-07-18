@@ -11,6 +11,9 @@ The Dynamical Catalog GFS dataset uses names such as ``temperature_2m`` and
 WeatherBench-style names such as ``2m_temperature`` and
 ``10m_u_component_of_wind``.  By default this script writes repo-compatible
 names where possible; pass ``--keep-source-names`` to preserve the source names.
+NOAA GFS/GEFS expose 2m temperature in degree Celsius.  By default this script
+converts it to Kelvin after renaming to the repo-compatible ``2m_temperature``
+name; pass ``--keep-source-units`` to leave source units unchanged.
 
 Use a ``.zarr`` output path for an intermediate suitable for WeatherBench2
 regridding, or a ``.nc``/``.netcdf`` path for a final NetCDF file.
@@ -59,6 +62,7 @@ LEAD_COORD_CANDIDATES = (
 )
 INIT_TIME_CANDIDATES = ("init_time", "forecast_reference_time", "time")
 ENSEMBLE_MEMBER_CANDIDATES = ("ensemble_member", "number", "realization", "member")
+TEMPERATURE_NAMES = ("2m_temperature", "temperature_2m")
 
 
 def _import_dynamical_catalog():
@@ -211,6 +215,41 @@ def _resolve_variables(ds, *, keep_source_names: bool) -> tuple[list[str], dict[
     return selected, rename
 
 
+def _temperature_is_kelvin(units: str | None) -> bool:
+    if units is None:
+        return False
+
+    normalized = units.strip().lower()
+    return normalized in {"k", "kelvin"}
+
+
+def _convert_2m_temperature_to_kelvin(ds):
+    temperature_name = next((name for name in TEMPERATURE_NAMES if name in ds), None)
+    if temperature_name is None:
+        print("Warning: no 2m temperature variable found; skipping unit conversion.")
+        return ds
+
+    attrs = dict(ds[temperature_name].attrs)
+    if _temperature_is_kelvin(attrs.get("units")):
+        print(f"{temperature_name} already appears to be Kelvin; skipping conversion.")
+        return ds
+
+    print(f"Converting {temperature_name} from degree Celsius to Kelvin.")
+    ds[temperature_name] = ds[temperature_name] + 273.15
+    ds[temperature_name].attrs.update(attrs)
+    ds[temperature_name].attrs["units"] = "K"
+    return ds
+
+
+def _drop_regrid_incompatible_vars(ds):
+    """Drop scalar CRS metadata that xarray-beam cannot write region-wise."""
+    drop_names = [name for name in ("spatial_ref",) if name in ds]
+    if drop_names:
+        print(f"Dropping regrid-incompatible metadata variables: {drop_names}")
+        ds = ds.drop_vars(drop_names)
+    return ds
+
+
 def _write_dataset(ds, output_path: Path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
@@ -240,6 +279,7 @@ def download_dynamical_forecast(
     lead_hours: list[int],
     ensemble_members: list[int] | None,
     keep_source_names: bool,
+    keep_source_units: bool,
 ):
     dynamical_catalog = _import_dynamical_catalog()
 
@@ -255,6 +295,12 @@ def download_dynamical_forecast(
         print(f"Renaming source variables for repo compatibility: {rename}")
         ds = ds.rename(rename)
 
+    if keep_source_units:
+        print("Keeping source units unchanged.")
+    else:
+        ds = _convert_2m_temperature_to_kelvin(ds)
+
+    ds = _drop_regrid_incompatible_vars(ds)
     ds = _select_lead_times(ds, lead_hours)
     ds = _select_init_time(ds, time_start, time_end)
     ds = _select_ensemble_members(ds, ensemble_members)
@@ -310,6 +356,11 @@ def main():
         action="store_true",
         help="Do not rename Dynamical source variables to repo-compatible names.",
     )
+    parser.add_argument(
+        "--keep-source-units",
+        action="store_true",
+        help="Do not convert GFS/GEFS 2m temperature from Celsius to Kelvin.",
+    )
     args = parser.parse_args()
 
     download_dynamical_forecast(
@@ -320,6 +371,7 @@ def main():
         lead_hours=args.lead_hours,
         ensemble_members=args.ensemble_members,
         keep_source_names=args.keep_source_names,
+        keep_source_units=args.keep_source_units,
     )
 
 

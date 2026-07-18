@@ -10,8 +10,8 @@
 
 # Defaults are set for the ETH PMLR cluster account/user paths below. Override
 # with sbatch exports only when needed:
-#   START_DATE=20201001
-#   END_DATE=20231231
+#   START_DATE=20220101
+#   END_DATE=20221231
 #   CYCLES="00"
 #   LEAD_HOURS="6 12 24 48 96 192"
 #   MEMBERS="0"       # use "all" for control + 30 perturbed members
@@ -28,8 +28,8 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
 OUTPUT_DIR="${OUTPUT_DIR:-/work/scratch/yelberkennou/gefs_fast}"
 BASE_URL="${BASE_URL:-https://noaa-gefs-pds.s3.amazonaws.com}"
 DATE="${DATE:-}"
-START_DATE="${START_DATE:-20201001}"
-END_DATE="${END_DATE:-20231231}"
+START_DATE="${START_DATE:-20220101}"
+END_DATE="${END_DATE:-20221231}"
 CYCLES="${CYCLES:-00}"
 LEAD_HOURS="${LEAD_HOURS:-6 12 24 48 96 192}"
 MEMBERS="${MEMBERS:-0}"

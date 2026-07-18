@@ -16,11 +16,15 @@
 #   CONDA_ENV_NAME=pmlr
 #   WB2_REGRID_SCRIPT=/path/to/weatherbench2/scripts/regrid.py
 #   MODE=all|gfs|gefs
-#   TIME_START=2024-01-01T00
-#   TIME_END=2024-12-31T23:59:59
+#   TIME_START=2025-01-01T00
+#   TIME_END=2025-12-31T23:59:59
+#   MONTHS="202501 202502 ..."
+#   LEAD_HOURS="6 12 24 48 96 192"
 #   SCRATCH_DIR=/scratch/$USER/dynamical_native
 #   OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data/dynamical
 #   CONVERT_NETCDF=1|0
+#   SKIP_EXISTING=1|0
+#   KEEP_SOURCE_UNITS=1|0
 #   GEFS_ENSEMBLE_MEMBERS=all|0|0,1,...
 
 set -eo pipefail
@@ -31,11 +35,15 @@ SCRIPT_DIR="${REPO_DIR}/download"
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
 MODE="${MODE:-all}"
-TIME_START="${TIME_START:-2024-01-01T00}"
-TIME_END="${TIME_END:-2024-12-31T23:59:59}"
+TIME_START="${TIME_START:-2025-01-01T00}"
+TIME_END="${TIME_END:-2025-12-31T23:59:59}"
+MONTHS="${MONTHS:-}"
+LEAD_HOURS="${LEAD_HOURS:-6 12 24 48 96 192}"
 SCRATCH_DIR="${SCRATCH_DIR:-/work/scratch/yelberkennou/dynamical_native}"
 OUTPUT_DIR="${OUTPUT_DIR:-/cluster/courses/pmlr/teams/team07/data/dynamical}"
 CONVERT_NETCDF="${CONVERT_NETCDF:-1}"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
+KEEP_SOURCE_UNITS="${KEEP_SOURCE_UNITS:-0}"
 GEFS_ENSEMBLE_MEMBERS="${GEFS_ENSEMBLE_MEMBERS:-all}"
 WB2_REGRID_SCRIPT="${WB2_REGRID_SCRIPT:-/home/yelberkennou/weatherbench2/scripts/regrid.py}"
 
@@ -68,9 +76,13 @@ PYTHON=python \
 MODE="${MODE}" \
 TIME_START="${TIME_START}" \
 TIME_END="${TIME_END}" \
+MONTHS="${MONTHS}" \
+LEAD_HOURS="${LEAD_HOURS}" \
 SCRATCH_DIR="${SCRATCH_DIR}" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
 CONVERT_NETCDF="${CONVERT_NETCDF}" \
+SKIP_EXISTING="${SKIP_EXISTING}" \
+KEEP_SOURCE_UNITS="${KEEP_SOURCE_UNITS}" \
 GEFS_ENSEMBLE_MEMBERS="${GEFS_ENSEMBLE_MEMBERS}" \
 WB2_REGRID_SCRIPT="${WB2_REGRID_SCRIPT}" \
 bash download/download_dynamical_surface_forecasts.sh

@@ -72,8 +72,8 @@ sbatch -A pmlr_jobs -t 02:00 download/sbatch_nomads_gfs_fast.sh
 
 The GFS sbatch wrapper defaults to:
 
-- `START_DATE=20210501`
-- `END_DATE=20231231`
+- `START_DATE=20220101`
+- `END_DATE=20221231`
 - `CYCLES="00 06 12 18"`
 - `LEAD_HOURS="6 12 24 48 96 192"`
 - `OUTPUT_DIR=/work/scratch/yelberkennou/gfs_fast`
@@ -94,7 +94,7 @@ GEFS uses the same byte-range approach against the NOAA GEFS S3 archive:
 https://noaa-gefs-pds.s3.amazonaws.com
 ```
 
-Control member from `2020-10-01` through the end of 2023:
+Control member for `[2022, 2023)`; because the CLI end date is inclusive, this is `20220101` through `20221231`:
 
 ```bash
 sbatch -A pmlr_jobs -t 02:00 download/sbatch_nomads_gefs_fast.sh
@@ -102,8 +102,8 @@ sbatch -A pmlr_jobs -t 02:00 download/sbatch_nomads_gefs_fast.sh
 
 The GEFS sbatch wrapper defaults to:
 
-- `START_DATE=20201001`
-- `END_DATE=20231231`
+- `START_DATE=20220101`
+- `END_DATE=20221231`
 - `CYCLES="00"`
 - `MEMBERS="0"`
 - `LEAD_HOURS="6 12 24 48 96 192"`
