@@ -36,7 +36,7 @@ def checkpoint_path(model_name, model_size, checkpoint_dir=Path("checkpoints"), 
     Encodes size, optional ``embed_dim`` (``dN``), and optional ``variant`` into
     ``best_<model>_model_<suffix>.pth`` under ``checkpoint_dir``.
     """
-    if model_name in ("mae", "ijepa"):
+    if model_name in ("mae", "ijepa", "realism"):
         parts = [model_size]
         if embed_dim is not None:
             parts.append(f"d{embed_dim}")

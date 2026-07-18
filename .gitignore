@@ -39,6 +39,7 @@ data/
 results/
 checkpoints/
 .DS_Store
+memory/
 
 Discriminator/weather-discriminator/
 Discriminator/weather-discriminator_kfold/
