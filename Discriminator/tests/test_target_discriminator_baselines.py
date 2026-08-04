@@ -102,7 +102,7 @@ class MockSFNOEncoder(torch.nn.Module):
         self.register_buffer("norm_mean", torch.tensor([280.0, 0.0, 0.0, 100000.0]).view(1, 4, 1, 1))
         self.register_buffer("norm_std", torch.tensor([10.0, 5.0, 5.0, 1000.0]).view(1, 4, 1, 1))
 
-    def extract_features(self, inputs):
+    def extract_features(self, inputs, enable_input_grad=False):
         normalized = (inputs - self.norm_mean) / self.norm_std
         pooled = torch.nn.functional.adaptive_avg_pool2d(normalized[:, :2], (2, 2))
         return pooled.flatten(1) * self.anchor
@@ -252,6 +252,48 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
         self.assertEqual(models["sfno_linear"](sample).shape, (2, 1))
         self.assertEqual(models["sfno_mlp"](sample).shape, (2, 1))
 
+
+    def test_sfno_integrated_gradients_use_checkpoint_mean_and_render_four_fields(self):
+        class Coordinates:
+            latitudes = np.linspace(-75.0, 75.0, 7)
+            longitudes = np.arange(8) * 45.0
+
+        encoder = MockSFNOEncoder()
+        head = LinearProbe(encoder.feature_dim)
+        with torch.no_grad():
+            head.output.weight.fill_(1.0)
+            head.output.bias.zero_()
+        model = FrozenSFNOProbe(encoder, head, "sfno_linear").eval()
+        sample = encoder.norm_mean.squeeze(0).expand(-1, 7, 8).clone() + 1.0
+        baseline = resolve_attribution_baseline(
+            sample, {"baseline": {"kind": "global_training_mean"}}, model=model,
+        )
+        self.assertTrue(torch.equal(baseline, encoder.norm_mean.squeeze(0).expand_as(sample)))
+        differentiable = sample.unsqueeze(0).detach().requires_grad_(True)
+        model(differentiable).sum().backward()
+        self.assertGreater(float(differentiable.grad.abs().sum()), 0.0)
+        self.assertIsNone(encoder.anchor.grad)
+        with torch.no_grad():
+            logit = float(model(sample.unsqueeze(0)).item())
+        cases = [
+            {"input": sample, "logit": logit, "true_class": "real", "selection": "highest", "dataset_index": 0, "time": "2020-01-01"},
+            {"input": sample + 0.5, "logit": logit, "true_class": "fake", "selection": "lowest", "dataset_index": 1, "time": "2020-01-02"},
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "cartopy.mpl.geoaxes.GeoAxes.coastlines"
+        ):
+            output = Path(directory) / "sfno_gallery.png"
+            rows = create_interpretability_gallery(
+                model, cases, Coordinates(), SFNO_VARIABLES, {}, {},
+                {"method": "integrated_gradients", "baseline": {"kind": "global_training_mean"},
+                 "steps": 2, "internal_batch_size": 2},
+                torch.device("cpu"), output, "sfno_linear", "forecast", "fixture",
+            )
+            self.assertTrue(output.is_file())
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(row["baseline_kind"] == "sfno_checkpoint_mean" for row in rows))
+            self.assertTrue(all("attribution_sum_mean_sea_level_pressure" in row for row in rows))
+            self.assertTrue(all(abs(row["completeness_residual"]) < 1e-4 for row in rows))
 
     def test_integrated_gradients_is_complete_for_linear_logit(self):
         class LinearLogit(torch.nn.Module):

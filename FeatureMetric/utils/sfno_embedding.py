@@ -205,7 +205,6 @@ class SFNOEmbedding(nn.Module):
         # flatten: full (C, h, w) concatenation. High-dim — use with MMD, not FID.
         return emb.flatten(1)
 
-    @torch.no_grad()
     def encode(self, x, corruption_fn=None):
         """Raw fields ``(B, 4, 121, 240)`` → SFNO spatial embedding ``(B, C, h, w)``.
 
@@ -225,13 +224,16 @@ class SFNOEmbedding(nn.Module):
             xn = corruption_fn(xn)
         return self.model(xn, self.static_channels)
 
-    @torch.no_grad()
-    def extract_features(self, x, corruption_fn=None):
-        """Raw fields ``(B, 4, 121, 240)`` → pooled feature vector ``(B, feature_dim)``.
+    def extract_features(self, x, corruption_fn=None, enable_input_grad=False):
+        """Raw fields → pooled features, optionally retaining gradients to inputs.
 
-        ``corruption_fn`` is applied in standardized space (see :meth:`encode`).
+        Normal SFNO evaluation retains the historical no-grad behavior. Set
+        ``enable_input_grad`` only for input-attribution methods such as IG.
         """
-        return self._pool(self.encode(x, corruption_fn=corruption_fn))
+        if enable_input_grad:
+            return self._pool(self.encode(x, corruption_fn=corruption_fn))
+        with torch.no_grad():
+            return self._pool(self.encode(x, corruption_fn=corruption_fn))
 
     def forward(self, x):
         return self.extract_features(x)

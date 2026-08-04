@@ -104,8 +104,11 @@ class FrozenSFNOProbe(torch.nn.Module):
         return self
 
     def forward(self, inputs):
-        with torch.no_grad():
-            features = self.encoder.extract_features(inputs)
+        # Encoder parameters are frozen, but do not suppress input gradients:
+        # integrated gradients needs to differentiate a logit back to raw fields.
+        features = self.encoder.extract_features(
+            inputs, enable_input_grad=bool(torch.is_grad_enabled() and inputs.requires_grad)
+        )
         return self.head(features)
 
 
@@ -386,12 +389,19 @@ def binary_classification_metrics(
     }
 
 
-def resolve_attribution_baseline(inputs, settings, metadata=None):
-    """Resolve an IG baseline through an extensible configuration interface."""
+def resolve_attribution_baseline(inputs, settings, metadata=None, model=None):
+    """Resolve an IG baseline for normalized CNN or raw SFNO inputs."""
     baseline = settings.get("baseline", {}) or {}
     kind = str(baseline.get("kind", "global_training_mean"))
     if kind != "global_training_mean":
         raise ValueError(f"Unsupported interpretability baseline kind: {kind}")
+    if bool(getattr(model, "expects_raw_fields", False)):
+        # SFNO receives physical units and normalizes internally. Its checkpoint
+        # mean is therefore the raw-field baseline corresponding to zero input.
+        mean = model.encoder.norm_mean.detach().cpu().reshape(-1, 1, 1)
+        if inputs.shape[0] != mean.shape[0]:
+            raise ValueError("SFNO attribution baseline has incompatible channel count.")
+        return mean.expand_as(inputs).clone()
     # SqueezeNet inputs are standardized with the global training mean/std.
     return torch.zeros_like(inputs)
 
@@ -518,88 +528,147 @@ def create_interpretability_gallery(
     model, cases, dataset, variables, means, stds, settings, device,
     output_path, architecture, kind, target,
 ):
-    """Create physical-field/IG pairs for independently selected real and fake cases."""
+    """Create held-out physical-field/IG galleries for CNN or four-field SFNO inputs."""
     method = str(settings.get("method", "integrated_gradients"))
     if method != "integrated_gradients":
         raise ValueError(f"Unsupported interpretability method: {method}")
+    raw_sfno = bool(getattr(model, "expects_raw_fields", False))
     rows = []
     for case in cases:
-        baseline = resolve_attribution_baseline(case["input"], settings, case)
+        baseline = resolve_attribution_baseline(case["input"], settings, case, model=model)
         attribution, diagnostics = integrated_gradients(
             model, case["input"], baseline, device,
             steps=int(settings.get("steps", 32)),
             internal_batch_size=int(settings.get("internal_batch_size", 8)),
         )
-        physical = case["input"][0].numpy() * float(stds[variables[0]]) + float(means[variables[0]])
-        relevance = attribution.sum(dim=0).numpy()
-        rows.append((case, physical, relevance, diagnostics))
+        if raw_sfno:
+            physical = case["input"].numpy()
+        else:
+            physical = np.stack([
+                case["input"][channel].numpy() * float(stds[variable]) + float(means[variable])
+                for channel, variable in enumerate(variables)
+            ])
+        rows.append((case, physical, attribution.numpy(), diagnostics))
     if not rows:
         raise ValueError("No held-out cases were selected for interpretability.")
 
-    physical_min = min(float(np.nanmin(row[1])) for row in rows)
-    physical_max = max(float(np.nanmax(row[1])) for row in rows)
-    relevance_limit = float(np.nanpercentile(
-        np.concatenate([np.abs(row[2]).ravel() for row in rows]), 99.0
-    ))
-    relevance_limit = max(relevance_limit, np.finfo(np.float32).eps)
     projection = ccrs.PlateCarree()
-    figure, axes = plt.subplots(
-        len(rows), 2, figsize=(13, max(3.0 * len(rows), 6.0)),
-        subplot_kw={"projection": projection}, squeeze=False,
-    )
-    physical_artist = relevance_artist = None
     metadata_rows = []
-    for row_index, (case, physical, relevance, diagnostics) in enumerate(rows):
-        physical_artist = axes[row_index, 0].pcolormesh(
-            dataset.longitudes, dataset.latitudes, physical, shading="auto",
-            cmap="coolwarm", vmin=physical_min, vmax=physical_max, transform=projection,
+    if not raw_sfno:
+        physical_min = min(float(np.nanmin(row[1][0])) for row in rows)
+        physical_max = max(float(np.nanmax(row[1][0])) for row in rows)
+        relevance_limit = max(float(np.nanpercentile(
+            np.concatenate([np.abs(row[2].sum(axis=0)).ravel() for row in rows]), 99.0
+        )), np.finfo(np.float32).eps)
+        figure, axes = plt.subplots(
+            len(rows), 2, figsize=(13, max(3.0 * len(rows), 6.0)),
+            subplot_kw={"projection": projection}, squeeze=False,
         )
-        relevance_artist = axes[row_index, 1].pcolormesh(
-            dataset.longitudes, dataset.latitudes, relevance, shading="auto",
-            cmap="RdBu_r", vmin=-relevance_limit, vmax=relevance_limit, transform=projection,
+        physical_artist = relevance_artist = None
+        for row_index, (case, physical, attribution, diagnostics) in enumerate(rows):
+            relevance = attribution.sum(axis=0)
+            physical_artist = axes[row_index, 0].pcolormesh(
+                dataset.longitudes, dataset.latitudes, physical[0], shading="auto",
+                cmap="coolwarm", vmin=physical_min, vmax=physical_max, transform=projection,
+            )
+            relevance_artist = axes[row_index, 1].pcolormesh(
+                dataset.longitudes, dataset.latitudes, relevance, shading="auto",
+                cmap="RdBu_r", vmin=-relevance_limit, vmax=relevance_limit, transform=projection,
+            )
+            _title_interpretability_case(axes[row_index, 0], case, diagnostics)
+            axes[row_index, 1].set_title("Signed integrated gradients (positive supports ERA5)", fontsize=8)
+            for axis in axes[row_index]:
+                axis.coastlines(linewidth=0.45); axis.set_global()
+            metadata_rows.append(_interpretability_metadata(
+                case, diagnostics, architecture, kind, target, output_path, "standardized_zero", variables, attribution,
+            ))
+        figure.suptitle(f"{architecture}: {kind}/{target} — held-out logit cases", fontsize=12)
+        figure.subplots_adjust(top=0.94, bottom=0.12, left=0.03, right=0.97, hspace=0.32, wspace=0.12)
+        figure.colorbar(physical_artist, cax=figure.add_axes([0.08, 0.035, 0.36, 0.015]), orientation="horizontal", label=f"{variables[0]} (physical units)")
+        figure.colorbar(relevance_artist, cax=figure.add_axes([0.56, 0.035, 0.36, 0.015]), orientation="horizontal", label="Integrated-gradient attribution")
+    else:
+        if list(variables) != SFNO_VARIABLES:
+            raise ValueError("SFNO interpretability requires the fixed four-field channel order.")
+        field_limits = {
+            variable: (min(float(np.nanmin(row[1][channel])) for row in rows),
+                       max(float(np.nanmax(row[1][channel])) for row in rows))
+            for channel, variable in enumerate(variables)
+        }
+        relevance_values = np.concatenate([
+            np.concatenate([row[2].ravel(), row[2].sum(axis=0).ravel()]) for row in rows
+        ])
+        relevance_limit = max(float(np.nanpercentile(np.abs(relevance_values), 99.0)), np.finfo(np.float32).eps)
+        figure, axes = plt.subplots(
+            len(rows) * 2, 5, figsize=(22, max(4.5 * len(rows), 8.0)),
+            subplot_kw={"projection": projection}, squeeze=False,
         )
-        for axis in axes[row_index]:
-            axis.coastlines(linewidth=0.45)
-            axis.set_global()
-        predicted = "real" if case["logit"] >= 0.0 else "fake"
-        details = [
-            case.get("time"),
-            "+{}h".format(case.get("lead_hour")) if case.get("lead_hour") is not None else None,
-            "severity={:.4g}".format(case.get("severity")) if case.get("severity") is not None else None,
-        ]
-        details = ", ".join(str(value) for value in details if value)
-        title = "{} {} | {} | logit={:.3f}, predicted={}, IG residual={:.2e}".format(
-            case["true_class"], case["selection"], details, case["logit"], predicted,
-            diagnostics["completeness_residual"],
-        )
-        axes[row_index, 0].set_title(title, fontsize=8, loc="left")
-        axes[row_index, 1].set_title("Signed integrated gradients (positive supports ERA5)", fontsize=8)
-        metadata_rows.append({
-            "architecture": architecture, "kind": kind, "target": target,
-            "true_class": case["true_class"], "selection": case["selection"],
-            "dataset_index": case["dataset_index"], "time": case.get("time", ""),
-            "initialization_time": case.get("initialization_time", ""),
-            "valid_time": case.get("valid_time", ""), "lead_hour": case.get("lead_hour", ""),
-            "severity": case.get("severity", ""), "logit": case["logit"],
-            "predicted_class": predicted, "correct": predicted == case["true_class"],
-            **diagnostics, "gallery_path": str(output_path),
-        })
-    figure.suptitle(f"{architecture}: {kind}/{target} — held-out logit cases", fontsize=12)
-    figure.subplots_adjust(top=0.94, bottom=0.12, left=0.03, right=0.97, hspace=0.32, wspace=0.12)
-    physical_colorbar_axis = figure.add_axes([0.08, 0.035, 0.36, 0.015])
-    relevance_colorbar_axis = figure.add_axes([0.56, 0.035, 0.36, 0.015])
-    figure.colorbar(
-        physical_artist, cax=physical_colorbar_axis, orientation="horizontal",
-        label=f"{variables[0]} (physical units)",
-    )
-    figure.colorbar(
-        relevance_artist, cax=relevance_colorbar_axis, orientation="horizontal",
-        label="Integrated-gradient attribution",
-    )
+        field_artists, relevance_artist = [None] * len(variables), None
+        for row_index, (case, physical, attribution, diagnostics) in enumerate(rows):
+            top, bottom = axes[2 * row_index], axes[2 * row_index + 1]
+            _title_interpretability_case(top[0], case, diagnostics)
+            for channel, variable in enumerate(variables):
+                vmin, vmax = field_limits[variable]
+                field_artists[channel] = top[channel].pcolormesh(
+                    dataset.longitudes, dataset.latitudes, physical[channel], shading="auto", cmap="coolwarm",
+                    vmin=vmin, vmax=vmax, transform=projection,
+                )
+                relevance_artist = bottom[channel].pcolormesh(
+                    dataset.longitudes, dataset.latitudes, attribution[channel], shading="auto", cmap="RdBu_r",
+                    vmin=-relevance_limit, vmax=relevance_limit, transform=projection,
+                )
+                top[channel].set_title(variable if channel else top[channel].get_title() + f" | {variable}", fontsize=8, loc="left")
+                bottom[channel].set_title(f"IG: {variable}", fontsize=8)
+            aggregate = attribution.sum(axis=0)
+            relevance_artist = bottom[4].pcolormesh(
+                dataset.longitudes, dataset.latitudes, aggregate, shading="auto", cmap="RdBu_r",
+                vmin=-relevance_limit, vmax=relevance_limit, transform=projection,
+            )
+            bottom[4].set_title("IG: all-channel sum", fontsize=8)
+            top[4].set_visible(False)
+            for axis in (*top[:4], *bottom):
+                axis.coastlines(linewidth=0.4); axis.set_global()
+            metadata_rows.append(_interpretability_metadata(
+                case, diagnostics, architecture, kind, target, output_path, "sfno_checkpoint_mean", variables, attribution,
+            ))
+        figure.suptitle(f"{architecture}: {kind}/{target} — held-out SFNO integrated gradients", fontsize=12)
+        figure.subplots_adjust(top=0.96, bottom=0.12, left=0.025, right=0.985, hspace=0.28, wspace=0.08)
+        for channel, variable in enumerate(variables):
+            figure.colorbar(field_artists[channel], cax=figure.add_axes([0.03 + channel * 0.23, 0.045, 0.17, 0.012]), orientation="horizontal", label=variable)
+        figure.colorbar(relevance_artist, cax=figure.add_axes([0.83, 0.045, 0.14, 0.012]), orientation="horizontal", label="IG relevance")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
     return metadata_rows
+
+
+def _title_interpretability_case(axis, case, diagnostics):
+    predicted = "real" if case["logit"] >= 0.0 else "fake"
+    details = [case.get("time"),
+               "+{}h".format(case.get("lead_hour")) if case.get("lead_hour") is not None else None,
+               "severity={:.4g}".format(case.get("severity")) if case.get("severity") is not None else None]
+    details = ", ".join(str(value) for value in details if value)
+    axis.set_title(
+        "{} {} | {} | logit={:.3f}, predicted={}, IG residual={:.2e}".format(
+            case["true_class"], case["selection"], details, case["logit"], predicted,
+            diagnostics["completeness_residual"],
+        ), fontsize=8, loc="left",
+    )
+
+
+def _interpretability_metadata(case, diagnostics, architecture, kind, target, output_path, baseline_kind, variables, attribution):
+    predicted = "real" if case["logit"] >= 0.0 else "fake"
+    metadata = {
+        "architecture": architecture, "kind": kind, "target": target,
+        "true_class": case["true_class"], "selection": case["selection"],
+        "dataset_index": case["dataset_index"], "time": case.get("time", ""),
+        "initialization_time": case.get("initialization_time", ""),
+        "valid_time": case.get("valid_time", ""), "lead_hour": case.get("lead_hour", ""),
+        "severity": case.get("severity", ""), "logit": case["logit"],
+        "predicted_class": predicted, "correct": predicted == case["true_class"],
+        "baseline_kind": baseline_kind, **diagnostics, "gallery_path": str(output_path),
+    }
+    metadata.update({f"attribution_sum_{variable}": float(attribution[channel].sum()) for channel, variable in enumerate(variables)})
+    return metadata
 
 
 def write_interpretability_cases(root, records):
@@ -608,7 +677,9 @@ def write_interpretability_cases(root, records):
     fields = [
         "architecture", "kind", "target", "true_class", "selection", "dataset_index",
         "time", "initialization_time", "valid_time", "lead_hour", "severity", "logit",
-        "predicted_class", "correct", "input_logit", "baseline_logit", "attribution_sum",
+        "predicted_class", "correct", "baseline_kind", "input_logit", "baseline_logit", "attribution_sum",
+        "attribution_sum_2m_temperature", "attribution_sum_10m_u_component_of_wind",
+        "attribution_sum_10m_v_component_of_wind", "attribution_sum_mean_sea_level_pressure",
         "completeness_residual", "gallery_path",
     ]
     with open(path, "w", newline="") as handle:
@@ -631,7 +702,7 @@ def load_target_squeezenet_checkpoint(path, cfg, device, architecture, variables
 
 
 def plot_target_discriminator_interpretability(cfg):
-    """Regenerate IG galleries from saved target-discriminator checkpoints."""
+    """Regenerate CNN and SFNO IG galleries from saved target checkpoints."""
     settings = get(cfg, "interpretability", {}) or {}
     if not bool(settings.get("enabled", True)):
         return [], None
@@ -647,14 +718,28 @@ def plot_target_discriminator_interpretability(cfg):
                 continue
             checkpoint = checkpoint_root / architecture / kind / label.replace(" ", "_") / "model.pth"
             if checkpoint.is_file():
-                tasks.append((architecture, kind, label, paths, corruption, checkpoint))
-    if not tasks:
-        print(f"Skipping target interpretability: no SqueezeNet checkpoints under {checkpoint_root}.")
-        return [], None
+                tasks.append((architecture, kind, label, paths, corruption, checkpoint, variables, None))
 
+    sfno_encoder = None
+    sfno_tasks = []
+    for architecture in ("sfno_linear", "sfno_mlp"):
+        for kind, label, paths, corruption in target_specs(cfg, SFNO_VARIABLES):
+            checkpoint = checkpoint_root / architecture / kind / label.replace(" ", "_") / "model.pth"
+            if checkpoint.is_file():
+                sfno_tasks.append((architecture, kind, label, paths, corruption, checkpoint, SFNO_VARIABLES, None))
+    if sfno_tasks:
+        try:
+            sfno_encoder = load_sfno_encoder(cfg, device)
+            tasks.extend(sfno_tasks)
+        except FileNotFoundError as error:
+            print(f"Skipping SFNO target interpretability: {error}")
+    if not tasks:
+        print(f"Skipping target interpretability: no compatible checkpoints under {checkpoint_root}.")
+        return [], None
     if not Path(str(cfg.real_nc_file)).is_file():
         print(f"Skipping target interpretability: missing ERA5 input {cfg.real_nc_file}.")
         return [], None
+
     torch.manual_seed(seed)
     np.random.seed(seed)
     real = safe_open_dataset(cfg.real_nc_file)
@@ -663,31 +748,41 @@ def plot_target_discriminator_interpretability(cfg):
     corruption_stds = {variable: max(float(corruption_train[variable].std()), 1e-8) for variable in variables}
     maximum = int(get(cfg, "max_eval_samples", 0))
     random_count = int(settings.get("random_samples_per_class", 2))
-    galleries = []
-    rows = []
+    galleries, rows = [], []
     try:
-        for architecture, kind, label, paths, corruption, checkpoint in tqdm(
+        for architecture, kind, label, paths, corruption, checkpoint, input_variables, _ in tqdm(
             tasks, desc="Plotting target interpretability"
         ):
+            raw_sfno = architecture in {"sfno_linear", "sfno_mlp"}
             fake = corruption_train if corruption else open_model_forecasts(paths)
             try:
-                train_records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
-                means, stds = (
-                    (corruption_means, corruption_stds) if corruption
-                    else matched_statistics(real, train_records, variables)
-                )
                 test_real, test_fake, test_records = target_test_inputs(real, fake, cfg, corruption)
-                dataset = BalancedTargetDataset(
-                    test_real, test_fake, variables, means, stds, cfg.lead_times, corruption, maximum,
-                    float(get(cfg, "corruption_power")),
-                    target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
-                    cfg, test_records, deterministic_seed=seed,
-                    equator_mask_degrees=(float((get(cfg, "equator_masked_hemisphere_splice", {}) or {}).get("half_width_degrees", 10.0))
-                                          if architecture == "squeezenet_equator_mask" else 0.0),
-                )
-                model = load_target_squeezenet_checkpoint(checkpoint, cfg, device, architecture, variables)
-                if architecture == "squeezenet_equator_mask":
-                    model.equator_mask_degrees = float((get(cfg, "equator_masked_hemisphere_splice", {}) or {}).get("half_width_degrees", 10.0))
+                if raw_sfno:
+                    model, _ = load_sfno_probe_checkpoint(checkpoint, cfg, device, encoder=sfno_encoder)
+                    model.sfno_use_era5_context, model.sfno_target_variables = sfno_context_settings(cfg)
+                    dataset = SFNOTargetDataset(
+                        test_real, test_fake, model.encoder, cfg.lead_times, corruption, maximum,
+                        float(get(cfg, "corruption_power")),
+                        target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
+                        cfg, test_records,
+                    )
+                    gallery_means, gallery_stds = {}, {}
+                else:
+                    train_records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
+                    means, stds = ((corruption_means, corruption_stds) if corruption
+                                   else matched_statistics(real, train_records, variables))
+                    dataset = BalancedTargetDataset(
+                        test_real, test_fake, variables, means, stds, cfg.lead_times, corruption, maximum,
+                        float(get(cfg, "corruption_power")),
+                        target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
+                        cfg, test_records, deterministic_seed=seed,
+                        equator_mask_degrees=(float((get(cfg, "equator_masked_hemisphere_splice", {}) or {}).get("half_width_degrees", 10.0))
+                                              if architecture == "squeezenet_equator_mask" else 0.0),
+                    )
+                    model = load_target_squeezenet_checkpoint(checkpoint, cfg, device, architecture, variables)
+                    if architecture == "squeezenet_equator_mask":
+                        model.equator_mask_degrees = float((get(cfg, "equator_masked_hemisphere_splice", {}) or {}).get("half_width_degrees", 10.0))
+                    gallery_means, gallery_stds = means, stds
                 cases = binary_classification_metrics(
                     model, dataset, device, int(get(cfg, "batch_size")),
                     f"Selecting IG cases {architecture} {kind}/{label}",
@@ -696,20 +791,17 @@ def plot_target_discriminator_interpretability(cfg):
                 gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
                                 f"{safe_target_name(label)}_integrated_gradients.png")
                 gallery_rows = create_interpretability_gallery(
-                    model, cases, dataset, variables, means, stds, settings, device, gallery_path,
-                    architecture, kind, label,
+                    model, cases, dataset, input_variables, gallery_means, gallery_stds, settings, device,
+                    gallery_path, architecture, kind, label,
                 )
-                galleries.append(gallery_path)
-                rows.extend(gallery_rows)
+                galleries.append(gallery_path); rows.extend(gallery_rows)
                 print(f"Saved target interpretability gallery to: {gallery_path}")
             finally:
                 if not corruption:
                     fake.close()
     finally:
         real.close()
-    cases_path = write_interpretability_cases(root, rows)
-    return galleries, cases_path
-
+    return galleries, write_interpretability_cases(root, rows)
 
 
 def target_test_inputs(real, fake, cfg, corruption):
@@ -877,6 +969,7 @@ class SFNOTargetDataset(Dataset):
         self.use_era5_context, self.target_variables = sfno_context_settings(cfg)
         self.paired_records = evenly_spaced_pairs(paired_records or [], max_samples)
         self.latitudes = np.asarray(fake.latitude.values, dtype=np.float64)
+        self.longitudes = np.asarray(fake.longitude.values, dtype=np.float64)
         self.donor_positions = None
         self.donor_seed = int(get(cfg, "seed", 0))
         if corruption == "hemisphere_splice":
@@ -1340,7 +1433,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
         test_real, test_fake, test_records = target_test_inputs(real, fake, cfg, corruption)
         maximum = int(get(cfg, "max_eval_samples", 0))
         interpretability = get(cfg, "interpretability", {}) or {}
-        supports_attribution = architecture in {"squeezenet", "squeezenet_attention", "squeezenet_equator_mask"}
+        supports_attribution = architecture in {"squeezenet", "squeezenet_attention", "squeezenet_equator_mask", "sfno_linear", "sfno_mlp"}
         attribution_enabled = bool(interpretability.get("enabled", True)) and supports_attribution
         attribution_seed = int(interpretability.get("seed", get(cfg, "seed", 0)))
         random_count = int(interpretability.get("random_samples_per_class", 2)) if attribution_enabled else 0
