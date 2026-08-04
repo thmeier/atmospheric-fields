@@ -1,0 +1,1538 @@
+"""Train target-only ERA5 discriminators and plot reverse-KL baseline curves."""
+import csv
+import os
+from contextlib import nullcontext
+from pathlib import Path
+import sys
+import hydra
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import numpy as np
+import torch
+from omegaconf import DictConfig, OmegaConf
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+try:
+    from .train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
+    from .plot_standard_metric_baselines import (
+        DATA_DEPENDENT_CORRUPTIONS,
+        STRUCTURED_NEAR_NULL_CORRUPTIONS,
+        apply_special_baseline_corruption,
+        corruption_sample_seed,
+        deranged_sample_positions,
+    )
+    from .monthly_split import (
+        concatenate_forecasts,
+        evenly_spaced_pairs,
+        forecast_pairs,
+        select_era5_split,
+    )
+except ImportError:
+    from train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
+    from plot_standard_metric_baselines import (
+        DATA_DEPENDENT_CORRUPTIONS,
+        STRUCTURED_NEAR_NULL_CORRUPTIONS,
+        apply_special_baseline_corruption,
+        corruption_sample_seed,
+        deranged_sample_positions,
+    )
+    from monthly_split import (
+        concatenate_forecasts,
+        evenly_spaced_pairs,
+        forecast_pairs,
+        select_era5_split,
+    )
+
+
+SPECIAL_CORRUPTIONS = STRUCTURED_NEAR_NULL_CORRUPTIONS | DATA_DEPENDENT_CORRUPTIONS
+SFNO_VARIABLES = [
+    "2m_temperature",
+    "10m_u_component_of_wind",
+    "10m_v_component_of_wind",
+    "mean_sea_level_pressure",
+]
+
+
+class LinearProbe(torch.nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.output = torch.nn.Linear(int(feature_dim), 1)
+
+    def forward(self, features):
+        return self.output(features)
+
+
+class ResidualMLPProbe(torch.nn.Module):
+    """Pre-normalized two-layer residual MLP followed by a scalar readout."""
+
+    def __init__(self, feature_dim, hidden_multiplier=2.0, dropout=0.1):
+        super().__init__()
+        feature_dim = int(feature_dim)
+        hidden_dim = int(round(feature_dim * float(hidden_multiplier)))
+        self.normalization = torch.nn.BatchNorm1d(feature_dim)
+        self.first = torch.nn.Linear(feature_dim, hidden_dim)
+        self.second = torch.nn.Linear(hidden_dim, feature_dim)
+        self.dropout = torch.nn.Dropout(float(dropout))
+        self.output = torch.nn.Linear(feature_dim, 1)
+
+    def forward(self, features):
+        residual = self.normalization(features)
+        residual = self.dropout(F.gelu(self.first(residual)))
+        residual = self.dropout(self.second(residual))
+        return self.output(F.gelu(features + residual))
+
+
+class FrozenSFNOProbe(torch.nn.Module):
+    """Frozen four-field SFNO encoder with a trainable scalar probe."""
+
+    expects_raw_fields = True
+
+    def __init__(self, encoder, head, architecture):
+        super().__init__()
+        self.encoder = encoder
+        self.head = head
+        self.architecture = str(architecture)
+        self.input_variables = tuple(SFNO_VARIABLES)
+        self.encoder.requires_grad_(False)
+        self.encoder.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.encoder.eval()
+        return self
+
+    def forward(self, inputs):
+        with torch.no_grad():
+            features = self.encoder.extract_features(inputs)
+        return self.head(features)
+
+
+def sfno_settings(cfg):
+    if cfg.get("target_discriminator") is not None:
+        return cfg.target_discriminator.get("sfno", {}) or {}
+    baseline = cfg.get("baseline", {}) or {}
+    discriminator = baseline.get("discriminator", {}) or {}
+    return discriminator.get("sfno", {}) or {}
+
+
+def sfno_context_settings(cfg):
+    settings = sfno_settings(cfg)
+    targets = tuple(settings.get("target_variables", ["2m_temperature"]))
+    return bool(settings.get("use_era5_context_for_non_target_fields", False)), targets
+
+
+def load_sfno_encoder(cfg, device):
+    """Load the shared FeatureMetric SFNO adapter without requiring installation."""
+    repository_root = Path(__file__).resolve().parents[2]
+    if str(repository_root) not in sys.path:
+        sys.path.insert(0, str(repository_root))
+    from FeatureMetric.utils.sfno_embedding import SFNOEmbedding
+
+    settings = sfno_settings(cfg)
+    repo_root = settings.get("repo_root") or os.environ.get("SFNO_REPO")
+    encoder = SFNOEmbedding(
+        embedding_channels=int(settings.get("embedding_channels", 8)),
+        embedding_resolution=tuple(settings.get("embedding_resolution", [31, 60])),
+        repo_root=repo_root,
+        pooling=str(settings.get("pooling", "grid")),
+        pool_grid=tuple(settings.get("pool_grid", [7, 8])),
+        weights_subdir=str(settings.get("weights_subdir", "weights_4fields")),
+    ).to(device)
+    encoder.requires_grad_(False)
+    return encoder.eval()
+
+
+def build_sfno_probe(encoder, architecture, cfg):
+    settings = sfno_settings(cfg)
+    if architecture == "sfno_linear":
+        head = LinearProbe(encoder.feature_dim)
+    elif architecture == "sfno_mlp":
+        head = ResidualMLPProbe(
+            encoder.feature_dim,
+            hidden_multiplier=float(settings.get("mlp_hidden_multiplier", 2.0)),
+            dropout=float(settings.get("mlp_dropout", 0.1)),
+        )
+    else:
+        raise ValueError(f"Unknown SFNO probe architecture: {architecture}")
+    return FrozenSFNOProbe(encoder, head.to(next(encoder.parameters()).device), architecture)
+
+
+def target_corruption_max(cfg, corruption):
+    section = target_settings(cfg)
+    maximum = section.get('corruption_severity_max', 0.2)
+    overrides = section.get('corruption_severity_max_overrides', {}) or {}
+    return float(overrides.get(str(corruption), maximum))
+
+
+def target_corruption_min(cfg, corruption):
+    """Return the training-only lower severity bound for one corruption."""
+    section = target_settings(cfg)
+    minimum = section.get('corruption_severity_min', 0.0)
+    overrides = section.get('corruption_severity_min_overrides', {}) or {}
+    return float(overrides.get(str(corruption), minimum))
+
+
+def training_corruption_severity(corruption, severity_max, power, severity_min=0.0):
+    """Sample fake strength, reserving an uncorrupted splice for the real class."""
+    if corruption == "hemisphere_splice":
+        return float(severity_max)
+    severity_max, severity_min = float(severity_max), float(severity_min)
+    if severity_min < 0.0 or severity_min > severity_max:
+        raise ValueError(
+            f"Expected 0 <= severity_min <= severity_max, got "
+            f"{severity_min} and {severity_max}."
+        )
+    return severity_min + (severity_max - severity_min) * (
+        np.random.random() ** float(power)
+    )
+
+
+def deterministic_corruption_severity(corruption, severity_max, power, severity_min, seed):
+    """Deterministic counterpart used by held-out evaluation and attribution."""
+    if corruption == "hemisphere_splice":
+        return float(severity_max)
+    severity_max, severity_min = float(severity_max), float(severity_min)
+    if severity_min < 0.0 or severity_min > severity_max:
+        raise ValueError(f"Expected 0 <= severity_min <= severity_max, got {severity_min} and {severity_max}.")
+    draw = np.random.default_rng(int(seed)).random()
+    return severity_min + (severity_max - severity_min) * (draw ** float(power))
+
+
+def epoch_deranged_donor_positions(size, seed, epoch):
+    """Return a reproducible full donor derangement for one training epoch."""
+    size = int(size)
+    if size < 2:
+        raise ValueError("Hemisphere splice requires at least two samples.")
+    rng = np.random.default_rng(np.random.SeedSequence([int(seed), int(epoch)]))
+    source_order = rng.permutation(size)
+    donor_positions = np.empty(size, dtype=int)
+    donor_positions[source_order] = np.roll(source_order, -1)
+    return donor_positions
+
+
+def target_settings(cfg):
+    section = cfg.get("target_discriminator")
+    if section is not None:
+        return section
+    baseline = cfg.get("baseline", {}) or {}
+    return baseline.get("discriminator", {}) or {}
+
+
+def get(cfg, key, default=None):
+    value = target_settings(cfg).get(key)
+    return default if value is None else value
+
+
+def target_device(cfg):
+    """Resolve `device: auto` to CUDA when available, otherwise CPU."""
+    requested = get(cfg, "device", "auto")
+    if requested is None or str(requested).lower() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(str(requested))
+
+
+def mask_equatorial_band(sample, latitudes, half_width_degrees):
+    """Replace an equatorial latitude band by the standardized mean (zero)."""
+    if float(half_width_degrees) <= 0.0:
+        return sample
+    masked = sample.clone()
+    equator = torch.from_numpy(np.abs(np.asarray(latitudes)) <= float(half_width_degrees))
+    masked[:, equator.to(device=masked.device), :] = 0.0
+    return masked
+
+
+def fields(ds, variables, means, stds, time_index, lead_index=None):
+    sample = ds.isel(time=time_index)
+    if lead_index is not None: sample = sample.isel(prediction_timedelta=lead_index)
+    values = [
+        np.nan_to_num(
+            (
+                sample[v].transpose("latitude", "longitude").values.astype(np.float32)
+                - means[v]
+            )
+            / stds[v]
+        ).astype(np.float32)
+        for v in variables
+    ]
+    return torch.from_numpy(np.stack(values))
+
+
+def raw_fields(ds, variables, time_index, lead_index=None):
+    sample = ds.isel(time=time_index)
+    if lead_index is not None:
+        sample = sample.isel(prediction_timedelta=lead_index)
+    values = [
+        np.nan_to_num(
+            sample[v].transpose("latitude", "longitude").values.astype(np.float32)
+        ).astype(np.float32)
+        for v in variables
+    ]
+    return torch.from_numpy(np.stack(values))
+
+
+def sfno_normalization(encoder):
+    cached = getattr(encoder, "_target_norm_cpu", None)
+    if cached is None:
+        cached = (
+            encoder.norm_mean.detach().cpu().reshape(-1, 1, 1),
+            encoder.norm_std.detach().cpu().reshape(-1, 1, 1),
+        )
+        encoder._target_norm_cpu = cached
+    return cached
+
+
+def apply_sfno_corruption(
+    raw, encoder, corruption, severity, latitudes, cfg, donor=None,
+    maximum_severity=None, random_seed=None, target_variables=None,
+):
+    """Corrupt a raw field in the standardized space expected by SFNO."""
+    mean, std = sfno_normalization(encoder)
+    standardized = (raw.to(torch.float32) - mean) / std
+    channel_indices = ([SFNO_VARIABLES.index(variable) for variable in target_variables]
+                       if target_variables is not None else list(range(len(SFNO_VARIABLES))))
+    selected = standardized[channel_indices]
+    if corruption in SPECIAL_CORRUPTIONS:
+        standardized_donor = None
+        if donor is not None:
+            standardized_donor = ((donor.to(torch.float32) - mean) / std).numpy()[channel_indices]
+        corrupted = torch.from_numpy(
+            apply_special_baseline_corruption(
+                selected.numpy(), corruption, severity, latitudes, cfg,
+                standardized_donor,
+                maximum_severity=(
+                    target_corruption_max(cfg, corruption)
+                    if maximum_severity is None else maximum_severity
+                ),
+                random_seed=random_seed,
+            )
+        )
+    else:
+        corrupted = apply_configured_corruption(selected, corruption, severity)
+    result = standardized.clone()
+    result[channel_indices] = corrupted.to(torch.float32)
+    return (result * std + mean).to(torch.float32)
+
+
+def indices(ds, maximum):
+    n = ds.sizes.get("time", 0)
+    return np.arange(n) if maximum <= 0 or n <= maximum else np.linspace(0, n-1, maximum, dtype=int)
+
+
+def binary_classification_metrics(
+    model, dataset, device, batch_size, description, random_samples_per_class=0, seed=0,
+):
+    """Compute held-out metrics and retain bounded logit-selected case tensors."""
+    loader = DataLoader(dataset, batch_size=int(batch_size), shuffle=False, num_workers=0)
+    model.eval()
+    model_dtype = next(model.parameters()).dtype
+    total_loss = total_correct = total_count = 0
+    extrema = {0: {"highest": None, "lowest": None}, 1: {"highest": None, "lowest": None}}
+    random_candidates = {0: [], 1: []}
+    keep_random = max(0, int(random_samples_per_class)) + 4
+    rng = np.random.default_rng(int(seed))
+
+    with torch.no_grad():
+        for inputs, labels in tqdm(loader, desc=description, leave=False):
+            start = total_count
+            device_inputs = inputs.to(device=device, dtype=model_dtype)
+            device_labels = labels.to(device=device, dtype=model_dtype)
+            logits = model(device_inputs)
+            losses = F.binary_cross_entropy_with_logits(logits, device_labels, reduction="none")
+            total_loss += float(losses.sum().item())
+            total_correct += int(((logits >= 0.0) == (device_labels >= 0.5)).sum().item())
+            batch_count = int(labels.numel())
+            if random_samples_per_class:
+                for offset in range(batch_count):
+                    dataset_index = start + offset
+                    label = int(labels[offset].item() >= 0.5)
+                    case = {
+                        "dataset_index": dataset_index,
+                        "label": label,
+                        "logit": float(logits[offset].item()),
+                        "loss": float(losses[offset].item()),
+                        "input": inputs[offset].detach().cpu().clone(),
+                    }
+                    if hasattr(dataset, "sample_metadata"):
+                        case.update(dataset.sample_metadata(dataset_index))
+                    if extrema[label]["highest"] is None or case["logit"] > extrema[label]["highest"]["logit"]:
+                        extrema[label]["highest"] = case
+                    if extrema[label]["lowest"] is None or case["logit"] < extrema[label]["lowest"]["logit"]:
+                        extrema[label]["lowest"] = case
+                    random_candidates[label].append((float(rng.random()), case))
+                    random_candidates[label].sort(key=lambda item: item[0])
+                    del random_candidates[label][keep_random:]
+            total_count += batch_count
+    if not total_count:
+        raise ValueError(f"No samples available for {description}.")
+
+    selected = []
+    for label in (1, 0):
+        highest, lowest = extrema[label]["highest"], extrema[label]["lowest"]
+        for selection, case in (("highest", highest), ("lowest", lowest)):
+            if case is not None:
+                selected.append({**case, "selection": selection})
+        excluded = {case["dataset_index"] for case in (highest, lowest) if case is not None}
+        random_cases = [case for _, case in random_candidates[label]
+                        if case["dataset_index"] not in excluded][:int(random_samples_per_class)]
+        selected.extend({**case, "selection": f"random_{number + 1}"}
+                        for number, case in enumerate(random_cases))
+    return {
+        "loss": total_loss / total_count,
+        "accuracy": total_correct / total_count,
+        "n_samples": total_count,
+        "cases": selected,
+    }
+
+
+def resolve_attribution_baseline(inputs, settings, metadata=None):
+    """Resolve an IG baseline through an extensible configuration interface."""
+    baseline = settings.get("baseline", {}) or {}
+    kind = str(baseline.get("kind", "global_training_mean"))
+    if kind != "global_training_mean":
+        raise ValueError(f"Unsupported interpretability baseline kind: {kind}")
+    # SqueezeNet inputs are standardized with the global training mean/std.
+    return torch.zeros_like(inputs)
+
+
+def integrated_gradients(model, inputs, baseline, device, steps=32, internal_batch_size=8):
+    """Integrated gradients of the raw real-vs-fake logit using trapezoidal integration."""
+    if int(steps) < 1:
+        raise ValueError("Integrated gradients requires steps >= 1.")
+    model.eval()
+    dtype = next(model.parameters()).dtype
+    inputs = inputs.detach().to(device=device, dtype=dtype)
+    baseline = baseline.detach().to(device=device, dtype=dtype)
+    delta = inputs - baseline
+    alphas = torch.linspace(0.0, 1.0, int(steps) + 1, device=device, dtype=dtype)
+    gradient_sum = torch.zeros_like(inputs)
+    for start in range(0, len(alphas), int(internal_batch_size)):
+        alpha = alphas[start:start + int(internal_batch_size)]
+        scaled = baseline.unsqueeze(0) + alpha.reshape(-1, 1, 1, 1) * delta.unsqueeze(0)
+        scaled.requires_grad_(True)
+        logits = model(scaled).reshape(-1)
+        gradients = torch.autograd.grad(logits.sum(), scaled, retain_graph=False)[0]
+        weights = torch.ones_like(alpha)
+        weights[alpha == 0.0] = 0.5
+        weights[alpha == 1.0] = 0.5
+        gradient_sum += (gradients * weights.reshape(-1, 1, 1, 1)).sum(dim=0)
+    attribution = delta * gradient_sum / float(steps)
+    with torch.no_grad():
+        input_logit = float(model(inputs.unsqueeze(0)).item())
+        baseline_logit = float(model(baseline.unsqueeze(0)).item())
+    attribution_sum = float(attribution.sum().item())
+    residual = (input_logit - baseline_logit) - attribution_sum
+    return attribution.detach().cpu(), {
+        "input_logit": input_logit,
+        "baseline_logit": baseline_logit,
+        "attribution_sum": attribution_sum,
+        "completeness_residual": float(residual),
+    }
+
+
+
+def _logit_histogram_edges(values, bins=40):
+    finite = [np.asarray(value)[np.isfinite(value)] for value in values]
+    combined = np.concatenate([value for value in finite if value.size])
+    return np.histogram_bin_edges(combined, bins=max(2, int(bins)))
+
+
+def _plot_logit_histogram(reference, candidate, title, candidate_label, output_path, color="tab:red"):
+    edges = _logit_histogram_edges([reference, candidate])
+    figure, axis = plt.subplots(figsize=(6.4, 4.0))
+    axis.hist(reference, bins=edges, density=True, histtype="stepfilled", color="tab:blue", alpha=0.35, label="ERA5 test")
+    axis.hist(candidate, bins=edges, density=True, histtype="step", linewidth=2.0, color=color, label=candidate_label)
+    axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
+    axis.set(title=title, xlabel="Real-vs-fake logit", ylabel="Density")
+    axis.grid(alpha=0.25); axis.legend(); figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=200); plt.close(figure)
+
+
+def _plot_logit_histogram_overlay(groups, title, output_path):
+    edges = _logit_histogram_edges([value for group in groups for value in (group["reference"], group["candidate"])])
+    figure, axis = plt.subplots(figsize=(7.2, 4.4))
+    pooled_reference = np.concatenate([group["reference"] for group in groups])
+    axis.hist(pooled_reference, bins=edges, density=True, histtype="stepfilled", color="tab:blue", alpha=0.30, label="ERA5 test (pooled)")
+    colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(groups)))
+    for color, group in zip(colors, groups):
+        axis.hist(group["candidate"], bins=edges, density=True, histtype="step", linewidth=1.7, color=color, label=group["label"])
+    axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
+    axis.set(title=title, xlabel="Real-vs-fake logit", ylabel="Density")
+    axis.grid(alpha=0.25); axis.legend(fontsize=8, ncol=2); figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=200); plt.close(figure)
+
+
+def plot_target_test_logit_histograms(model, architecture, kind, label, test_real, test_fake, records,
+                                      corruption, variables, means, stds, cfg, device, maximum, batch_size):
+    """Plot held-out real/fake logit densities for every target test point."""
+    root = Path(str(get(cfg, "output_dir"))) / "plots" / "target_logit_distributions" / architecture / kind / safe_target_name(label)
+    groups = []
+    if corruption:
+        selected = indices(test_fake, maximum)
+        reference = logits_for(model, test_real, variables, means, stds, device, maximum, batch_size, cfg=cfg, selected_indices=selected)
+        maximum_severity = target_corruption_max(cfg, corruption)
+        levels = np.linspace(0.0, maximum_severity, int(get(cfg, "corruption_steps", 7)))
+        for severity in levels:
+            candidate = logits_for(model, test_fake, variables, means, stds, device, maximum, batch_size,
+                                   corruption=corruption, severity=float(severity), cfg=cfg,
+                                   maximum_severity=maximum_severity, selected_indices=selected)
+            name = f"severity={severity:.3g}"
+            path = root / f"severity_{severity:.3g}.png"
+            _plot_logit_histogram(reference, candidate, f"{architecture}: {label} ({name})", label, path)
+            groups.append({"label": name, "reference": reference, "candidate": candidate, "path": path})
+        overlay_path = root / "all_corruption_strengths.png"
+        _plot_logit_histogram_overlay(groups, f"{architecture}: {label} — all corruption strengths", overlay_path)
+    else:
+        for lead_index, lead in enumerate(np.asarray(test_fake.prediction_timedelta.values).astype("timedelta64[h]").astype(int)):
+            selected_records = [record for record in records if record.lead_index == lead_index]
+            selected_records = evenly_spaced_pairs(selected_records, maximum)
+            if not selected_records:
+                continue
+            forecast_indices = [record.forecast_index for record in selected_records]
+            reference_indices = [record.era5_index for record in selected_records]
+            reference = logits_for(model, test_real, variables, means, stds, device, maximum, batch_size, cfg=cfg, selected_indices=reference_indices)
+            candidate = logits_for(
+                model, test_fake, variables, means, stds, device, maximum, batch_size,
+                lead=lead_index, cfg=cfg, selected_indices=forecast_indices,
+                context_ds=(test_real if bool(getattr(model, "sfno_use_era5_context", False)) else None),
+                context_indices=(reference_indices if bool(getattr(model, "sfno_use_era5_context", False)) else None),
+            )
+            name = f"+{int(lead)}h"
+            path = root / f"lead_{int(lead):03d}h.png"
+            _plot_logit_histogram(reference, candidate, f"{architecture}: {label} ({name})", label, path)
+            groups.append({"label": name, "reference": reference, "candidate": candidate, "path": path})
+        overlay_path = root / "all_lead_times.png"
+        if groups:
+            _plot_logit_histogram_overlay(groups, f"{architecture}: {label} — all lead times", overlay_path)
+    return [group["path"] for group in groups] + ([overlay_path] if groups else [])
+
+def safe_target_name(value):
+    return "".join(character if character.isalnum() or character in "-_" else "_"
+                   for character in str(value)).strip("_")
+
+
+def create_interpretability_gallery(
+    model, cases, dataset, variables, means, stds, settings, device,
+    output_path, architecture, kind, target,
+):
+    """Create physical-field/IG pairs for independently selected real and fake cases."""
+    method = str(settings.get("method", "integrated_gradients"))
+    if method != "integrated_gradients":
+        raise ValueError(f"Unsupported interpretability method: {method}")
+    rows = []
+    for case in cases:
+        baseline = resolve_attribution_baseline(case["input"], settings, case)
+        attribution, diagnostics = integrated_gradients(
+            model, case["input"], baseline, device,
+            steps=int(settings.get("steps", 32)),
+            internal_batch_size=int(settings.get("internal_batch_size", 8)),
+        )
+        physical = case["input"][0].numpy() * float(stds[variables[0]]) + float(means[variables[0]])
+        relevance = attribution.sum(dim=0).numpy()
+        rows.append((case, physical, relevance, diagnostics))
+    if not rows:
+        raise ValueError("No held-out cases were selected for interpretability.")
+
+    physical_min = min(float(np.nanmin(row[1])) for row in rows)
+    physical_max = max(float(np.nanmax(row[1])) for row in rows)
+    relevance_limit = float(np.nanpercentile(
+        np.concatenate([np.abs(row[2]).ravel() for row in rows]), 99.0
+    ))
+    relevance_limit = max(relevance_limit, np.finfo(np.float32).eps)
+    projection = ccrs.PlateCarree()
+    figure, axes = plt.subplots(
+        len(rows), 2, figsize=(13, max(3.0 * len(rows), 6.0)),
+        subplot_kw={"projection": projection}, squeeze=False,
+    )
+    physical_artist = relevance_artist = None
+    metadata_rows = []
+    for row_index, (case, physical, relevance, diagnostics) in enumerate(rows):
+        physical_artist = axes[row_index, 0].pcolormesh(
+            dataset.longitudes, dataset.latitudes, physical, shading="auto",
+            cmap="coolwarm", vmin=physical_min, vmax=physical_max, transform=projection,
+        )
+        relevance_artist = axes[row_index, 1].pcolormesh(
+            dataset.longitudes, dataset.latitudes, relevance, shading="auto",
+            cmap="RdBu_r", vmin=-relevance_limit, vmax=relevance_limit, transform=projection,
+        )
+        for axis in axes[row_index]:
+            axis.coastlines(linewidth=0.45)
+            axis.set_global()
+        predicted = "real" if case["logit"] >= 0.0 else "fake"
+        details = [
+            case.get("time"),
+            "+{}h".format(case.get("lead_hour")) if case.get("lead_hour") is not None else None,
+            "severity={:.4g}".format(case.get("severity")) if case.get("severity") is not None else None,
+        ]
+        details = ", ".join(str(value) for value in details if value)
+        title = "{} {} | {} | logit={:.3f}, predicted={}, IG residual={:.2e}".format(
+            case["true_class"], case["selection"], details, case["logit"], predicted,
+            diagnostics["completeness_residual"],
+        )
+        axes[row_index, 0].set_title(title, fontsize=8, loc="left")
+        axes[row_index, 1].set_title("Signed integrated gradients (positive supports ERA5)", fontsize=8)
+        metadata_rows.append({
+            "architecture": architecture, "kind": kind, "target": target,
+            "true_class": case["true_class"], "selection": case["selection"],
+            "dataset_index": case["dataset_index"], "time": case.get("time", ""),
+            "initialization_time": case.get("initialization_time", ""),
+            "valid_time": case.get("valid_time", ""), "lead_hour": case.get("lead_hour", ""),
+            "severity": case.get("severity", ""), "logit": case["logit"],
+            "predicted_class": predicted, "correct": predicted == case["true_class"],
+            **diagnostics, "gallery_path": str(output_path),
+        })
+    figure.suptitle(f"{architecture}: {kind}/{target} — held-out logit cases", fontsize=12)
+    figure.subplots_adjust(top=0.94, bottom=0.12, left=0.03, right=0.97, hspace=0.32, wspace=0.12)
+    physical_colorbar_axis = figure.add_axes([0.08, 0.035, 0.36, 0.015])
+    relevance_colorbar_axis = figure.add_axes([0.56, 0.035, 0.36, 0.015])
+    figure.colorbar(
+        physical_artist, cax=physical_colorbar_axis, orientation="horizontal",
+        label=f"{variables[0]} (physical units)",
+    )
+    figure.colorbar(
+        relevance_artist, cax=relevance_colorbar_axis, orientation="horizontal",
+        label="Integrated-gradient attribution",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    return metadata_rows
+
+
+def write_interpretability_cases(root, records):
+    path = Path(root) / "data" / "target_interpretability_cases.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "architecture", "kind", "target", "true_class", "selection", "dataset_index",
+        "time", "initialization_time", "valid_time", "lead_hour", "severity", "logit",
+        "predicted_class", "correct", "input_logit", "baseline_logit", "attribution_sum",
+        "completeness_residual", "gallery_path",
+    ]
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
+    print(f"Saved target interpretability cases to: {path}")
+    return path
+
+
+def load_target_squeezenet_checkpoint(path, cfg, device, architecture, variables):
+    """Recreate one saved SqueezeNet target critic for post-training plotting."""
+    model = WeatherDiscriminator(
+        len(variables), ("squeezenet" if architecture == "squeezenet_equator_mask" else architecture), learning_rate=get(cfg, "learning_rate"),
+        pretrained_backbone=bool(get(cfg, "pretrained_backbone", True)),
+    ).to(device)
+    model.model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    model.eval()
+    return model
+
+
+def plot_target_discriminator_interpretability(cfg):
+    """Regenerate IG galleries from saved target-discriminator checkpoints."""
+    settings = get(cfg, "interpretability", {}) or {}
+    if not bool(settings.get("enabled", True)):
+        return [], None
+    variables = list(get(cfg, "variables"))
+    root = Path(str(get(cfg, "output_dir")))
+    checkpoint_root = root / "models" / "target_discriminators"
+    seed = int(settings.get("seed", get(cfg, "seed", 0)))
+    device = target_device(cfg)
+    tasks = []
+    for architecture in ("squeezenet", "squeezenet_attention", "squeezenet_equator_mask"):
+        for kind, label, paths, corruption in target_specs(cfg, variables):
+            if architecture == "squeezenet_equator_mask" and corruption != "hemisphere_splice":
+                continue
+            checkpoint = checkpoint_root / architecture / kind / label.replace(" ", "_") / "model.pth"
+            if checkpoint.is_file():
+                tasks.append((architecture, kind, label, paths, corruption, checkpoint))
+    if not tasks:
+        print(f"Skipping target interpretability: no SqueezeNet checkpoints under {checkpoint_root}.")
+        return [], None
+
+    if not Path(str(cfg.real_nc_file)).is_file():
+        print(f"Skipping target interpretability: missing ERA5 input {cfg.real_nc_file}.")
+        return [], None
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    real = safe_open_dataset(cfg.real_nc_file)
+    corruption_train = select_era5_split(real, cfg, "train", coverage="corruption")
+    corruption_means = {variable: float(corruption_train[variable].mean()) for variable in variables}
+    corruption_stds = {variable: max(float(corruption_train[variable].std()), 1e-8) for variable in variables}
+    maximum = int(get(cfg, "max_eval_samples", 0))
+    random_count = int(settings.get("random_samples_per_class", 2))
+    galleries = []
+    rows = []
+    try:
+        for architecture, kind, label, paths, corruption, checkpoint in tqdm(
+            tasks, desc="Plotting target interpretability"
+        ):
+            fake = corruption_train if corruption else open_model_forecasts(paths)
+            try:
+                train_records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
+                means, stds = (
+                    (corruption_means, corruption_stds) if corruption
+                    else matched_statistics(real, train_records, variables)
+                )
+                test_real, test_fake, test_records = target_test_inputs(real, fake, cfg, corruption)
+                dataset = BalancedTargetDataset(
+                    test_real, test_fake, variables, means, stds, cfg.lead_times, corruption, maximum,
+                    float(get(cfg, "corruption_power")),
+                    target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
+                    cfg, test_records, deterministic_seed=seed,
+                    equator_mask_degrees=(float((get(cfg, "equator_masked_hemisphere_splice", {}) or {}).get("half_width_degrees", 10.0))
+                                          if architecture == "squeezenet_equator_mask" else 0.0),
+                )
+                model = load_target_squeezenet_checkpoint(checkpoint, cfg, device, architecture, variables)
+                if architecture == "squeezenet_equator_mask":
+                    model.equator_mask_degrees = float((get(cfg, "equator_masked_hemisphere_splice", {}) or {}).get("half_width_degrees", 10.0))
+                cases = binary_classification_metrics(
+                    model, dataset, device, int(get(cfg, "batch_size")),
+                    f"Selecting IG cases {architecture} {kind}/{label}",
+                    random_samples_per_class=random_count, seed=seed,
+                ).get("cases", [])
+                gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
+                                f"{safe_target_name(label)}_integrated_gradients.png")
+                gallery_rows = create_interpretability_gallery(
+                    model, cases, dataset, variables, means, stds, settings, device, gallery_path,
+                    architecture, kind, label,
+                )
+                galleries.append(gallery_path)
+                rows.extend(gallery_rows)
+                print(f"Saved target interpretability gallery to: {gallery_path}")
+            finally:
+                if not corruption:
+                    fake.close()
+    finally:
+        real.close()
+    cases_path = write_interpretability_cases(root, rows)
+    return galleries, cases_path
+
+
+
+def target_test_inputs(real, fake, cfg, corruption):
+    """Build the held-out counterpart of one target training problem."""
+    if corruption:
+        test = select_era5_split(real, cfg, "test", coverage="corruption")
+        return test, test, None
+    pairs = forecast_pairs(fake, real, cfg, "test", cfg.lead_times)
+    if not pairs:
+        raise ValueError("No exact monthly test forecast/ERA5 pairs remain for target evaluation.")
+    return real, fake, pairs
+
+
+class BalancedTargetDataset(Dataset):
+    """Balanced real/fake data with reproducible held-out corruptions."""
+
+    def __init__(self, real, fake, variables, means, stds, leads, corruption=None,
+                 max_samples=0, power=2.0, severity_max=0.05, cfg=None,
+                 paired_records=None, deterministic_seed=None, equator_mask_degrees=0.0):
+        self.real, self.fake = real, fake
+        self.variables, self.means, self.stds = variables, means, stds
+        self.real_i, self.fake_i = indices(real, max_samples), indices(fake, max_samples)
+        self.leads = ([i for i, hours in enumerate(
+            np.asarray(fake.prediction_timedelta.values).astype("timedelta64[h]").astype(int)
+        ) if int(hours) in leads] if "prediction_timedelta" in fake.dims else [None])
+        self.corruption, self.power, self.severity_max = corruption, float(power), float(severity_max)
+        self.paired_records = evenly_spaced_pairs(paired_records or [], max_samples)
+        self.cfg = cfg
+        self.deterministic_seed = None if deterministic_seed is None else int(deterministic_seed)
+        self.latitudes = np.asarray(fake.latitude.values, dtype=np.float64)
+        self.equator_mask_degrees = float(equator_mask_degrees)
+        self.longitudes = np.asarray(fake.longitude.values, dtype=np.float64)
+        self.donor_positions = None
+        self.donor_seed = int(get(cfg, "seed", 0))
+        if corruption == "hemisphere_splice":
+            self.set_epoch(0)
+        self.n = len(self.paired_records) if self.paired_records else max(
+            len(self.real_i), len(self.fake_i) * len(self.leads)
+        )
+
+    def __len__(self):
+        return 2 * self.n
+
+    def set_epoch(self, epoch):
+        """Refresh hemisphere-splice donors once per training epoch."""
+        if self.corruption == "hemisphere_splice":
+            self.donor_positions = epoch_deranged_donor_positions(
+                len(self.fake_i), self.donor_seed, int(epoch)
+            )
+
+    def _sample_seed(self, position):
+        if self.deterministic_seed is None:
+            return None
+        return corruption_sample_seed(self.deterministic_seed, str(self.corruption), int(position))
+
+    def _severity(self, position):
+        minimum = target_corruption_min(self.cfg, self.corruption)
+        seed = self._sample_seed(position)
+        if seed is None:
+            return training_corruption_severity(
+                self.corruption, self.severity_max, self.power, minimum
+            )
+        return deterministic_corruption_severity(
+            self.corruption, self.severity_max, self.power, minimum, seed
+        )
+
+    @staticmethod
+    def _time(dataset, index):
+        return str(np.asarray(dataset.time.values)[int(index)])
+
+    def sample_metadata(self, index):
+        is_fake, position = index >= self.n, index % self.n
+        metadata = {"dataset_index": int(index), "true_class": "fake" if is_fake else "real"}
+        if not is_fake:
+            if self.paired_records:
+                record = self.paired_records[position % len(self.paired_records)]
+                metadata.update(time=str(record.valid_time), valid_time=str(record.valid_time))
+            else:
+                real_index = int(self.real_i[position % len(self.real_i)])
+                metadata.update(time=self._time(self.real, real_index))
+            return metadata
+        if self.corruption:
+            fake_position = position % len(self.fake_i)
+            metadata.update(
+                time=self._time(self.fake, int(self.fake_i[fake_position])),
+                corruption=str(self.corruption), severity=float(self._severity(fake_position)),
+            )
+            return metadata
+        if self.paired_records:
+            record = self.paired_records[position % len(self.paired_records)]
+            metadata.update(
+                time=str(record.valid_time), initialization_time=str(record.initialization_time),
+                valid_time=str(record.valid_time), lead_hour=int(record.lead_hour),
+            )
+            return metadata
+        time_position, lead_position = divmod(position, len(self.leads))
+        sample_index = int(self.fake_i[time_position % len(self.fake_i)])
+        lead_index = self.leads[lead_position]
+        lead_hour = 0 if lead_index is None else int(
+            np.asarray(self.fake.prediction_timedelta.values)[lead_index]
+            .astype("timedelta64[h]").astype(int)
+        )
+        metadata.update(time=self._time(self.fake, sample_index), lead_hour=lead_hour)
+        return metadata
+
+    def __getitem__(self, index):
+        is_fake, position = index >= self.n, index % self.n
+        if not is_fake:
+            real_index = (self.paired_records[position % len(self.paired_records)].era5_index
+                          if self.paired_records else int(self.real_i[position % len(self.real_i)]))
+            return mask_equatorial_band(fields(self.real, self.variables, self.means, self.stds, int(real_index)), self.latitudes, self.equator_mask_degrees), torch.tensor([1.0])
+        if self.corruption:
+            fake_position = position % len(self.fake_i)
+            sample = fields(self.fake, self.variables, self.means, self.stds,
+                            int(self.fake_i[fake_position]))
+            severity, seed = self._severity(fake_position), self._sample_seed(fake_position)
+            if self.corruption in SPECIAL_CORRUPTIONS:
+                donor = None
+                if self.donor_positions is not None:
+                    donor = fields(self.fake, self.variables, self.means, self.stds,
+                                   int(self.fake_i[int(self.donor_positions[fake_position])])).numpy()
+                corrupted = torch.from_numpy(apply_special_baseline_corruption(
+                    sample.numpy(), self.corruption, severity, self.latitudes, self.cfg,
+                    donor, maximum_severity=self.severity_max, random_seed=seed,
+                ))
+            elif seed is None:
+                corrupted = apply_configured_corruption(sample, self.corruption, severity)
+            else:
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(int(seed))
+                    corrupted = apply_configured_corruption(sample, self.corruption, severity)
+            return mask_equatorial_band(corrupted.to(dtype=torch.float32), self.latitudes, self.equator_mask_degrees), torch.tensor([0.0])
+        if self.paired_records:
+            record = self.paired_records[position % len(self.paired_records)]
+            return mask_equatorial_band(fields(self.fake, self.variables, self.means, self.stds,
+                          record.forecast_index, record.lead_index), self.latitudes, self.equator_mask_degrees), torch.tensor([0.0])
+        time_position, lead_position = divmod(position, len(self.leads))
+        return mask_equatorial_band(fields(self.fake, self.variables, self.means, self.stds,
+                      int(self.fake_i[time_position % len(self.fake_i)]),
+                      self.leads[lead_position]), self.latitudes, self.equator_mask_degrees), torch.tensor([0.0])
+
+
+class SFNOTargetDataset(Dataset):
+    """Balanced raw four-field samples for a frozen SFNO encoder."""
+
+    def __init__(self, real, fake, encoder, leads, corruption=None, max_samples=0,
+                 power=2.0, severity_max=0.2, cfg=None, paired_records=None):
+        self.real = real
+        self.fake = fake
+        self.encoder = encoder
+        self.real_i = indices(real, max_samples)
+        self.fake_i = indices(fake, max_samples)
+        self.leads = (
+            [
+                i for i, hours in enumerate(
+                    np.asarray(fake.prediction_timedelta.values).astype("timedelta64[h]").astype(int)
+                ) if int(hours) in leads
+            ]
+            if "prediction_timedelta" in fake.dims else [None]
+        )
+        self.corruption = corruption
+        self.power = float(power)
+        self.severity_max = float(severity_max)
+        self.cfg = cfg
+        self.use_era5_context, self.target_variables = sfno_context_settings(cfg)
+        self.paired_records = evenly_spaced_pairs(paired_records or [], max_samples)
+        self.latitudes = np.asarray(fake.latitude.values, dtype=np.float64)
+        self.donor_positions = None
+        self.donor_seed = int(get(cfg, "seed", 0))
+        if corruption == "hemisphere_splice":
+            self.set_epoch(0)
+        self.n = len(self.paired_records) if self.paired_records else max(len(self.real_i), len(self.fake_i) * len(self.leads))
+
+    def __len__(self):
+        return 2 * self.n
+
+    def set_epoch(self, epoch):
+        """Refresh hemisphere-splice donors once per training epoch."""
+        if self.corruption == "hemisphere_splice":
+            self.donor_positions = epoch_deranged_donor_positions(
+                len(self.fake_i), self.donor_seed, int(epoch)
+            )
+
+    def __getitem__(self, index):
+        is_fake = index >= self.n
+        position = index % self.n
+        if not is_fake:
+            sample_index = (
+                self.paired_records[position % len(self.paired_records)].era5_index
+                if self.paired_records else int(self.real_i[position % len(self.real_i)])
+            )
+            return raw_fields(self.real, SFNO_VARIABLES, sample_index), torch.tensor([1.0])
+        if self.corruption:
+            fake_position = position % len(self.fake_i)
+            sample_index = int(self.fake_i[fake_position])
+            sample = raw_fields(self.fake, SFNO_VARIABLES, sample_index)
+            donor = None
+            if self.donor_positions is not None:
+                donor_index = int(self.fake_i[int(self.donor_positions[fake_position])])
+                donor = raw_fields(self.fake, SFNO_VARIABLES, donor_index)
+            severity = training_corruption_severity(
+                self.corruption, self.severity_max, self.power,
+                target_corruption_min(self.cfg, self.corruption),
+            )
+            corrupted = apply_sfno_corruption(
+                sample, self.encoder, self.corruption, severity, self.latitudes,
+                self.cfg, donor, maximum_severity=self.severity_max,
+                target_variables=self.target_variables if self.use_era5_context else None,
+            )
+            return corrupted, torch.tensor([0.0])
+        if self.paired_records:
+            record = self.paired_records[position % len(self.paired_records)]
+            if self.use_era5_context:
+                forecast = raw_fields(self.fake, self.target_variables, record.forecast_index, record.lead_index)
+                context = raw_fields(self.real,
+                                     [v for v in SFNO_VARIABLES if v not in self.target_variables],
+                                     record.era5_index)
+                values = []
+                for variable in SFNO_VARIABLES:
+                    values.append(forecast[self.target_variables.index(variable)] if variable in self.target_variables
+                                  else context[[v for v in SFNO_VARIABLES if v not in self.target_variables].index(variable)])
+                return torch.stack(values), torch.tensor([0.0])
+            return raw_fields(self.fake, SFNO_VARIABLES, record.forecast_index, record.lead_index), torch.tensor([0.0])
+        time_position, lead_position = divmod(position, len(self.leads))
+        sample_index = int(self.fake_i[time_position % len(self.fake_i)])
+        return (
+            raw_fields(self.fake, SFNO_VARIABLES, sample_index, self.leads[lead_position]),
+            torch.tensor([0.0]),
+        )
+
+
+def logits_for(
+    model, ds, variables, means, stds, device, maximum, batch_size, *,
+    lead=None, corruption=None, severity=0., cfg=None, maximum_severity=None,
+    progress_description=None, selected_indices=None, context_ds=None, context_indices=None,
+):
+    values=[]; batch=[]
+    model_dtype = next(model.parameters()).dtype
+    raw_sfno = bool(getattr(model, "expects_raw_fields", False))
+    input_variables = list(getattr(model, "input_variables", variables))
+    if selected_indices is None:
+        selected_indices = indices(ds, maximum)
+    else:
+        selected_indices = np.asarray(selected_indices, dtype=int)
+        if maximum > 0 and len(selected_indices) > maximum:
+            keep = np.linspace(0, len(selected_indices) - 1, maximum, dtype=int)
+            selected_indices = selected_indices[keep]
+            if context_indices is not None:
+                context_indices = np.asarray(context_indices, dtype=int)[keep]
+    if context_indices is not None:
+        context_indices = np.asarray(context_indices, dtype=int)
+        if len(context_indices) != len(selected_indices):
+            raise ValueError(
+                "context_indices must align one-to-one with selected_indices "
+                f"({len(context_indices)} != {len(selected_indices)})"
+            )
+    donor_positions = (
+        deranged_sample_positions(len(selected_indices), int(get(cfg, 'seed', 0)))
+        if corruption == 'hemisphere_splice' else None
+    )
+    with torch.no_grad():
+        iterator = selected_indices
+        if progress_description is not None:
+            iterator = tqdm(selected_indices, desc=progress_description, leave=False)
+        for position, i in enumerate(iterator):
+            if raw_sfno and context_ds is not None and bool(getattr(model, "sfno_use_era5_context", False)):
+                target_variables = list(getattr(model, "sfno_target_variables", ["2m_temperature"]))
+                context_variables = [v for v in input_variables if v not in target_variables]
+                context_index = int(context_indices[position])
+                candidate_fields = raw_fields(ds, target_variables, int(i), lead)
+                context_fields = raw_fields(context_ds, context_variables, context_index)
+                x = torch.stack([
+                    candidate_fields[target_variables.index(variable)] if variable in target_variables
+                    else context_fields[context_variables.index(variable)]
+                    for variable in input_variables
+                ])
+            else:
+                x = (
+                    raw_fields(ds, input_variables, int(i), lead)
+                    if raw_sfno else fields(ds,variables,means,stds,int(i),lead)
+                )
+            if raw_sfno and corruption:
+                donor = None
+                if donor_positions is not None:
+                    donor = raw_fields(
+                        ds, input_variables,
+                        int(selected_indices[int(donor_positions[position])]), lead,
+                    )
+                x = apply_sfno_corruption(
+                    x, model.encoder, corruption, severity,
+                    np.asarray(ds.latitude.values), cfg, donor,
+                    maximum_severity=maximum_severity,
+                    random_seed=corruption_sample_seed(get(cfg, "seed", 0), corruption, int(i)),
+                    target_variables=(getattr(model, "sfno_target_variables", None)
+                                      if getattr(model, "sfno_use_era5_context", False) else None),
+                )
+            elif corruption in SPECIAL_CORRUPTIONS:
+                donor = None
+                if donor_positions is not None:
+                    donor = fields(
+                        ds, variables, means, stds,
+                        int(selected_indices[int(donor_positions[position])]), lead,
+                    ).numpy()
+                x = torch.from_numpy(apply_special_baseline_corruption(
+                    x.numpy(), corruption, severity, np.asarray(ds.latitude.values), cfg,
+                    donor, maximum_severity=(
+                        target_corruption_max(cfg, corruption)
+                        if maximum_severity is None else maximum_severity
+                    ),
+                    random_seed=corruption_sample_seed(get(cfg, "seed", 0), corruption, int(i)),
+                ))
+            elif corruption:
+                x=apply_configured_corruption(x,corruption,severity)
+            x = mask_equatorial_band(
+                x, ds.latitude.values, float(getattr(model, "equator_mask_degrees", 0.0))
+            )
+            batch.append(x)
+            if len(batch) == batch_size:
+                inputs = torch.stack(batch).to(device=device, dtype=model_dtype)
+                values.extend(model(inputs).flatten().cpu().tolist()); batch=[]
+        if batch:
+            inputs = torch.stack(batch).to(device=device, dtype=model_dtype)
+            values.extend(model(inputs).flatten().cpu().tolist())
+    return np.asarray(values)
+
+
+def score(model, ds, variables, means, stds, device, *, lead=None, corruption=None, severity=0., maximum=0, batch_size=32, cfg=None, maximum_severity=None, progress_description=None, selected_indices=None, context_ds=None, context_indices=None):
+    z=logits_for(model,ds,variables,means,stds,device,maximum,batch_size,lead=lead,corruption=corruption,severity=severity,cfg=cfg,maximum_severity=maximum_severity,progress_description=progress_description,selected_indices=selected_indices,context_ds=context_ds,context_indices=context_indices); conj=z-1.; return float(conj.mean()), float(conj.std(ddof=1)/np.sqrt(len(z))) if len(z)>1 else 0., len(z)
+
+
+def train_target(real, fake, variables, means, stds, cfg, device, *, corruption=None,
+                 label=None, model_name=None, metric_logger=None, log_every_n_steps=20,
+                 paired_records=None, equator_mask_degrees=0.0):
+    selected_model_name = str(model_name or get(cfg, 'model_name'))
+    model=WeatherDiscriminator(len(variables), selected_model_name, learning_rate=get(cfg,'learning_rate'), pretrained_backbone=bool(get(cfg,'pretrained_backbone',True))).to(device)
+    dataset=BalancedTargetDataset(real,fake,variables,means,stds,cfg.lead_times,corruption,int(get(cfg,'max_train_samples',0)),float(get(cfg,'corruption_power')),target_corruption_max(cfg, corruption) if corruption else float(get(cfg,'corruption_severity_max')),cfg,paired_records,equator_mask_degrees=equator_mask_degrees)
+    opt=torch.optim.AdamW(model.parameters(),lr=float(get(cfg,'learning_rate')),weight_decay=float(get(cfg,'weight_decay')))
+    model.train()
+    loader = DataLoader(
+        dataset,
+        batch_size=int(get(cfg,'batch_size')),
+        shuffle=True,
+        num_workers=int(get(cfg,'num_workers')),
+    )
+    target_label = label or corruption or "forecast"
+    global_step = 0
+    final_metrics = {}
+    for epoch in range(int(get(cfg,'epochs'))):
+        dataset.set_epoch(epoch)
+        epoch_loss = epoch_correct = epoch_count = 0.0
+        batches = tqdm(
+            loader,
+            desc=f"{target_label}: epoch {epoch + 1}/{int(get(cfg, 'epochs'))}",
+            leave=False,
+        )
+        for x,y in batches:
+            inputs, labels = x.to(device), y.to(device)
+            opt.zero_grad(); logits = model(inputs)
+            loss=F.binary_cross_entropy_with_logits(logits, labels); loss.backward(); opt.step()
+            batch_count = labels.numel()
+            batch_correct = ((logits.detach() >= 0.0) == (labels >= 0.5)).sum().item()
+            epoch_loss += loss.detach().item() * batch_count
+            epoch_correct += batch_correct
+            epoch_count += batch_count
+            global_step += 1
+            if metric_logger is not None and global_step % max(int(log_every_n_steps), 1) == 0:
+                metric_logger({
+                    "train/batch_loss": float(loss.detach().item()),
+                    "train/batch_accuracy": float(batch_correct / batch_count),
+                    "train/global_step": global_step,
+                    "train/epoch": epoch + 1,
+                })
+            batches.set_postfix(loss=f"{loss.detach().item():.4f}")
+        if epoch_count:
+            final_metrics = {
+                "loss": float(epoch_loss / epoch_count),
+                "accuracy": float(epoch_correct / epoch_count),
+                "n_samples": int(epoch_count),
+            }
+            if metric_logger is not None:
+                metric_logger({
+                    "train/epoch_loss": final_metrics["loss"],
+                    "train/epoch_accuracy": final_metrics["accuracy"],
+                    "train/epoch": epoch + 1,
+                })
+    model.target_train_metrics = final_metrics
+    return model.eval()
+
+
+def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, label=None,
+                      metric_logger=None, log_every_n_steps=20, paired_records=None):
+    """Train linear and residual-MLP heads from each shared frozen embedding."""
+    if int(get(cfg, "num_workers", 0)) != 0:
+        raise ValueError("SFNO target training requires target_discriminator.num_workers=0.")
+    severity_max = (
+        target_corruption_max(cfg, corruption)
+        if corruption else float(get(cfg, "corruption_severity_max"))
+    )
+    dataset = SFNOTargetDataset(
+        real, fake, encoder, cfg.lead_times, corruption,
+        int(get(cfg, "max_train_samples", 0)),
+        float(get(cfg, "corruption_power")), severity_max, cfg, paired_records,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(get(cfg, "batch_size")),
+        shuffle=True,
+        num_workers=0,
+    )
+    heads = {
+        "sfno_linear": LinearProbe(encoder.feature_dim).to(device),
+        "sfno_mlp": ResidualMLPProbe(
+            encoder.feature_dim,
+            hidden_multiplier=float(sfno_settings(cfg).get("mlp_hidden_multiplier", 2.0)),
+            dropout=float(sfno_settings(cfg).get("mlp_dropout", 0.1)),
+        ).to(device),
+    }
+    parameters = [parameter for head in heads.values() for parameter in head.parameters()]
+    optimizer = torch.optim.AdamW(
+        parameters,
+        lr=float(get(cfg, "learning_rate")),
+        weight_decay=float(get(cfg, "weight_decay")),
+    )
+    epochs = int(get(cfg, "epochs"))
+    target_label = label or corruption or "forecast"
+    encoder.eval()
+    for head in heads.values():
+        head.train()
+    global_step = 0
+    final_metrics = {}
+    for epoch in range(epochs):
+        dataset.set_epoch(epoch)
+        epoch_loss = {name: 0.0 for name in heads}
+        epoch_correct = {name: 0.0 for name in heads}
+        epoch_count = 0
+        batches = tqdm(loader, desc=f"SFNO {target_label}: epoch {epoch + 1}/{epochs}", leave=False)
+        for inputs, labels in batches:
+            # BatchNorm1d cannot estimate variance from a one-sample training batch.
+            if inputs.shape[0] < 2:
+                continue
+            inputs = inputs.to(device=device, dtype=torch.float32)
+            labels = labels.to(device=device, dtype=torch.float32)
+            with torch.no_grad():
+                features = encoder.extract_features(inputs)
+            optimizer.zero_grad()
+            logits_by_head = {name: head(features) for name, head in heads.items()}
+            losses = {
+                name: F.binary_cross_entropy_with_logits(logits, labels)
+                for name, logits in logits_by_head.items()
+            }
+            loss = torch.stack(list(losses.values())).sum()
+            loss.backward()
+            optimizer.step()
+            count = labels.numel(); epoch_count += count; global_step += 1
+            for name, logits in logits_by_head.items():
+                logits = logits.detach()
+                epoch_loss[name] += losses[name].detach().item() * count
+                epoch_correct[name] += ((logits >= 0.0) == (labels >= 0.5)).sum().item()
+            if metric_logger is not None and global_step % max(int(log_every_n_steps), 1) == 0:
+                payload = {"train/global_step": global_step, "train/epoch": epoch + 1}
+                for name in heads:
+                    payload[f"{name}/batch_loss"] = float(losses[name].detach().item())
+                    payload[f"{name}/batch_accuracy"] = float(
+                        ((logits_by_head[name].detach() >= 0.0) == (labels >= 0.5)).float().mean().item()
+                    )
+                metric_logger(payload)
+            batches.set_postfix(
+                linear=f"{losses['sfno_linear'].detach().item():.4f}",
+                mlp=f"{losses['sfno_mlp'].detach().item():.4f}",
+            )
+        if epoch_count:
+            final_metrics = {
+                name: {
+                    "loss": float(epoch_loss[name] / epoch_count),
+                    "accuracy": float(epoch_correct[name] / epoch_count),
+                    "n_samples": int(epoch_count),
+                }
+                for name in heads
+            }
+            if metric_logger is not None:
+                payload = {"train/epoch": epoch + 1}
+                for name, metrics in final_metrics.items():
+                    payload[f"{name}/epoch_loss"] = metrics["loss"]
+                    payload[f"{name}/epoch_accuracy"] = metrics["accuracy"]
+                metric_logger(payload)
+    probes = {}
+    for name, head in heads.items():
+        probe = FrozenSFNOProbe(encoder, head.eval(), name).eval()
+        probe.target_train_metrics = final_metrics.get(name, {})
+        probe.sfno_use_era5_context, probe.sfno_target_variables = sfno_context_settings(cfg)
+        probes[name] = probe
+    return probes
+
+
+def sfno_checkpoint_metadata(encoder, architecture):
+    return {
+        "architecture": str(architecture),
+        "input_variables": list(SFNO_VARIABLES),
+        "embedding_channels": int(encoder.embedding_channels),
+        "embedding_resolution": list(encoder.embedding_resolution),
+        "pooling": str(encoder.pooling),
+        "pool_grid": list(encoder.pool_grid),
+        "feature_dim": int(encoder.feature_dim),
+        "encoder_frozen": True,
+        "encoder_pretraining": "ERA5 1975-2019; overlaps the temporal test partition",
+    }
+
+
+def save_sfno_probe_checkpoint(model, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "head_state_dict": model.head.state_dict(),
+            "metadata": sfno_checkpoint_metadata(model.encoder, model.architecture),
+        },
+        path,
+    )
+
+
+def load_sfno_probe_checkpoint(path, cfg, device, encoder=None):
+    payload = torch.load(path, map_location=device, weights_only=True)
+    metadata = payload.get("metadata", {})
+    architecture = metadata.get("architecture")
+    if architecture not in {"sfno_linear", "sfno_mlp"}:
+        raise ValueError(f"Invalid SFNO probe architecture in {path}: {architecture!r}")
+    if list(metadata.get("input_variables", [])) != SFNO_VARIABLES:
+        raise ValueError(f"SFNO probe checkpoint {path} has incompatible input variables.")
+    encoder = load_sfno_encoder(cfg, device) if encoder is None else encoder
+    expected = sfno_checkpoint_metadata(encoder, architecture)
+    for key in ("embedding_channels", "embedding_resolution", "pooling", "pool_grid", "feature_dim"):
+        if metadata.get(key) != expected[key]:
+            raise ValueError(
+                f"SFNO probe checkpoint {path} has {key}={metadata.get(key)!r}; "
+                f"configured encoder expects {expected[key]!r}."
+            )
+    model = build_sfno_probe(encoder, architecture, cfg).to(device)
+    model.head.load_state_dict(payload["head_state_dict"])
+    return model.eval(), metadata
+
+
+def real_term(model, train, variables, means, stds, device, maximum, batch_size, *, progress_description=None, selected_indices=None):
+    logits=logits_for(model,train,variables,means,stds,device,maximum,batch_size,progress_description=progress_description,selected_indices=selected_indices)
+    v=-np.exp(np.minimum(-logits, 80)); return float(v.mean()), float(v.std(ddof=1)/np.sqrt(len(v))) if len(v)>1 else 0.
+
+
+def compatible(c, variables):
+    return not (c in {'wind_patch_shuffle','wind_rotation'} and not {'10m_u_component_of_wind','10m_v_component_of_wind'}.issubset(variables))
+
+
+def target_specs(cfg, variables):
+    forecasts = []
+    for label, configured_paths in get(cfg, "forecast_files").items():
+        paths = [str(path) for path in configured_paths]
+        missing = [path for path in paths if not Path(path).exists()]
+        if missing:
+            print(f"Skipping {label}: unavailable forecast files: {missing}")
+            continue
+        forecasts.append(("forecast", label, paths, None))
+    corruptions = [
+        ("corruption", str(name), None, str(name))
+        for name in cfg.baseline.corruptions if compatible(str(name), variables)
+    ]
+    return forecasts + corruptions
+
+
+def open_model_forecasts(paths):
+    datasets = [normalize_prediction_timedelta(safe_open_dataset(path)) for path in paths]
+    return concatenate_forecasts(datasets)
+
+
+def matched_statistics(real, records, variables):
+    if not records:
+        raise ValueError("No forecast/ERA5 training pairs remain after monthly valid-time selection.")
+    matched = real.isel(time=[record.era5_index for record in records])
+    means = {variable: float(matched[variable].mean()) for variable in variables}
+    stds = {variable: max(float(matched[variable].std()), 1e-8) for variable in variables}
+    return means, stds
+
+
+def write_target_train_test_metrics(root, records):
+    """Persist one row per trained target/probe for train-versus-test comparison."""
+    path = Path(root) / "data" / "target_train_test_metrics.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "architecture", "kind", "target", "train_loss", "train_accuracy",
+        "train_n_samples", "test_loss", "test_accuracy", "test_n_samples",
+        "path", "run_url",
+    ]
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
+    print(f"Saved target train/test metrics to: {path}")
+    return path
+
+
+def train_target_discriminator_baselines(cfg, tracker=None):
+    """Train configured target critics, optionally using one tracked run per target."""
+    torch.manual_seed(int(get(cfg,'seed'))); np.random.seed(int(get(cfg,'seed')))
+    device = target_device(cfg)
+    variables=list(get(cfg,'variables')); root=Path(str(get(cfg,'output_dir'))); root.mkdir(parents=True,exist_ok=True)
+    resolved_path = root/'resolved_config.yaml'; OmegaConf.save(cfg,resolved_path,resolve=True)
+    real=safe_open_dataset(cfg.real_nc_file)
+    corruption_train=select_era5_split(real,cfg,"train",coverage="corruption")
+    corruption_means={v:float(corruption_train[v].mean()) for v in variables}
+    corruption_stds={v:max(float(corruption_train[v].std()),1e-8) for v in variables}
+    checkpoint_root = root / "models" / "target_discriminators"
+    outputs = []
+    interpretability_rows = []
+    pipeline = cfg.get("pipeline", {}) or {}
+    wandb_settings = pipeline.get("wandb", {}) or {}
+    log_every = int(wandb_settings.get("log_every_n_steps", 20))
+    upload = bool(wandb_settings.get("upload_checkpoints", True))
+
+    def tracked_context(architecture, kind, label):
+        if tracker is None:
+            return nullcontext(None)
+        metadata = {
+            "architecture": architecture, "target_kind": kind, "target": label,
+            "variables": list(SFNO_VARIABLES if architecture == "sfno" else variables),
+        }
+        return tracker.run(
+            f"train/{architecture}/{kind}/{label}", "discriminator-training", cfg,
+            metadata=metadata, tags=[architecture, kind, str(label)],
+        )
+
+    def evaluate_target(model, architecture, kind, label, fake, corruption, means, stds, run, equator_mask_degrees=0.0):
+        test_real, test_fake, test_records = target_test_inputs(real, fake, cfg, corruption)
+        maximum = int(get(cfg, "max_eval_samples", 0))
+        interpretability = get(cfg, "interpretability", {}) or {}
+        supports_attribution = architecture in {"squeezenet", "squeezenet_attention", "squeezenet_equator_mask"}
+        attribution_enabled = bool(interpretability.get("enabled", True)) and supports_attribution
+        attribution_seed = int(interpretability.get("seed", get(cfg, "seed", 0)))
+        random_count = int(interpretability.get("random_samples_per_class", 2)) if attribution_enabled else 0
+        if bool(getattr(model, "expects_raw_fields", False)):
+            dataset = SFNOTargetDataset(
+                test_real, test_fake, model.encoder, cfg.lead_times, corruption, maximum,
+                float(get(cfg, "corruption_power")),
+                target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
+                cfg, test_records,
+            )
+        else:
+            dataset = BalancedTargetDataset(
+                test_real, test_fake, variables, means, stds, cfg.lead_times, corruption, maximum,
+                float(get(cfg, "corruption_power")),
+                target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
+                cfg, test_records, deterministic_seed=attribution_seed,
+                equator_mask_degrees=equator_mask_degrees,
+            )
+        test_metrics = binary_classification_metrics(
+            model, dataset, device, int(get(cfg, "batch_size")),
+            f"Testing {architecture} {kind}/{label}",
+            random_samples_per_class=random_count, seed=attribution_seed,
+        )
+        cases = test_metrics.pop("cases", [])
+        train_metrics = dict(getattr(model, "target_train_metrics", {}))
+        record = {
+            "architecture": architecture, "kind": kind, "target": label,
+            "train_loss": train_metrics.get("loss", float("nan")),
+            "train_accuracy": train_metrics.get("accuracy", float("nan")),
+            "train_n_samples": train_metrics.get("n_samples", 0),
+            "test_loss": test_metrics["loss"],
+            "test_accuracy": test_metrics["accuracy"],
+            "test_n_samples": test_metrics["n_samples"],
+        }
+        if run is not None:
+            prefix = "" if architecture.startswith("squeezenet") else f"{architecture}/"
+            run.log({
+                f"{prefix}train/final_loss": record["train_loss"],
+                f"{prefix}train/final_accuracy": record["train_accuracy"],
+                f"{prefix}test/loss": record["test_loss"],
+                f"{prefix}test/accuracy": record["test_accuracy"],
+                f"{prefix}test/n_samples": record["test_n_samples"],
+            })
+            run.summary[f"{prefix}test/loss"] = record["test_loss"]
+            run.summary[f"{prefix}test/accuracy"] = record["test_accuracy"]
+        logit_histogram_paths = plot_target_test_logit_histograms(
+            model, architecture, kind, label, test_real, test_fake, test_records, corruption,
+            variables, means, stds, cfg, device, maximum, int(get(cfg, "batch_size")),
+        )
+        record["test_logit_histograms"] = [str(path) for path in logit_histogram_paths]
+        if run is not None:
+            tracker.log_images(run, logit_histogram_paths, root / "plots")
+            run.summary["test/logit_histograms"] = len(logit_histogram_paths)
+        if attribution_enabled:
+            gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
+                            f"{safe_target_name(label)}_integrated_gradients.png")
+            try:
+                rows = create_interpretability_gallery(
+                    model, cases, dataset, variables, means, stds, interpretability,
+                    device, gallery_path, architecture, kind, label,
+                )
+                interpretability_rows.extend(rows)
+                record["interpretability_gallery"] = str(gallery_path)
+                residuals = [abs(float(row["completeness_residual"])) for row in rows]
+                if run is not None:
+                    tracker.log_images(run, [gallery_path], root / "plots")
+                    tracker.log_records_table(run, "interpretability/cases", rows)
+                    run.summary["interpretability/status"] = "completed"
+                    run.summary["interpretability/n_cases"] = len(rows)
+                    run.summary["interpretability/max_abs_completeness_residual"] = max(residuals)
+                print(f"Saved target interpretability gallery to: {gallery_path}")
+            except Exception as error:
+                print(f"Interpretability failed for {architecture} {kind}/{label}: {error}")
+                if run is not None:
+                    run.summary["interpretability/status"] = "failed"
+                    run.summary["interpretability/error"] = str(error)
+        elif run is not None:
+            run.summary["interpretability/status"] = "not_applicable"
+        return record
+
+    if bool(get(cfg, "train_squeezenet", True)):
+        targets = target_specs(cfg, variables)
+        for kind,label,paths,corruption in tqdm(targets, desc="Training SqueezeNet targets"):
+            with tracked_context("squeezenet", kind, label) as run:
+                fake = corruption_train if corruption else open_model_forecasts(paths)
+                records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
+                means, stds = (
+                    (corruption_means, corruption_stds)
+                    if corruption else matched_statistics(real, records, variables)
+                )
+                model=train_target(
+                    real if not corruption else corruption_train,fake,variables,means,stds,cfg,device,corruption=corruption,label=label,
+                    metric_logger=None if run is None else run.log, log_every_n_steps=log_every,
+                    paired_records=records,
+                )
+                out=checkpoint_root/kind/label.replace(' ','_'); out.mkdir(parents=True,exist_ok=True)
+                output_path=out/'model.pth'; torch.save(model.model.state_dict(),output_path)
+                print(f"Saved SqueezeNet {kind} target discriminator: {output_path}")
+                if tracker is not None and upload:
+                    tracker.log_artifact(run, f"target-discriminator-squeezenet-{kind}-{label}", "model", [output_path, resolved_path])
+                summary = evaluate_target(model, "squeezenet", kind, label, fake, corruption, means, stds, run)
+                summary.update(path=str(output_path), run_url=getattr(run, "url", None))
+                outputs.append(summary)
+                if not corruption: fake.close()
+    masked = get(cfg, "equator_masked_hemisphere_splice", {}) or {}
+    if bool(masked.get("enabled", True)):
+        label, corruption = "hemisphere_splice", "hemisphere_splice"
+        half_width = float(masked.get("half_width_degrees", 10.0))
+        with tracked_context("squeezenet_equator_mask", "corruption", label) as run:
+            model = train_target(
+                corruption_train, corruption_train, variables, corruption_means, corruption_stds,
+                cfg, device, corruption=corruption, label=label, model_name="squeezenet",
+                metric_logger=None if run is None else run.log, log_every_n_steps=log_every,
+                equator_mask_degrees=half_width,
+            )
+            model.equator_mask_degrees = half_width
+            out = checkpoint_root / "squeezenet_equator_mask" / "corruption" / label
+            out.mkdir(parents=True, exist_ok=True)
+            output_path = out / "model.pth"; torch.save(model.model.state_dict(), output_path)
+            summary = evaluate_target(model, "squeezenet_equator_mask", "corruption", label,
+                                      corruption_train, corruption, corruption_means, corruption_stds,
+                                      run, equator_mask_degrees=half_width)
+            summary.update(path=str(output_path), run_url=getattr(run, "url", None)); outputs.append(summary)
+
+    if bool(get(cfg, "train_attention_squeezenet", False)):
+        targets = target_specs(cfg, variables)
+        for kind,label,paths,corruption in tqdm(
+            targets, desc="Training attention-SqueezeNet targets"
+        ):
+            with tracked_context("squeezenet_attention", kind, label) as run:
+                fake = corruption_train if corruption else open_model_forecasts(paths)
+                records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
+                means, stds = (
+                    (corruption_means, corruption_stds)
+                    if corruption else matched_statistics(real, records, variables)
+                )
+                model=train_target(
+                    real if not corruption else corruption_train, fake, variables, means, stds, cfg, device,
+                    corruption=corruption, label=label, model_name="squeezenet_attention",
+                    metric_logger=None if run is None else run.log, log_every_n_steps=log_every,
+                    paired_records=records,
+                )
+                out=checkpoint_root/'squeezenet_attention'/kind/label.replace(' ','_'); out.mkdir(parents=True,exist_ok=True)
+                output_path=out/'model.pth'; torch.save(model.model.state_dict(),output_path)
+                print(f"Saved attention-SqueezeNet {kind} target discriminator: {output_path}")
+                if tracker is not None and upload:
+                    tracker.log_artifact(run, f"target-discriminator-squeezenet-attention-{kind}-{label}", "model", [output_path, resolved_path])
+                summary = evaluate_target(model, "squeezenet_attention", kind, label, fake, corruption, means, stds, run)
+                summary.update(path=str(output_path), run_url=getattr(run, "url", None))
+                outputs.append(summary)
+                if not corruption: fake.close()
+    if bool(sfno_settings(cfg).get("enabled", True)):
+        missing = [variable for variable in SFNO_VARIABLES if variable not in corruption_train.data_vars]
+        if missing:
+            raise ValueError(f"ERA5 is missing required SFNO variables: {missing}")
+        try:
+            encoder = load_sfno_encoder(cfg, device)
+        except FileNotFoundError as error:
+            print(f"Skipping optional SFNO target training: {error}")
+            write_target_train_test_metrics(root, outputs)
+            write_interpretability_cases(root, interpretability_rows)
+            real.close()
+            return outputs
+        targets = target_specs(cfg, SFNO_VARIABLES)
+        for kind,label,paths,corruption in tqdm(targets, desc="Training SFNO probe targets"):
+            with tracked_context("sfno", kind, label) as run:
+                fake = corruption_train if corruption else open_model_forecasts(paths)
+                records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
+                probes = train_sfno_target(
+                    real if not corruption else corruption_train, fake, encoder, cfg, device, corruption=corruption, label=label,
+                    metric_logger=None if run is None else run.log, log_every_n_steps=log_every,
+                    paired_records=records,
+                )
+                paths = []
+                for architecture, model in probes.items():
+                    output_path = checkpoint_root/architecture/kind/label.replace(' ','_')/'model.pth'
+                    save_sfno_probe_checkpoint(model, output_path); paths.append(output_path)
+                    print(f"Saved {architecture} {kind} target discriminator: {output_path}")
+                    summary = evaluate_target(model, architecture, kind, label, fake, corruption, {}, {}, run)
+                    summary.update(path=str(output_path), run_url=getattr(run, "url", None))
+                    outputs.append(summary)
+                if tracker is not None and upload:
+                    tracker.log_artifact(run, f"target-discriminator-sfno-{kind}-{label}", "model", [*paths, resolved_path])
+                if not corruption: fake.close()
+    write_target_train_test_metrics(root, outputs)
+    write_interpretability_cases(root, interpretability_rows)
+    real.close()
+    return outputs
+
+
+@hydra.main(version_base=None, config_path='../conf', config_name='target_discriminator_baselines')
+def main(cfg: DictConfig):
+    train_target_discriminator_baselines(cfg)
+
+if __name__=='__main__': main()
