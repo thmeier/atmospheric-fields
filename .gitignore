@@ -53,3 +53,4 @@ useful_commands.txt
 Discriminator/slurm_baseline_pipeline_*.err
 Discriminator/tea_debug.log
 sfno_8c_31x60/
+sfno_8c_31x60_code_and_weights/

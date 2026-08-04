@@ -38,38 +38,59 @@ DEFAULT_WEIGHTS_SUBDIR = "weights_4fields"
 
 
 def _resolve_sfno_repo(repo_root=None, weights_subdir=DEFAULT_WEIGHTS_SUBDIR):
-    """Locate the SFNO-Embedding repo and put its ``src/`` on ``sys.path``.
+    """Locate an SFNO checkout or standalone inference bundle.
 
-    Resolution order: explicit ``repo_root`` arg → ``SFNO_REPO`` env var →
-    sibling ``../SFNO-Embedding`` next to this project. We import the vendored
-    ``models.SFNO`` (which uses the repo's bundled ``th_copy`` SHT code), so the
-    external ``torch_harmonics`` package is not required.
+    Accepted layouts are the historical ``src/ + weights_4fields/`` checkout
+    and the supplied standalone ``models/ + weights/`` bundle. Resolution is:
+    explicit ``repo_root`` → ``SFNO_REPO`` → legacy sibling checkout → local
+    standalone bundle. Both layouts vendor the spherical-harmonic code, so no
+    external ``torch_harmonics`` dependency is needed.
     """
-    if repo_root is None:
-        repo_root = os.environ.get("SFNO_REPO")
-    if repo_root is None:
+    if repo_root is not None:
+        candidates = [repo_root]
+    elif os.environ.get("SFNO_REPO"):
+        candidates = [os.environ["SFNO_REPO"]]
+    else:
         here = os.path.dirname(os.path.abspath(__file__))
-        # utils/ -> FeatureMetric/ -> atmospheric-fields/ -> PMLR_L/
-        candidate = os.path.normpath(
-            os.path.join(here, "..", "..", "..", "SFNO-Embedding")
-        )
-        repo_root = candidate
-    src = os.path.join(repo_root, "src")
-    weights = os.path.join(repo_root, weights_subdir)
-    if not os.path.isdir(src):
-        raise FileNotFoundError(
-            f"SFNO repo src/ not found at {src!r}. Set --sfno-repo or $SFNO_REPO "
-            f"to the SFNO-Embedding checkout."
-        )
-    if not os.path.isdir(weights):
-        raise FileNotFoundError(
-            f"SFNO weights not found at {weights!r}. Place the 4-field checkpoints "
-            f"(model_<C>c_<HxW>_4fields.pth, static_fields.pth, "
-            f"normalization_means_4fields.pt, normalization_stds_4fields.pt) there."
-        )
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    return repo_root, weights
+        project_root = os.path.normpath(os.path.join(here, "..", ".."))
+        candidates = [
+            os.path.normpath(os.path.join(project_root, "..", "SFNO-Embedding")),
+            os.path.join(project_root, "sfno_8c_31x60_code_and_weights"),
+        ]
+
+    attempted = []
+    for candidate in candidates:
+        root = os.path.abspath(os.fspath(candidate))
+        legacy_src = os.path.join(root, "src")
+        standalone_models = os.path.join(root, "models")
+        if os.path.isdir(legacy_src):
+            code_root = legacy_src
+            weight_candidates = [os.path.join(root, weights_subdir)]
+        elif os.path.isdir(standalone_models):
+            code_root = root
+            weight_candidates = [os.path.join(root, weights_subdir)]
+            if weights_subdir == DEFAULT_WEIGHTS_SUBDIR:
+                weight_candidates.append(os.path.join(root, "weights"))
+        else:
+            attempted.append(f"{root} (expected src/ or models/)")
+            continue
+
+        weights = next((path for path in weight_candidates if os.path.isdir(path)), None)
+        if weights is None:
+            attempted.append(
+                f"{root} (expected one of: {', '.join(weight_candidates)})"
+            )
+            continue
+        if code_root not in sys.path:
+            sys.path.insert(0, code_root)
+        return root, weights
+
+    raise FileNotFoundError(
+        "Could not locate an SFNO code-and-weights bundle. Set --sfno-repo or "
+        "$SFNO_REPO to either an SFNO-Embedding checkout (src/ + weights_4fields/) "
+        "or the standalone bundle (models/ + weights/). Attempted: "
+        + "; ".join(attempted)
+    )
 
 
 class SFNOEmbedding(nn.Module):

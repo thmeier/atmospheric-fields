@@ -729,7 +729,7 @@ From `Discriminator/`, run the complete suite with:
 ```bash
 conda activate pmlr
 export DATA_DIR=/cluster/courses/pmlr/teams/team07/data
-export SFNO_REPO=/path/to/SFNO-Embedding
+export SFNO_REPO=/path/to/SFNO-Embedding  # or /path/to/sfno_8c_31x60_code_and_weights
 wandb login
 srun -A pmlr -t 2-00:00 \
   python scripts/run_baseline_pipeline.py \
@@ -820,8 +820,9 @@ even though they are skipped by the temperature-only SqueezeNet baseline.
 The released four-field encoder was pretrained on ERA5 from 1975–2019. It has
 therefore seen part of this experiment's temporal test partition, so its curves
 are labeled as four-field representation-transfer results rather than a
-leakage-free temporal-holdout comparison. Set `SFNO_REPO` to the external
-`SFNO-Embedding` checkout containing `src/` and `weights_4fields/`:
+leakage-free temporal-holdout comparison. Set `SFNO_REPO` either to an external `SFNO-Embedding` checkout containing
+`src/` and `weights_4fields/`, or directly to the standalone
+`sfno_8c_31x60_code_and_weights` bundle containing `models/` and `weights/`:
 
 The training command writes only target checkpoints. The standard baseline
 runner loads them, evaluates the poster reverse-KL critic score (with fixed
@@ -829,7 +830,7 @@ runner loads them, evaluates the poster reverse-KL critic score (with fixed
 diamonds to the baseline-owned discriminator figures.
 
 ```bash
-export SFNO_REPO=/path/to/SFNO-Embedding
+export SFNO_REPO=/path/to/SFNO-Embedding  # or /path/to/sfno_8c_31x60_code_and_weights
 DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
   srun -A pmlr -t 2-00:00 python scripts/train_target_discriminator_baselines.py
 ```

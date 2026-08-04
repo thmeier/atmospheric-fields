@@ -52,17 +52,27 @@ esac
 
 mkdir -p plots
 
+# Accept either an SFNO-Embedding checkout (weights_4fields/) or the
+# standalone inference bundle shipped as models/ + weights/.
+if [ -d "$SFNO_REPO/weights_4fields" ]; then
+    W="$SFNO_REPO/weights_4fields"
+elif [ -d "$SFNO_REPO/weights" ]; then
+    W="$SFNO_REPO/weights"
+else
+    W="$SFNO_REPO/weights_4fields"
+fi
+
 missing=0
-for f in "$SFNO_REPO/weights_4fields/model_${CHANNELS}c_${HW}_4fields.pth" \
-         "$SFNO_REPO/weights_4fields/static_fields.pth" \
-         "$SFNO_REPO/weights_4fields/normalization_means_4fields.pt" \
-         "$SFNO_REPO/weights_4fields/normalization_stds_4fields.pt" \
+for f in "$W/model_${CHANNELS}c_${HW}_4fields.pth" \
+         "$W/static_fields.pth" \
+         "$W/normalization_means_4fields.pt" \
+         "$W/normalization_stds_4fields.pt" \
          "$ERA5"; do
     [ -e "$f" ] || { echo "MISSING: $f"; missing=1; }
 done
 if [ "$missing" -ne 0 ]; then
     echo ""
-    echo "Prerequisites missing — stage the SFNO repo/4-field weights (see"
+    echo "Prerequisites missing — stage an SFNO code-and-weights bundle (see"
     echo "submit_sfno_mmd.sh), then re-submit."
     exit 1
 fi
