@@ -1,0 +1,23 @@
+defaults:
+  - target_discriminator_baselines
+  - _self_
+
+pipeline:
+  stages:
+    - train_discriminators
+    - evaluate_standard_metrics
+    - evaluate_discriminator_metrics
+    - plot
+  id: null
+  fail_fast: true
+  manifest_dir: "${target_discriminator.output_dir}/pipeline_runs"
+  wandb:
+    enabled: true
+    project: "weather-discriminator-baselines"
+    entity: null
+    mode: "online"
+    tags: []
+    upload_checkpoints: true
+    upload_evaluation_data: true
+    upload_plots: true
+    log_every_n_steps: 20
