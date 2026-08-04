@@ -90,6 +90,24 @@ def temporal_checkpoint_dir(cfg):
 
 def discover_temporal_pairs(cfg):
     """Find model-specific train/test forecast files for temporal holdout."""
+    monthly = cfg.get("monthly_split") or {}
+    if str(monthly.get("strategy", "")) == "monthly_valid_time":
+        permitted_years = {
+            str(time_range[0])[:4] for time_range in monthly.model_valid_time_ranges
+        }
+        by_model = {}
+        for path in candidate_forecast_files(cfg):
+            if not os.path.exists(path):
+                continue
+            span = date_span_from_path(path)
+            if span is None or span[0][:4] not in permitted_years:
+                continue
+            label = model_label_from_path(path)
+            by_model.setdefault(label, []).append(path)
+        return {
+            label: {"files": sorted(paths)}
+            for label, paths in sorted(by_model.items())
+        }
     train_range, test_range = cfg.train_fake_range, cfg.test_fake_range
     train_year = range_year(train_range)
     test_year = range_year(test_range)
@@ -127,3 +145,27 @@ def checkpoint_filename(cfg, model_label):
 def checkpoint_path(cfg, model_label):
     """Return the temporal-holdout checkpoint path for one model."""
     return temporal_checkpoint_dir(cfg) / checkpoint_filename(cfg, model_label)
+
+
+def checkpoint_input_channels(state_dict, model_name):
+    """Read the input-channel count directly from saved torchvision weights."""
+    key = "features.0.weight" if model_name.startswith("squeezenet") else "conv1.weight"
+    if key not in state_dict:
+        raise KeyError(f"Checkpoint does not contain {key}; cannot infer its input channels.")
+    return int(state_dict[key].shape[1])
+
+
+def reconcile_checkpoint_variables(cfg, variables, state_dict):
+    """Recover input fields for legacy temporal checkpoints with stale filename tags."""
+    expected_channels = checkpoint_input_channels(state_dict, cfg.model_name)
+    if len(variables) == expected_channels:
+        return variables
+    configured = variables_from_config(cfg)
+    if len(configured) == expected_channels:
+        return configured
+    if expected_channels == 1:
+        return [str(cfg.selected_variable)]
+    raise ValueError(
+        f"Checkpoint expects {expected_channels} channels, but the candidate variables are {variables} "
+        f"and config.variables has {len(configured)} channels. Set case_study_variables explicitly."
+    )

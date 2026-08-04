@@ -112,7 +112,9 @@ def evaluate_and_visualize(cfg: DictConfig):
         level=cfg.get("level"),
         balanced=False,
         disturb_type=cfg.get("disturb_type", None),
-        disturb_level=cfg.get("disturb_level", 0.0)
+        disturb_level=cfg.get("disturb_level", 0.0),
+        monthly_split_cfg=cfg if cfg.get("monthly_split") else None,
+        monthly_split_name="test",
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 

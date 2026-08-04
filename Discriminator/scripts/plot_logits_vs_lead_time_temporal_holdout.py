@@ -9,13 +9,17 @@ from omegaconf import DictConfig
 import torch
 
 try:
-    from .analysis_utils import LeadTimeInferenceDataset, mean_logits_by_lead, normalization_stats, resolve_device
+    from .analysis_utils import resolve_device
+    from .monthly_split import concatenate_forecasts, forecast_pairs, lead_hours
+    from .train_target_discriminator_baselines import logits_for, matched_statistics
     from .temporal_holdout_utils import checkpoint_path, discover_temporal_pairs, safe_model_name, variable_tag, variables_from_config
-    from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+    from .train_discriminator import WeatherDiscriminator, normalize_prediction_timedelta, safe_open_dataset
 except ImportError:
-    from analysis_utils import LeadTimeInferenceDataset, mean_logits_by_lead, normalization_stats, resolve_device
+    from analysis_utils import resolve_device
+    from monthly_split import concatenate_forecasts, forecast_pairs, lead_hours
+    from train_target_discriminator_baselines import logits_for, matched_statistics
     from temporal_holdout_utils import checkpoint_path, discover_temporal_pairs, safe_model_name, variable_tag, variables_from_config
-    from train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
+    from train_discriminator import WeatherDiscriminator, normalize_prediction_timedelta, safe_open_dataset
 
 
 def plot_curve(label, lead_hours, means, stds, color):
@@ -61,18 +65,7 @@ def main(cfg: DictConfig):
         raise RuntimeError("No temporal train/test forecast pairs found.")
 
     real_ds = safe_open_dataset(cfg.real_nc_file)
-    real_test_ds = select_time_ranges(real_ds, cfg.test_real_ranges)
-    means, stds = normalization_stats(real_ds, model_vars, cfg.train_real_range)
-
     model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
-    era5_dataset = LeadTimeInferenceDataset(
-        real_test_ds,
-        model_vars,
-        means,
-        stds,
-        level=cfg.get("level"),
-        max_samples=cfg.get("max_samples", 0),
-    )
 
     plt.figure(figsize=(13, 8))
     colors = plt.cm.tab10(np.linspace(0, 1, len(pairs)))
@@ -85,48 +78,43 @@ def main(cfg: DictConfig):
         if not ckpt.exists():
             print(f"Skipping {model_label}: checkpoint not found at {ckpt}")
             continue
-        if not os.path.exists(files["test"]):
-            print(f"Skipping {model_label}: test file not found at {files['test']}")
-            continue
-
         print(f"Evaluating {model_label} with checkpoint: {ckpt}")
         model.model.load_state_dict(torch.load(ckpt, map_location=device))
         model.eval()
 
-        fake_ds = safe_open_dataset(files["test"])
-        fake_test_ds = fake_ds.sel(time=slice(cfg.test_fake_range[0], cfg.test_fake_range[1]))
-        if fake_test_ds.sizes.get("time", 0) == 0:
-            print(f"Skipping {model_label}: no fake samples in test range {cfg.test_fake_range}")
+        opened = [normalize_prediction_timedelta(safe_open_dataset(path)) for path in files["files"]]
+        fake_ds = concatenate_forecasts(opened)
+        train_pairs = forecast_pairs(fake_ds, real_ds, cfg, "train", cfg.lead_times)
+        test_pairs = forecast_pairs(fake_ds, real_ds, cfg, "test", cfg.lead_times)
+        if not train_pairs or not test_pairs:
+            print(f"Skipping {model_label}: no exact monthly train/test forecast–ERA5 pairs")
             fake_ds.close()
             continue
-
-        fake_dataset = LeadTimeInferenceDataset(
-            fake_test_ds,
-            model_vars,
-            means,
-            stds,
-            level=cfg.get("level"),
-            max_samples=cfg.get("max_samples", 0),
-        )
-        lead_hours, fake_mean, fake_std = mean_logits_by_lead(
-            fake_dataset,
-            model,
-            cfg,
-            device,
-            f"{model_label} test forecast",
-        )
-        max_lead_hour = max(max_lead_hour, int(np.max(lead_hours)))
-        plot_curve(model_label, lead_hours, fake_mean, fake_std, color)
-
-        _, era5_mean, era5_std = mean_logits_by_lead(
-            era5_dataset,
-            model,
-            cfg,
-            device,
-            f"ERA5 with {model_label} discriminator",
-        )
-        era5_means.append(era5_mean[0])
-        era5_stds.append(era5_std[0])
+        means, stds = matched_statistics(real_ds, train_pairs, model_vars)
+        curve_hours, fake_mean, fake_std, reference_values = [], [], [], []
+        for lead_index, lead_hour in enumerate(lead_hours(fake_ds)):
+            selected = [pair for pair in test_pairs if pair.lead_index == lead_index]
+            if not selected:
+                continue
+            forecast_logits = logits_for(
+                model, fake_ds, model_vars, means, stds, device,
+                int(cfg.get("max_samples", 0)), int(cfg.batch_size),
+                lead=lead_index, selected_indices=[pair.forecast_index for pair in selected],
+            )
+            era5_logits = logits_for(
+                model, real_ds, model_vars, means, stds, device,
+                int(cfg.get("max_samples", 0)), int(cfg.batch_size),
+                selected_indices=[pair.era5_index for pair in selected],
+            )
+            curve_hours.append(int(lead_hour))
+            fake_mean.append(float(np.mean(forecast_logits)))
+            fake_std.append(float(np.std(forecast_logits)))
+            reference_values.extend(era5_logits.tolist())
+        curve_hours = np.asarray(curve_hours)
+        max_lead_hour = max(max_lead_hour, int(np.max(curve_hours)))
+        plot_curve(model_label, curve_hours, fake_mean, fake_std, color)
+        era5_means.append(float(np.mean(reference_values)))
+        era5_stds.append(float(np.std(reference_values)))
         fake_ds.close()
 
     if not era5_means:
@@ -154,7 +142,7 @@ def main(cfg: DictConfig):
 
     var_display = cfg.selected_variable.replace("_", " ").title() if len(model_vars) == 1 else "All Fields"
     plt.title(
-        f"Temporal Holdout Analysis: Train Forecast Period vs Test Forecast Period\n"
+        f"Monthly Valid-Time Holdout: days 1–15 train, days 20–26 test\n"
         f"Model: {cfg.model_name} | Variable: {var_display}",
         fontsize=14,
     )

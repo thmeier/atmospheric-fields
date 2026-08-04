@@ -34,6 +34,11 @@ except ImportError:
     )
 
 try:
+    from .monthly_split import forecast_pairs
+except ImportError:
+    from monthly_split import forecast_pairs
+
+try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = None
@@ -75,6 +80,8 @@ def _time_ranges_overlap(left, right):
 
 def validate_no_train_test_overlap(cfg):
     """Fail early if train/test time splits leak into each other."""
+    if str((cfg.get("monthly_split") or {}).get("strategy", "")) == "monthly_valid_time":
+        return
     if cfg.get("skip_train_test_overlap_check", False):
         return
 
@@ -244,13 +251,21 @@ def random_field_subset(num_fields, field_prob):
         mask[np.random.randint(num_fields)] = True
     return np.flatnonzero(mask)
 
-def sample_power_law_severity(max_severity, power):
-    """Bias random severities toward low values when `power > 1`."""
+def sample_power_law_severity(max_severity, power, min_severity=0.0):
+    """Sample from ``min + (max - min) * U**power`` for fake corruptions."""
+    max_severity, min_severity = float(max_severity), float(min_severity)
+    if min_severity < 0.0 or min_severity > max_severity:
+        raise ValueError(
+            f"Expected 0 <= min_severity <= max_severity, got "
+            f"{min_severity} and {max_severity}."
+        )
     if max_severity <= 0:
         return 0.0
     if power <= 0:
         raise ValueError(f"corruption_severity_power must be > 0, got {power}")
-    return float(max_severity) * (np.random.random() ** float(power))
+    return min_severity + (max_severity - min_severity) * (
+        np.random.random() ** float(power)
+    )
 
 
 def build_logger(cfg):
@@ -290,8 +305,9 @@ class WeatherDiscriminatorDataset(Dataset):
                  means=None, stds=None, balanced=True,
                  augment=False, augment_prob=0.5, disturb_type=None, disturb_level=0.0,
                  corruption_types=None, corruption_severity_max=1.0,
-                 corruption_severity_power=2.0, field_corruption_prob=0.5,
-                 max_samples=0):
+                 corruption_severity_power=2.0, corruption_severity_min=0.0,
+                 corruption_severity_min_overrides=None, field_corruption_prob=0.5,
+                 max_samples=0, monthly_split_cfg=None, monthly_split_name="train"):
         self.variables = variables
         self.balanced = balanced
         self.augment = augment
@@ -301,18 +317,28 @@ class WeatherDiscriminatorDataset(Dataset):
         self.corruption_types = list(corruption_types or ["blur", "grf", "pixel_replace"])
         self.corruption_severity_max = corruption_severity_max
         self.corruption_severity_power = corruption_severity_power
+        self.corruption_severity_min = float(corruption_severity_min)
+        self.corruption_severity_min_overrides = dict(corruption_severity_min_overrides or {})
         self.field_corruption_prob = field_corruption_prob
+        self.monthly_split_cfg = monthly_split_cfg
         max_samples = int(max_samples or 0)
-        
+        monthly = monthly_split_cfg is not None
+
         self.real_ds = normalize_prediction_timedelta(safe_open_dataset(real_nc_path))
-        self.real_ds = self._prepare_dataset(self.real_ds, level=level, time_range=real_range, max_samples=max_samples)
+        self.real_ds = self._prepare_dataset(
+            self.real_ds, level=level, time_range=None if monthly else real_range,
+            max_samples=0 if monthly else max_samples,
+        )
         
         from omegaconf import ListConfig
         if isinstance(fake_nc_path, (list, ListConfig)): 
             self.fake_sources = []
             for p in fake_nc_path:
                 ds = normalize_prediction_timedelta(safe_open_dataset(p))
-                ds = self._prepare_dataset(ds, level=level, time_range=fake_range, max_samples=max_samples)
+                ds = self._prepare_dataset(
+                    ds, level=level, time_range=None if monthly else fake_range,
+                    max_samples=0 if monthly else max_samples,
+                )
                 if ds.sizes.get("time", 0) > 0:
                     self.fake_sources.append(ds)
             if not self.fake_sources:
@@ -320,7 +346,10 @@ class WeatherDiscriminatorDataset(Dataset):
             self.fake_range_applied = True
         else:
             self.fake_ds = normalize_prediction_timedelta(safe_open_dataset(fake_nc_path))
-            self.fake_ds = self._prepare_dataset(self.fake_ds, level=level, time_range=fake_range, max_samples=max_samples)
+            self.fake_ds = self._prepare_dataset(
+                self.fake_ds, level=level, time_range=None if monthly else fake_range,
+                max_samples=0 if monthly else max_samples,
+            )
             self.fake_sources = [self.fake_ds]
             self.fake_range_applied = False
 
@@ -342,7 +371,20 @@ class WeatherDiscriminatorDataset(Dataset):
         
         # Forecast datasets contain multiple lead times.  ERA5/reference data is
         # evaluated at lead zero when that coordinate exists.
-        self.fake_sample_index = self._build_fake_sample_index(self.fake_sources, lead_times)
+        if monthly:
+            self.fake_sample_index = []
+            for source_index, source in enumerate(self.fake_sources):
+                for pair in forecast_pairs(
+                    source, self.real_ds, monthly_split_cfg, monthly_split_name, lead_times
+                ):
+                    self.fake_sample_index.append((
+                        source_index, pair.forecast_index, pair.lead_index, pair.era5_index
+                    ))
+            if max_samples > 0 and len(self.fake_sample_index) > max_samples:
+                positions = np.linspace(0, len(self.fake_sample_index) - 1, max_samples, dtype=int)
+                self.fake_sample_index = [self.fake_sample_index[int(position)] for position in positions]
+        else:
+            self.fake_sample_index = self._build_fake_sample_index(self.fake_sources, lead_times)
         if not self.fake_sample_index:
             raise ValueError(f"No fake samples found for configured lead_times={lead_times}")
 
@@ -358,12 +400,16 @@ class WeatherDiscriminatorDataset(Dataset):
         # real and fake samples without using forecast statistics.
         if means is None or stds is None:
             print(f"Calculating stats from REAL dataset...")
+            stats_ds = (
+                self.real_ds.isel(time=[record[3] for record in self.fake_sample_index])
+                if monthly else self.real_ds
+            )
             self.means = {}
             self.stds = {}
             for v in self.variables:
                 if v in self.real_ds.data_vars:
-                    self.means[v] = float(self.real_ds[v].mean())
-                    self.stds[v] = float(self.real_ds[v].std())
+                    self.means[v] = float(stats_ds[v].mean())
+                    self.stds[v] = float(stats_ds[v].std())
                 else:
                     self.means[v] = 0.0
                     self.stds[v] = 1.0
@@ -373,7 +419,7 @@ class WeatherDiscriminatorDataset(Dataset):
         # Balanced mode defines a stable 50/50 real/fake epoch even when the
         # number of ERA5 times and forecast-times-by-leads differs.
         self.total_fake_samples = len(self.fake_sample_index)
-        self.total_real_samples = len(self.real_times)
+        self.total_real_samples = len(self.fake_sample_index) if monthly else len(self.real_times)
         self.fake_categories = (
             ("forecast", "corrupted_real", "corrupted_forecast")
             if self.augment else
@@ -449,10 +495,12 @@ class WeatherDiscriminatorDataset(Dataset):
             return self.total_real_samples + self.total_fake_samples
 
     def _real_indices(self, idx):
+        if self.monthly_split_cfg is not None:
+            return self.fake_sample_index[idx % self.total_real_samples][3], self.real_lead_idx
         return idx % self.total_real_samples, self.real_lead_idx
 
     def _fake_indices(self, idx):
-        return self.fake_sample_index[idx % self.total_fake_samples]
+        return self.fake_sample_index[idx % self.total_fake_samples][:3]
 
     def _sample_tensor(self, ds, t_idx, l_idx):
         ds_slice = ds.isel(time=t_idx)
@@ -478,10 +526,14 @@ class WeatherDiscriminatorDataset(Dataset):
         return self._apply_fieldwise_corruption_type(sample, field_corruption_type)
 
     def _apply_fieldwise_corruption_type(self, sample, field_corruption_type):
+        minimum = float(self.corruption_severity_min_overrides.get(
+            field_corruption_type, self.corruption_severity_min
+        ))
         for channel_idx in random_field_subset(len(self.variables), self.field_corruption_prob):
             field_severity = sample_power_law_severity(
                 self.corruption_severity_max,
                 self.corruption_severity_power,
+                minimum,
             )
             sample = apply_fieldwise_corruption(
                 sample,
@@ -500,9 +552,13 @@ class WeatherDiscriminatorDataset(Dataset):
         if corruption_type in FIELDWISE_CORRUPTION_FNS:
             return self._apply_fieldwise_corruption_type(sample, corruption_type)
         else:
+            minimum = float(self.corruption_severity_min_overrides.get(
+                corruption_type, self.corruption_severity_min
+            ))
             severity = sample_power_law_severity(
                 self.corruption_severity_max,
                 self.corruption_severity_power,
+                minimum,
             )
             return apply_configured_corruption(sample, corruption_type, severity)
 
@@ -552,17 +608,107 @@ class WeatherDiscriminatorDataset(Dataset):
 
         return sample, label
 
+class SqueezeNetGlobalAttention(nn.Module):
+    """SqueezeNet features followed by lightweight global spatial mixing."""
+
+    def __init__(
+        self,
+        num_weather_channels,
+        pretrained_backbone=True,
+        attention_channels=64,
+        attention_heads=4,
+        attention_ffn_channels=128,
+        attention_dropout=0.1,
+    ):
+        super().__init__()
+        if attention_channels % 4 != 0:
+            raise ValueError("attention_channels must be divisible by 4 for spherical positions.")
+        weights = models.SqueezeNet1_1_Weights.DEFAULT if pretrained_backbone else None
+        backbone = models.squeezenet1_1(weights=weights)
+        old_conv = backbone.features[0]
+        backbone.features[0] = nn.Conv2d(
+            num_weather_channels,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+        )
+        with torch.no_grad():
+            repeat_factor = (num_weather_channels // 3) + 1
+            new_weights = old_conv.weight.repeat(1, repeat_factor, 1, 1)[
+                :, :num_weather_channels, :, :
+            ]
+            backbone.features[0].weight = nn.Parameter(
+                new_weights * (3.0 / num_weather_channels)
+            )
+        self.features = backbone.features
+        self.projection = nn.Conv2d(512, attention_channels, kernel_size=1)
+        layer = nn.TransformerEncoderLayer(
+            d_model=attention_channels,
+            nhead=attention_heads,
+            dim_feedforward=attention_ffn_channels,
+            dropout=attention_dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.global_mixer = layer
+        self.global_token = nn.Parameter(torch.zeros(1, 1, attention_channels))
+        nn.init.normal_(self.global_token, std=0.02)
+        self.output_norm = nn.LayerNorm(attention_channels)
+        self.classifier = nn.Linear(attention_channels, 1)
+        self.attention_channels = int(attention_channels)
+
+    @staticmethod
+    def spherical_position_encoding(height, width, channels, device, dtype):
+        """Fixed latitude and exactly periodic longitude Fourier positions."""
+        quarter = channels // 4
+        frequencies = torch.arange(1, quarter + 1, device=device, dtype=dtype)
+        latitudes = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        latitude_angles = latitudes[:, None] * frequencies[None, :] * (torch.pi / 2.0)
+        latitude_encoding = torch.cat(
+            [latitude_angles.sin(), latitude_angles.cos()], dim=-1
+        )
+        longitudes = torch.arange(width, device=device, dtype=dtype) * (2.0 * torch.pi / width)
+        longitude_angles = longitudes[:, None] * frequencies[None, :]
+        longitude_encoding = torch.cat(
+            [longitude_angles.sin(), longitude_angles.cos()], dim=-1
+        )
+        latitude_encoding = latitude_encoding[:, None, :].expand(height, width, -1)
+        longitude_encoding = longitude_encoding[None, :, :].expand(height, width, -1)
+        return torch.cat([latitude_encoding, longitude_encoding], dim=-1).reshape(
+            1, height * width, channels
+        )
+
+    def forward(self, x):
+        features = self.projection(self.features(x))
+        _, _, height, width = features.shape
+        tokens = features.flatten(2).transpose(1, 2)
+        tokens = tokens + self.spherical_position_encoding(
+            height, width, self.attention_channels, tokens.device, tokens.dtype
+        )
+        global_token = self.global_token.expand(tokens.shape[0], -1, -1)
+        mixed = self.global_mixer(torch.cat([global_token, tokens], dim=1))
+        return self.classifier(self.output_norm(mixed[:, 0]))
+
+
 class WeatherDiscriminator(L.LightningModule):
     """Torchvision backbone adapted for weather-field binary classification."""
 
-    def __init__(self, num_weather_channels, model_name="resnet18", learning_rate=1e-4):
+    def __init__(
+        self,
+        num_weather_channels,
+        model_name="resnet18",
+        learning_rate=1e-4,
+        pretrained_backbone=True,
+    ):
         super().__init__()
         self.save_hyperparameters()
         self.learning_rate = learning_rate
         self.model_name = model_name
         
         if model_name == "resnet18":
-            self.model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            weights = models.ResNet18_Weights.DEFAULT if pretrained_backbone else None
+            self.model = models.resnet18(weights=weights)
             old_conv = self.model.conv1
             self.model.conv1 = nn.Conv2d(
                 num_weather_channels, old_conv.out_channels, 
@@ -576,7 +722,8 @@ class WeatherDiscriminator(L.LightningModule):
             self.model.fc = nn.Linear(self.model.fc.in_features, 1)
             
         elif model_name == "squeezenet":
-            self.model = models.squeezenet1_1(weights=models.SqueezeNet1_1_Weights.DEFAULT)
+            weights = models.SqueezeNet1_1_Weights.DEFAULT if pretrained_backbone else None
+            self.model = models.squeezenet1_1(weights=weights)
             old_conv = self.model.features[0]
             self.model.features[0] = nn.Conv2d(
                 num_weather_channels, old_conv.out_channels, 
@@ -590,6 +737,15 @@ class WeatherDiscriminator(L.LightningModule):
             old_classifier = self.model.classifier[1]
             self.model.classifier[1] = nn.Conv2d(old_classifier.in_channels, 1, kernel_size=(1, 1))
             self.model.classifier[2] = nn.Identity()
+        elif model_name == "squeezenet_attention":
+            self.model = SqueezeNetGlobalAttention(
+                num_weather_channels,
+                pretrained_backbone=pretrained_backbone,
+                attention_channels=64,
+                attention_heads=4,
+                attention_ffn_channels=128,
+                attention_dropout=0.1,
+            )
         else:
             raise ValueError(f"Unsupported model: {model_name}")
             
@@ -600,6 +756,48 @@ class WeatherDiscriminator(L.LightningModule):
         if self.model_name == "squeezenet":
             out = torch.flatten(out, 1)
         return out
+
+    def pre_pool_logit_map(self, x):
+        """Return the spatial logit map immediately before global pooling.
+
+        Its spatial mean is the scalar discriminator logit returned by
+        :meth:`forward`. For ResNet this is the class-activation map induced by
+        the binary fully connected head; for SqueezeNet it is the final 1x1
+        classifier-convolution output.
+        """
+        if self.model_name == "squeezenet":
+            features = self.model.features(x)
+            return self.model.classifier[:3](features)
+
+        if self.model_name == "resnet18":
+            model = self.model
+            features = model.conv1(x)
+            features = model.bn1(features)
+            features = model.relu(features)
+            features = model.maxpool(features)
+            features = model.layer1(features)
+            features = model.layer2(features)
+            features = model.layer3(features)
+            features = model.layer4(features)
+            return torch.nn.functional.conv2d(
+                features,
+                model.fc.weight[:, :, None, None],
+                model.fc.bias,
+            )
+
+        if self.model_name == "squeezenet_attention":
+            raise NotImplementedError(
+                "The attention discriminator uses a global token, so its scalar logit "
+                "has no exact additive pre-pooling logit map."
+            )
+
+        raise ValueError(f"Unsupported model: {self.model_name}")
+
+    def forward_with_logit_map(self, x):
+        """Return scalar logits and their exact pre-pooling spatial maps."""
+        logit_map = self.pre_pool_logit_map(x)
+        logits = torch.mean(logit_map, dim=(-2, -1))
+        return logits, logit_map
 
     def training_step(self, batch, batch_idx):
         inputs, labels = batch
@@ -634,8 +832,15 @@ def main(cfg: DictConfig):
         corruption_types=cfg.get("corruption_types"),
         corruption_severity_max=cfg.get("corruption_severity_max", 1.0),
         corruption_severity_power=cfg.get("corruption_severity_power", 2.0),
+        corruption_severity_min=cfg.get("corruption_severity_min", 0.0),
+        corruption_severity_min_overrides=cfg.get("corruption_severity_min_overrides", {}),
         field_corruption_prob=cfg.get("field_corruption_prob", 0.5),
         max_samples=cfg.get("max_samples", 0),
+        monthly_split_cfg=(
+            cfg if str((cfg.get("monthly_split") or {}).get("strategy", "")) == "monthly_valid_time"
+            else None
+        ),
+        monthly_split_name="train",
     )
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
     
