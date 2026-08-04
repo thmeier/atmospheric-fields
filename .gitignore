@@ -46,3 +46,10 @@ Discriminator/weather-discriminator_kfold/
 *.ckpt
 
 Discriminator/artifacts/
+
+useful_commands.txt
+
+# Local experiment artifacts
+Discriminator/slurm_baseline_pipeline_*.err
+Discriminator/tea_debug.log
+sfno_8c_31x60/

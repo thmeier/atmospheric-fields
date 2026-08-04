@@ -1,6 +1,6 @@
 """Visualize Keisler 850 hPa temperature beside matching ERA5 fields.
 
-This is a diagnostic for unusually large Keisler temperature metric error bars.
+This is a diagnostic for unusually large Keisler temperature metric values.
 By default it selects the five samples with the largest absolute spatial-mean
 bias at the 12 h lead and plots Keisler, ERA5 at the forecast valid time, and
 their difference.
@@ -200,12 +200,12 @@ def main(cfg: DictConfig):
     sample_mode = str(cfg_get(cfg, "visualize_sample_mode", "worst_mean_bias"))
     include_invalid = bool(cfg_get(cfg, "visualize_include_invalid", False))
 
-    keisler_path = cfg.standard_metric_comparison_files["Keisler"]
-    era5_path = cfg_get(cfg, "standard_metric_real_nc_file", cfg.real_nc_file)
+    keisler_path = cfg.comparison_files["Keisler"]
+    era5_path = cfg.real_nc_file
     keisler_ds = normalize_prediction_timedelta(safe_open_dataset(keisler_path))
     era5_ds = safe_open_dataset(era5_path)
 
-    keisler_ds = select_level(select_time_ranges(keisler_ds, cfg.standard_metric_test_fake_range), cfg.get("level"))
+    keisler_ds = select_level(select_time_ranges(keisler_ds, cfg.test_fake_range), cfg.get("level"))
     era5_ds = select_level(era5_ds, cfg.get("level"))
     if variable not in keisler_ds.data_vars:
         raise ValueError(f"{variable} missing from Keisler file: {keisler_path}")

@@ -44,7 +44,11 @@ def describe_child_failure(exc):
     return f"child trainer was killed by {signal_name}"
 
 
-def build_train_command(cfg, model_label, train_file, test_file):
+def hydra_paths_arg(paths):
+    return "[" + ",".join(f"'{path}'" for path in paths) + "]"
+
+
+def build_train_command(cfg, model_label, files):
     """Build a child train_discriminator.py command for one forecast model."""
     return [
         sys.executable,
@@ -52,8 +56,8 @@ def build_train_command(cfg, model_label, train_file, test_file):
         str(SCRIPT_DIR / "train_discriminator.py"),
         "--config-name",
         "config",
-        f"++fake_nc_file=[{train_file}]",
-        f"++test_fake_nc_file={test_file}",
+        f"++fake_nc_file={hydra_paths_arg(files)}",
+        f"++test_fake_nc_file={files[0]}",
         f"++selected_variable={cfg.selected_variable}",
         f"++model_name={cfg.model_name}",
         f"++output_filename={checkpoint_filename(cfg, model_label)}",
@@ -65,8 +69,6 @@ def build_train_command(cfg, model_label, train_file, test_file):
         f"++num_workers={cfg.num_workers}",
         f"++max_samples={cfg.get('max_samples', 0)}",
         f"++precision={cfg.precision}",
-        f"++train_fake_range={hydra_range_arg(cfg.train_fake_range)}",
-        f"++test_fake_range={hydra_range_arg(cfg.test_fake_range)}",
         f"++augment={str(cfg.get('augment', True)).lower()}",
     ]
 
@@ -81,19 +83,18 @@ def main(cfg: DictConfig):
     if not pairs:
         raise RuntimeError("No temporal train/test forecast pairs found.")
 
-    print(f"Temporal fake train range: {cfg.train_fake_range}")
-    print(f"Temporal fake test range: {cfg.test_fake_range}")
+    print(f"Monthly valid-time train days: {cfg.monthly_split.train_days}")
+    print(f"Monthly valid-time test days: {cfg.monthly_split.test_days}")
 
     for model_label, files in pairs.items():
         output_path = checkpoint_dir / checkpoint_filename(cfg, model_label)
         print("\n" + "=" * 50)
         print(f"Temporal holdout model: {model_label}")
         print("=" * 50)
-        print(f"Training fake file: {files['train']}")
-        print(f"Test fake file: {files['test']}")
+        print(f"Forecast files: {files['files']}")
         print(f"Output checkpoint: {output_path}")
 
-        cmd = build_train_command(cfg, model_label, files["train"], files["test"])
+        cmd = build_train_command(cfg, model_label, files["files"])
         print(f"Executing command: {' '.join(map(str, cmd))}")
         try:
             subprocess.run(cmd, check=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})

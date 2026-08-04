@@ -57,6 +57,12 @@ def _finalize_like_input(original_x, work_x):
     return work_x
 
 
+def _preserve_spatial_mean(original, corrupted):
+    """Shift each sample/channel so its ordinary spatial mean is unchanged."""
+    residual = corrupted - original
+    return corrupted - residual.mean(dim=(-2, -1), keepdim=True)
+
+
 def apply_gaussian_blur(x, severity):
     """
     x: torch tensor of shape (N, C, H, W)
@@ -123,15 +129,17 @@ def apply_gaussian_field_noise(x, severity, len_scale=10.0):
     # We want Var = std^2, so sum(A^2) = std^2 * (H*W)^2
     # With A[k] = c * sqrt(power[k]): c = std * H * W / sqrt(sum(power))
     amplitude = np.sqrt(power) * std * (H * W) / np.sqrt(power.sum())
-    amplitude = torch.from_numpy(amplitude)  # (H, W)
+    amplitude = torch.from_numpy(amplitude).to(device=work_x.device, dtype=work_x.dtype)
 
     # Sample white noise in frequency domain, weight by amplitude, IFFT back
     # Real and imaginary parts are independent normals
-    noise_freq = torch.randn(N, C, H, W) + 1j * torch.randn(N, C, H, W)
+    noise_freq = torch.randn(
+        N, C, H, W, device=work_x.device, dtype=work_x.dtype
+    ) + 1j * torch.randn(N, C, H, W, device=work_x.device, dtype=work_x.dtype)
     noise_freq = noise_freq * amplitude
     noise = torch.fft.ifft2(noise_freq).real
 
-    corrupted = work_x + noise.to(work_x.device)
+    corrupted = _preserve_spatial_mean(work_x, work_x + noise)
     if _is_model_padded_shape(x):
         return _repad_like_dataset(corrupted)
     return corrupted
@@ -141,7 +149,10 @@ def apply_random_pixel_replace(x, severity, max_replace_prob=0.3):
     """
     x: torch tensor of shape (N, C, H, W)
     severity: float in [0, 1]. Maps to replacement probability in [0, 0.3].
-    Replaces a random subset of interior pixels with Gaussian samples.
+    Replaces a random subset of interior pixels with Gaussian samples while
+    preserving each sample/channel's spatial mean. Only selected pixels are
+    changed: the proposed replacement values receive a shared offset whose
+    selected-pixel sum exactly matches the original selected-pixel sum.
     """
     if severity <= 0:
         return x
@@ -151,7 +162,16 @@ def apply_random_pixel_replace(x, severity, max_replace_prob=0.3):
 
     mask = torch.rand_like(work_x) < replace_prob
     replacement = torch.randn_like(work_x)
-    corrupted = torch.where(mask, replacement, work_x)
+    selected_count = mask.sum(dim=(-2, -1), keepdim=True)
+    selected_sum_difference = ((work_x - replacement) * mask).sum(
+        dim=(-2, -1), keepdim=True
+    )
+    selected_offset = torch.where(
+        selected_count > 0,
+        selected_sum_difference / selected_count.clamp_min(1),
+        torch.zeros_like(selected_sum_difference),
+    )
+    corrupted = torch.where(mask, replacement + selected_offset, work_x)
 
     if _is_model_padded_shape(x):
         return _repad_like_dataset(corrupted)

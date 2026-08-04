@@ -1,0 +1,27 @@
+defaults:
+  - baseline_config
+  - _self_
+
+# Probe the null space of the exact finite Wendland-response matrix configured
+# under `baseline`; this does not represent the continuous SCWD operator.
+scwd_null_space:
+  variable: "2m_temperature"
+  output_dir: "${output_dir}/baselines/temporal_holdout/surface/${scwd_null_space.variable}/scwd_null_space"
+  visualization_time: "2018-08-23T00:00:00"
+  evaluation_samples: 128
+  rms_values: [0.05, 0.10, 0.20]
+  seed_block_pixels: 1
+  projection_atol: 1e-10
+  projection_btol: 1e-10
+  projection_max_iterations: 1000
+  verification_tolerance: 1e-7
+  plot_coastlines: true
+  near_null_gallery_rms: 0.20
+  near_null_patterns:
+    - "equatorial_checker_texture"
+    - "meridional_scanlines"
+    - "checkerboard_2px"
+    - "zonal_scanlines"
+  hemisphere_splice_enabled: true
+  hemisphere_splice_seed: 0
+  hemisphere_splice_latitude: 0.0

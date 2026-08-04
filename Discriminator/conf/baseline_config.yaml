@@ -1,0 +1,153 @@
+defaults:
+  - config
+  - _self_
+
+# Point-estimate distribution baselines aligned with the temporal-holdout
+# surface experiment. ERA5 paths, real-data time splits, lead times, and the
+# corruption severity scale are inherited from config.yaml.
+baseline:
+  variables:
+    - "2m_temperature"
+
+  # Per-model maximum coverage. Each forecast is evaluated only at configured
+  # valid-time test days and paired to ERA5 at that exact timestamp.
+  forecast_files:
+    "GraphCast":
+      - "${data_dir}/graphcast_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+      - "${data_dir}/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    "Pangu-Weather":
+      - "${data_dir}/pangu_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+      - "${data_dir}/pangu_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    "FuXi":
+      - "${data_dir}/fuxi_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    "IFS HRES":
+      - "${data_dir}/ifs_hres_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
+      - "${data_dir}/ifs_hres_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    "ERA5 Forecast":
+      - "${data_dir}/era5_forecast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+
+  # Complete canonical corruption catalog. Wind-vector corruptions are skipped
+  # automatically when the selected baseline fields do not contain U/V wind.
+  corruptions:
+    - "gaussian_blur"
+    - "hf_noise"
+    - "grf"
+    - "pixel_replace"
+    - "wind_patch_shuffle"
+    - "wind_rotation"
+    - "equatorial_checker_texture"
+    - "meridional_scanlines"
+    - "checkerboard_2px"
+    - "zonal_scanlines"
+    - "hemisphere_splice"
+  metrics:
+    - "mean_bias"
+    - "std_ratio_error"
+    - "crps_like_field_energy"
+    - "zonal_energy_spectrum_l2"
+    - "zonal_energy_spectrum_log_l2"
+    - "sliced_wasserstein"
+    - "sliced_wasserstein_lon_corrected"
+    - "global_mean_wasserstein"
+    - "mmd_rbf"
+    - "scwd"
+    - "scwd_area_weighted"
+
+  output_dir: "${output_dir}/baselines/monthly_valid_time_2018_2020/surface"
+  # Use every timestamp in each configured range. The two quadratic metrics
+  # retain an evenly spaced subset to keep their exact all-pairs estimators
+  # tractable.
+  eval_samples: 0
+  # Corruption sweeps use evenly spaced monthly test samples. Severity zero is
+  # the test distribution compared with itself; the days 16–end versus days
+  # 1–15 null divergence is stored as a separate row.
+  corruption_eval_samples: 1000
+  pairwise_eval_samples: 256
+  value_samples: 20000
+  filter_invalid_fields: true
+  invalid_zero_atol: 1e-12
+  invalid_min_std: 1e-12
+
+  backend: "auto"
+  device: null
+  dtype: "float32"
+  feature_chunk_size: 32
+  scratch_dir: null
+  corruption_seed: 0
+  # Structured near-null severities are normalized RMS amplitudes. For the
+  # data-dependent hemisphere splice, severity/max is the probability that a
+  # sample's entire southern hemisphere is replaced by its donor field.
+  hemisphere_splice_latitude: 0.0
+
+  field_energy_chunk_size: 4
+  spectrum_log_eps_factor: 1e-12
+  swd_pixels: 4096
+  swd_projections: 64
+  swd_seed: 0
+  # Vissio et al. use a 20-bin Ulam discretization for global-mean W2.
+  global_mean_wd_bins: 20
+  mmd_bandwidth: null
+  mmd_standardize: true
+  # Optional leakage-free MMD diagnostic: fit a per-model/per-lead global
+  # forecast-to-ERA5 mean/variance correction on train days, then freeze it on test days.
+  mmd_global_moment_matching:
+    enabled: false
+    output_subdir: mmd_global_moment_matching
+    eval_samples: 0
+
+  scwd_anchor_lat_points: 60
+  scwd_anchor_lon_points: 120
+  scwd_domain_lat_points: 361
+  scwd_domain_lon_points: 720
+  scwd_radius_km: 1000.0
+  scwd_order: 2.0
+  scwd_quantiles: 200
+  scwd_channel_projections: 16
+  scwd_anchor_chunk_size: 128
+  scwd_top_w1_anchors: 6
+  scwd_distribution_bins: 40
+
+  corruption_steps: 7
+  corruption_severity_max: 0.2
+  corruption_severity_max_overrides:
+    # Blur severity is its native fraction of the full sigma=1.125-pixel kernel.
+    gaussian_blur: 1.0
+    pixel_replace: 0.01
+  # Companion maps show Corrupted − ERA5 for one representative timestamp from
+  # the same full-range samples used for the corruption-metric sweep.
+  plot_corruption_disturbances: true
+  corruption_visualization_time_index: null
+  discriminator:
+    enabled: true
+    checkpoint_dir: "${baseline.output_dir}/2m_temperature/models/target_discriminators"
+    model_name: squeezenet
+    attention_squeezenet:
+      enabled: true
+      model_name: squeezenet_attention
+    equator_masked_hemisphere_splice:
+      enabled: true
+      half_width_degrees: 10.0
+    sfno:
+      enabled: true
+      repo_root: null
+      weights_subdir: weights_4fields
+      target_variables: ["2m_temperature"]
+      use_era5_context_for_non_target_fields: false
+      embedding_channels: 8
+      embedding_resolution: [31, 60]
+      pooling: grid
+      pool_grid: [7, 8]
+      mlp_hidden_multiplier: 2.0
+      mlp_dropout: 0.1
+    evaluation_batch_size: 32
+    # Same deterministic, evenly spaced train/test sample selection as the
+    # standard corruption metrics and their disturbance galleries.
+    evaluation_samples: ${baseline.corruption_eval_samples}
+    corruption_severity_max: 0.2
+    corruption_severity_max_overrides:
+      gaussian_blur: 1.0
+      pixel_replace: 0.01
+    corruption_steps: 7
+    plot_yscale: linear
+    plot_linthresh: 1e-2
+    forecast_files: ${baseline.forecast_files}
