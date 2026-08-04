@@ -50,8 +50,17 @@ SEED="${SEED:-0}"
 
 mkdir -p plots
 
+# Accept either an SFNO-Embedding checkout (weights_4fields/) or the
+# standalone inference bundle shipped as models/ + weights/.
+if [ -d "$SFNO_REPO/weights_4fields" ]; then
+    W="$SFNO_REPO/weights_4fields"
+elif [ -d "$SFNO_REPO/weights" ]; then
+    W="$SFNO_REPO/weights"
+else
+    W="$SFNO_REPO/weights_4fields"
+fi
+
 # ── Preflight: both checkpoints + shared static/norm files + ERA5 ────────────
-W="$SFNO_REPO/weights_4fields"
 missing=0
 for f in "$W/model_4c_15x28_4fields.pth" \
          "$W/model_8c_31x60_4fields.pth" \
@@ -63,7 +72,7 @@ for f in "$W/model_4c_15x28_4fields.pth" \
 done
 if [ "$missing" -ne 0 ]; then
     echo ""
-    echo "Prerequisites missing — stage \$SFNO_REPO/weights_4fields/ (see"
+    echo "Prerequisites missing — stage either \$SFNO_REPO/weights_4fields/ or \$SFNO_REPO/weights/ (see"
     echo "submit_sfno_mmd.sh) and check \$ERA5, then re-submit."
     exit 1
 fi
