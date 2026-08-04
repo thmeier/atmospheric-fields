@@ -1,0 +1,15 @@
+defaults:
+  - config
+  - _self_
+
+# Measure the exact fieldwise Gaussian-blur path used by discriminator training
+# on normalized ERA5 training fields.  The default sweep resolves the small-
+# sigma elbow before choosing a non-zero severity floor for power-law sampling.
+gaussian_blur_elbow:
+  min_severity: 0.1
+  max_severity: 0.3
+  num_severities: 81
+  max_samples: 128
+  batch_size: 16
+  output_csv: "${output_dir}/diagnostics/gaussian_blur_elbow.csv"
+  output_plot: "${output_dir}/diagnostics/gaussian_blur_elbow.png"
