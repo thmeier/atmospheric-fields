@@ -519,6 +519,143 @@ def plot_target_test_logit_histograms(model, architecture, kind, label, test_rea
             _plot_logit_histogram_overlay(groups, f"{architecture}: {label} — all lead times", overlay_path)
     return [group["path"] for group in groups] + ([overlay_path] if groups else [])
 
+def _sfno_features(encoder, samples, device, batch_size):
+    """Encode raw four-field samples without retaining activation graphs."""
+    features = []
+    with torch.no_grad():
+        for start in range(0, len(samples), max(1, int(batch_size))):
+            batch = torch.stack(samples[start:start + max(1, int(batch_size))])
+            features.append(encoder.extract_features(batch.to(device=device, dtype=torch.float32)))
+    return torch.cat(features, dim=0).detach().cpu().numpy()
+
+
+def _mean_sfno_distance(first, second):
+    return float(np.linalg.norm(np.asarray(first) - np.asarray(second), axis=1).mean())
+
+
+def _sfno_forecast_input(model, real, fake, record):
+    """Construct precisely the four-field forecast input seen by the SFNO probe."""
+    if not bool(getattr(model, "sfno_use_era5_context", False)):
+        return raw_fields(fake, SFNO_VARIABLES, record.forecast_index, record.lead_index)
+    target_variables = list(getattr(model, "sfno_target_variables", ["2m_temperature"]))
+    context_variables = [variable for variable in SFNO_VARIABLES if variable not in target_variables]
+    forecast = raw_fields(fake, target_variables, record.forecast_index, record.lead_index)
+    context = raw_fields(real, context_variables, record.era5_index)
+    return torch.stack([
+        forecast[target_variables.index(variable)] if variable in target_variables
+        else context[context_variables.index(variable)]
+        for variable in SFNO_VARIABLES
+    ])
+
+
+def sfno_representation_ratio_rows(model, test_real, test_fake, records, corruption, cfg, device,
+                                   maximum, batch_size):
+    """Return held-out R_corr rows for a frozen SFNO representation.
+
+    The denominator is the mean latent distance between a deterministic
+    derangement of ERA5 test samples. The numerator is the mean distance between
+    each reference and its matched forecast/corruption counterpart. Consequently
+    R_corr is zero for an identity transform and about one when its average
+    displacement matches a typical held-out ERA5 latent displacement.
+    """
+    if not bool(getattr(model, "expects_raw_fields", False)):
+        return []
+    encoder = model.encoder
+    seed = int(get(cfg, "seed", 0))
+
+    def summarize(reference_samples, candidate_samples, coordinate):
+        if len(reference_samples) < 2:
+            return None
+        reference_features = _sfno_features(encoder, reference_samples, device, batch_size)
+        candidate_features = _sfno_features(encoder, candidate_samples, device, batch_size)
+        donor_positions = deranged_sample_positions(len(reference_samples), seed)
+        reference_distance = _mean_sfno_distance(reference_features, reference_features[donor_positions])
+        corruption_distance = _mean_sfno_distance(reference_features, candidate_features)
+        ratio = float("nan") if reference_distance <= np.finfo(np.float64).eps else corruption_distance / reference_distance
+        return {
+            **coordinate,
+            "reference_distance": reference_distance,
+            "candidate_distance": corruption_distance,
+            "r_corr": ratio,
+            "n_samples": int(len(reference_samples)),
+        }
+
+    rows = []
+    if corruption:
+        selected = indices(test_real, maximum)
+        reference_samples = [raw_fields(test_real, SFNO_VARIABLES, int(index)) for index in selected]
+        donor_positions = deranged_sample_positions(len(selected), seed) if corruption == "hemisphere_splice" else None
+        maximum_severity = target_corruption_max(cfg, corruption)
+        for severity in np.linspace(0.0, maximum_severity, int(get(cfg, "corruption_steps", 7))):
+            candidates = []
+            for position, index in enumerate(selected):
+                donor = (raw_fields(test_fake, SFNO_VARIABLES, int(selected[int(donor_positions[position])]))
+                         if donor_positions is not None else None)
+                candidates.append(apply_sfno_corruption(
+                    reference_samples[position], model.encoder, corruption, float(severity),
+                    np.asarray(test_real.latitude.values), cfg, donor,
+                    maximum_severity=maximum_severity,
+                    random_seed=corruption_sample_seed(seed, corruption, int(index)),
+                    target_variables=(getattr(model, "sfno_target_variables", None)
+                                      if getattr(model, "sfno_use_era5_context", False) else None),
+                ))
+            row = summarize(reference_samples, candidates, {"severity": float(severity), "lead_hour": None})
+            if row is not None:
+                rows.append(row)
+    else:
+        lead_hours = np.asarray(test_fake.prediction_timedelta.values).astype("timedelta64[h]").astype(int)
+        for lead_index, lead_hour in enumerate(lead_hours):
+            selected_records = evenly_spaced_pairs(
+                [record for record in records if record.lead_index == lead_index], maximum,
+            )
+            if len(selected_records) < 2:
+                continue
+            reference_samples = [raw_fields(test_real, SFNO_VARIABLES, record.era5_index) for record in selected_records]
+            candidates = [_sfno_forecast_input(model, test_real, test_fake, record) for record in selected_records]
+            row = summarize(reference_samples, candidates, {"severity": None, "lead_hour": int(lead_hour)})
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+def plot_sfno_representation_ratio(rows, architecture, kind, label, output_path):
+    """Plot R_corr across a target's lead times or corruption strengths."""
+    if not rows:
+        return None
+    figure, axis = plt.subplots(figsize=(6.4, 4.0))
+    corruptions = rows[0]["severity"] is not None
+    x = np.asarray([row["severity"] if corruptions else row["lead_hour"] for row in rows], dtype=float)
+    y = np.asarray([row["r_corr"] for row in rows], dtype=float)
+    finite = np.isfinite(y)
+    axis.plot(x[finite], y[finite], marker="o", color="tab:purple")
+    if np.any(~finite):
+        axis.scatter(x[~finite], np.zeros(np.count_nonzero(~finite)), marker="x", color="black", label="undefined (zero ERA5 reference distance)")
+        axis.legend(fontsize=8)
+    axis.set(
+        title=f"{architecture}: {label} — SFNO representation ratio",
+        xlabel="Corruption strength" if corruptions else "Lead time (hours)",
+        ylabel=r"$R_{corr}=E||\phi(x)-\phi(T(x))||_2 / E||\phi(x_i)-\phi(x_j)||_2$",
+    )
+    axis.grid(alpha=0.25)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200)
+    plt.close(figure)
+    return output_path
+
+
+def write_sfno_representation_ratios(root, records):
+    path = Path(root) / "data" / "sfno_representation_ratios.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["architecture", "kind", "target", "severity", "lead_hour", "reference_distance",
+              "candidate_distance", "r_corr", "n_samples"]
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(records)
+    print(f"Saved SFNO representation ratios to: {path}")
+    return path
+
+
 def safe_target_name(value):
     return "".join(character if character.isalnum() or character in "-_" else "_"
                    for character in str(value)).strip("_")
@@ -1412,6 +1549,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
     checkpoint_root = root / "models" / "target_discriminators"
     outputs = []
     interpretability_rows = []
+    representation_ratio_rows = []
     pipeline = cfg.get("pipeline", {}) or {}
     wandb_settings = pipeline.get("wandb", {}) or {}
     log_every = int(wandb_settings.get("log_every_n_steps", 20))
@@ -1487,6 +1625,34 @@ def train_target_discriminator_baselines(cfg, tracker=None):
         if run is not None:
             tracker.log_images(run, logit_histogram_paths, root / "plots")
             run.summary["test/logit_histograms"] = len(logit_histogram_paths)
+        ratio_settings = (sfno_settings(cfg).get("representation_ratio", {}) or {})
+        if bool(getattr(model, "expects_raw_fields", False)) and bool(ratio_settings.get("enabled", True)):
+            ratios = sfno_representation_ratio_rows(
+                model, test_real, test_fake, test_records, corruption, cfg, device, maximum,
+                int(get(cfg, "batch_size")),
+            )
+            for ratio in ratios:
+                ratio.update({"architecture": architecture, "kind": kind, "target": label})
+            representation_ratio_rows.extend(ratios)
+            ratio_path = plot_sfno_representation_ratio(
+                ratios, architecture, kind, label,
+                root / "plots" / "sfno_representation_ratio" / architecture / kind /
+                f"{safe_target_name(label)}.png",
+            )
+            record["sfno_representation_ratios"] = ratios
+            record["sfno_representation_ratio_plot"] = str(ratio_path) if ratio_path else ""
+            if run is not None:
+                for ratio in ratios:
+                    coordinate = ratio["severity"] if ratio["severity"] is not None else ratio["lead_hour"]
+                    run.log({
+                        "sfno/representation_ratio": ratio["r_corr"],
+                        "sfno/representation_candidate_distance": ratio["candidate_distance"],
+                        "sfno/representation_reference_distance": ratio["reference_distance"],
+                        "sfno/representation_coordinate": coordinate,
+                    })
+                run.summary["sfno/representation_ratio_points"] = len(ratios)
+                if ratio_path is not None:
+                    tracker.log_images(run, [ratio_path], root / "plots")
         if attribution_enabled:
             gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
                             f"{safe_target_name(label)}_integrated_gradients.png")
@@ -1596,6 +1762,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
             print(f"Skipping optional SFNO target training: {error}")
             write_target_train_test_metrics(root, outputs)
             write_interpretability_cases(root, interpretability_rows)
+            write_sfno_representation_ratios(root, representation_ratio_rows)
             real.close()
             return outputs
         targets = target_specs(cfg, SFNO_VARIABLES)
@@ -1621,6 +1788,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 if not corruption: fake.close()
     write_target_train_test_metrics(root, outputs)
     write_interpretability_cases(root, interpretability_rows)
+    write_sfno_representation_ratios(root, representation_ratio_rows)
     real.close()
     return outputs
 
