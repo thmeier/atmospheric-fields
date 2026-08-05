@@ -33,6 +33,10 @@ target_discriminator:
     epochs: 5
     representation_ratio:
       enabled: true
+      # Match the standard-corruption evaluation budget rather than materializing all ERA5 maps.
+      evaluation_samples: ${baseline.corruption_eval_samples}
+      # Full-resolution block-six maps are evaluated in small batches.
+      batch_size: 8
     mlp_hidden_multiplier: 2.0
     mlp_dropout: 0.1
   device: auto
