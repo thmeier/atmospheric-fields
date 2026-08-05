@@ -65,8 +65,14 @@ class SFNOBundleResolutionTest(unittest.TestCase):
             pooling="grid", pool_grid=(7, 8),
         ).eval()
         with torch.no_grad():
-            features = model.extract_features(torch.zeros(1, 4, 121, 240))
+            inputs = torch.zeros(1, 4, 121, 240)
+            features = model.extract_features(inputs)
+            maps = model.extract_representation_maps(inputs)
         self.assertEqual(tuple(features.shape), (1, 448))
+        self.assertEqual(tuple(maps["block6_post_residual"].shape), (1, 34, 121, 240))
+        self.assertEqual(tuple(maps["block7_pre_projection"].shape), (1, 34, 31, 60))
+        self.assertEqual(tuple(maps["pooled_embedding"].shape), (1, 448))
+        self.assertTrue(torch.equal(features, maps["pooled_embedding"]))
 
 
 if __name__ == "__main__":

@@ -519,18 +519,30 @@ def plot_target_test_logit_histograms(model, architecture, kind, label, test_rea
             _plot_logit_histogram_overlay(groups, f"{architecture}: {label} — all lead times", overlay_path)
     return [group["path"] for group in groups] + ([overlay_path] if groups else [])
 
-def _sfno_features(encoder, samples, device, batch_size):
-    """Encode raw four-field samples without retaining activation graphs."""
-    features = []
+def _sfno_layer_pair_distances(encoder, first_samples, second_samples, device, batch_size):
+    """Mean L2 distances for named SFNO maps without retaining full test tensors."""
+    if len(first_samples) != len(second_samples):
+        raise ValueError("SFNO sample counts must match for representation distances.")
+    totals = {}
+    count = 0
+    batch_size = max(1, int(batch_size))
     with torch.no_grad():
-        for start in range(0, len(samples), max(1, int(batch_size))):
-            batch = torch.stack(samples[start:start + max(1, int(batch_size))])
-            features.append(encoder.extract_features(batch.to(device=device, dtype=torch.float32)))
-    return torch.cat(features, dim=0).detach().cpu().numpy()
+        for start in range(0, len(first_samples), batch_size):
+            stop = min(start + batch_size, len(first_samples))
+            first = torch.stack(first_samples[start:stop]).to(device=device, dtype=torch.float32)
+            second = torch.stack(second_samples[start:stop]).to(device=device, dtype=torch.float32)
+            first_maps = encoder.extract_representation_maps(first)
+            second_maps = encoder.extract_representation_maps(second)
+            for layer, first_map in first_maps.items():
+                norms = torch.linalg.vector_norm((first_map - second_maps[layer]).flatten(1), dim=1)
+                totals[layer] = totals.get(layer, 0.0) + float(norms.sum().item())
+            count += stop - start
+    return {layer: total / count for layer, total in totals.items()}
 
 
-def _mean_sfno_distance(first, second):
-    return float(np.linalg.norm(np.asarray(first) - np.asarray(second), axis=1).mean())
+def _sfno_reference_distances(encoder, reference_samples, donor_positions, device, batch_size):
+    donors = [reference_samples[int(position)] for position in donor_positions]
+    return _sfno_layer_pair_distances(encoder, reference_samples, donors, device, batch_size)
 
 
 def _sfno_forecast_input(model, real, fake, record):
@@ -563,22 +575,26 @@ def sfno_representation_ratio_rows(model, test_real, test_fake, records, corrupt
     encoder = model.encoder
     seed = int(get(cfg, "seed", 0))
 
-    def summarize(reference_samples, candidate_samples, coordinate):
+    def summarize(reference_samples, candidate_samples, coordinate, reference_distances=None):
         if len(reference_samples) < 2:
             return None
-        reference_features = _sfno_features(encoder, reference_samples, device, batch_size)
-        candidate_features = _sfno_features(encoder, candidate_samples, device, batch_size)
-        donor_positions = deranged_sample_positions(len(reference_samples), seed)
-        reference_distance = _mean_sfno_distance(reference_features, reference_features[donor_positions])
-        corruption_distance = _mean_sfno_distance(reference_features, candidate_features)
-        ratio = float("nan") if reference_distance <= np.finfo(np.float64).eps else corruption_distance / reference_distance
-        return {
+        if reference_distances is None:
+            donor_positions = deranged_sample_positions(len(reference_samples), seed)
+            reference_distances = _sfno_reference_distances(
+                encoder, reference_samples, donor_positions, device, batch_size,
+            )
+        candidate_distances = _sfno_layer_pair_distances(
+            encoder, reference_samples, candidate_samples, device, batch_size,
+        )
+        return [{
             **coordinate,
+            "representation_layer": layer,
             "reference_distance": reference_distance,
-            "candidate_distance": corruption_distance,
-            "r_corr": ratio,
+            "candidate_distance": candidate_distances[layer],
+            "r_corr": (float("nan") if reference_distance <= np.finfo(np.float64).eps
+                       else candidate_distances[layer] / reference_distance),
             "n_samples": int(len(reference_samples)),
-        }
+        } for layer, reference_distance in reference_distances.items()]
 
     rows = []
     if corruption:
@@ -586,6 +602,9 @@ def sfno_representation_ratio_rows(model, test_real, test_fake, records, corrupt
         reference_samples = [raw_fields(test_real, SFNO_VARIABLES, int(index)) for index in selected]
         donor_positions = deranged_sample_positions(len(selected), seed) if corruption == "hemisphere_splice" else None
         maximum_severity = target_corruption_max(cfg, corruption)
+        reference_distances = _sfno_reference_distances(
+            encoder, reference_samples, deranged_sample_positions(len(reference_samples), seed), device, batch_size,
+        ) if len(reference_samples) >= 2 else None
         for severity in np.linspace(0.0, maximum_severity, int(get(cfg, "corruption_steps", 7))):
             candidates = []
             for position, index in enumerate(selected):
@@ -599,9 +618,12 @@ def sfno_representation_ratio_rows(model, test_real, test_fake, records, corrupt
                     target_variables=(getattr(model, "sfno_target_variables", None)
                                       if getattr(model, "sfno_use_era5_context", False) else None),
                 ))
-            row = summarize(reference_samples, candidates, {"severity": float(severity), "lead_hour": None})
+            row = summarize(
+                reference_samples, candidates, {"severity": float(severity), "lead_hour": None},
+                reference_distances=reference_distances,
+            )
             if row is not None:
-                rows.append(row)
+                rows.extend(row)
     else:
         lead_hours = np.asarray(test_fake.prediction_timedelta.values).astype("timedelta64[h]").astype(int)
         for lead_index, lead_hour in enumerate(lead_hours):
@@ -614,7 +636,7 @@ def sfno_representation_ratio_rows(model, test_real, test_fake, records, corrupt
             candidates = [_sfno_forecast_input(model, test_real, test_fake, record) for record in selected_records]
             row = summarize(reference_samples, candidates, {"severity": None, "lead_hour": int(lead_hour)})
             if row is not None:
-                rows.append(row)
+                rows.extend(row)
     return rows
 
 
@@ -624,13 +646,24 @@ def plot_sfno_representation_ratio(rows, architecture, kind, label, output_path)
         return None
     figure, axis = plt.subplots(figsize=(6.4, 4.0))
     corruptions = rows[0]["severity"] is not None
-    x = np.asarray([row["severity"] if corruptions else row["lead_hour"] for row in rows], dtype=float)
-    y = np.asarray([row["r_corr"] for row in rows], dtype=float)
-    finite = np.isfinite(y)
-    axis.plot(x[finite], y[finite], marker="o", color="tab:purple")
-    if np.any(~finite):
-        axis.scatter(x[~finite], np.zeros(np.count_nonzero(~finite)), marker="x", color="black", label="undefined (zero ERA5 reference distance)")
-        axis.legend(fontsize=8)
+    layer_order = ["block6_post_residual", "block7_pre_projection", "pooled_embedding"]
+    labels = {
+        "block6_post_residual": "Block 6 post-residual (34×121×240)",
+        "block7_pre_projection": "Block 7 pre-projection (34×31×60)",
+        "pooled_embedding": "Pooled 8-channel embedding",
+    }
+    colors = {layer: color for layer, color in zip(layer_order, plt.cm.tab10.colors)}
+    for layer in layer_order:
+        layer_rows = [row for row in rows if row.get("representation_layer", "pooled_embedding") == layer]
+        if not layer_rows:
+            continue
+        x = np.asarray([row["severity"] if corruptions else row["lead_hour"] for row in layer_rows], dtype=float)
+        y = np.asarray([row["r_corr"] for row in layer_rows], dtype=float)
+        finite = np.isfinite(y)
+        axis.plot(x[finite], y[finite], marker="o", color=colors[layer], label=labels[layer])
+        if np.any(~finite):
+            axis.scatter(x[~finite], np.zeros(np.count_nonzero(~finite)), marker="x", color=colors[layer])
+    axis.legend(fontsize=8)
     axis.set(
         title=f"{architecture}: {label} — SFNO representation ratio",
         xlabel="Corruption strength" if corruptions else "Lead time (hours)",
@@ -647,8 +680,8 @@ def plot_sfno_representation_ratio(rows, architecture, kind, label, output_path)
 def write_sfno_representation_ratios(root, records):
     path = Path(root) / "data" / "sfno_representation_ratios.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["architecture", "kind", "target", "severity", "lead_hour", "reference_distance",
-              "candidate_distance", "r_corr", "n_samples"]
+    fields = ["architecture", "kind", "target", "representation_layer", "severity", "lead_hour",
+              "reference_distance", "candidate_distance", "r_corr", "n_samples"]
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader(); writer.writerows(records)
@@ -1628,8 +1661,9 @@ def train_target_discriminator_baselines(cfg, tracker=None):
         ratio_settings = (sfno_settings(cfg).get("representation_ratio", {}) or {})
         if bool(getattr(model, "expects_raw_fields", False)) and bool(ratio_settings.get("enabled", True)):
             ratios = sfno_representation_ratio_rows(
-                model, test_real, test_fake, test_records, corruption, cfg, device, maximum,
-                int(get(cfg, "batch_size")),
+                model, test_real, test_fake, test_records, corruption, cfg, device,
+                int(ratio_settings.get("evaluation_samples", maximum)),
+                min(int(get(cfg, "batch_size")), int(ratio_settings.get("batch_size", 8))),
             )
             for ratio in ratios:
                 ratio.update({"architecture": architecture, "kind": kind, "target": label})
@@ -1645,6 +1679,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 for ratio in ratios:
                     coordinate = ratio["severity"] if ratio["severity"] is not None else ratio["lead_hour"]
                     run.log({
+                        "sfno/representation_layer": ratio["representation_layer"],
                         "sfno/representation_ratio": ratio["r_corr"],
                         "sfno/representation_candidate_distance": ratio["candidate_distance"],
                         "sfno/representation_reference_distance": ratio["reference_distance"],

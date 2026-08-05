@@ -224,6 +224,39 @@ class SFNOEmbedding(nn.Module):
             xn = corruption_fn(xn)
         return self.model(xn, self.static_channels)
 
+    def extract_representation_maps(self, x, corruption_fn=None):
+        """Return SFNO maps for layerwise representation diagnostics.
+
+        ``block6_post_residual`` is the full-resolution tensor fed into the
+        final encoder block. ``block7_pre_projection`` is its downsampled output
+        before the final 1x1 channel projection.
+        """
+        if x.shape[-3:] != (self.IN_CHANNELS, 121, 240):
+            raise ValueError(
+                f"expected (B, {self.IN_CHANNELS}, 121, 240) raw fields, got {tuple(x.shape)}"
+            )
+        core = getattr(self.model, "sfno_model", None)
+        if core is None:
+            raise RuntimeError("The configured SFNO implementation does not expose its encoder blocks.")
+        xn = (x - self.norm_mean) / self.norm_std
+        if corruption_fn is not None:
+            xn = corruption_fn(xn)
+        encoded = core.encoder(xn)
+        if self.static_channels is not None:
+            encoded = torch.cat([
+                encoded,
+                self.static_channels.expand(encoded.shape[0], -1, -1, -1),
+            ], dim=1)
+        encoded = core.pos_drop(core.pos_embed(encoded))
+        block6_post_residual = core.encoder_block(encoded) + encoded
+        block7_pre_projection = core.last_encoder_block(block6_post_residual)
+        embedding = core.channel_down_scaling(block7_pre_projection)
+        return {
+            "block6_post_residual": block6_post_residual,
+            "block7_pre_projection": block7_pre_projection,
+            "pooled_embedding": self._pool(embedding),
+        }
+
     def extract_features(self, x, corruption_fn=None, enable_input_grad=False):
         """Raw fields → pooled features, optionally retaining gradients to inputs.
 
