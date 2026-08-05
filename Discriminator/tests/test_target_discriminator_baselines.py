@@ -24,6 +24,7 @@ from Discriminator.scripts.train_target_discriminator_baselines import (
     integrated_gradients,
     resolve_attribution_baseline,
     sfno_representation_ratio_rows,
+    build_sfno_probe,
     load_sfno_probe_checkpoint,
     save_sfno_probe_checkpoint,
     training_corruption_severity,
@@ -115,6 +116,21 @@ class MockSFNOEncoder(torch.nn.Module):
             "block7_pre_projection": block7,
             "pooled_embedding": block7[:, :2].flatten(1),
         }
+
+
+class FinetunableMockSFNOEncoder(MockSFNOEncoder):
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.sfno_model = torch.nn.Module()
+        self.model.sfno_model.last_encoder_block = torch.nn.Conv2d(2, 2, 1, bias=False)
+        self.model.sfno_model.channel_down_scaling = torch.nn.Conv2d(2, 2, 1, bias=False)
+
+    def extract_features(self, inputs, enable_input_grad=False):
+        normalized = (inputs - self.norm_mean) / self.norm_std
+        block7 = self.model.sfno_model.last_encoder_block(normalized[:, :2])
+        embedding = self.model.sfno_model.channel_down_scaling(block7)
+        return torch.nn.functional.adaptive_avg_pool2d(embedding, (2, 2)).flatten(1) * self.anchor
 
 
 class TargetDiscriminatorBaselineTest(unittest.TestCase):
@@ -232,6 +248,41 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
         self.assertIsNone(encoder.anchor.grad)
         self.assertIsNotNone(model.head.output.weight.grad)
         self.assertFalse(encoder.training)
+
+    def test_sfno_final_encoder_stage_finetuning_is_checkpointed(self):
+        cfg = target_config()
+        cfg.target_discriminator.sfno.unfreeze_final_encoder_stage = True
+        encoder = FinetunableMockSFNOEncoder()
+        model = build_sfno_probe(encoder, "sfno_linear", cfg)
+        block = encoder.model.sfno_model.last_encoder_block
+        projection = encoder.model.sfno_model.channel_down_scaling
+        self.assertTrue(all(parameter.requires_grad for parameter in block.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in projection.parameters()))
+        self.assertFalse(encoder.anchor.requires_grad)
+        source = four_field_target_dataset()
+        initial_block = block.weight.detach().clone()
+        initial_projection = projection.weight.detach().clone()
+        train_sfno_target(source, source, encoder, cfg, torch.device("cpu"), label="finetune-fixture")
+        self.assertFalse(torch.equal(block.weight, initial_block))
+        self.assertFalse(torch.equal(projection.weight, initial_projection))
+        with torch.no_grad():
+            block.weight.fill_(0.25)
+            projection.weight.fill_(0.5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "finetuned.pth"
+            save_sfno_probe_checkpoint(model, path)
+            loaded, metadata = load_sfno_probe_checkpoint(
+                path, cfg, torch.device("cpu"), encoder=FinetunableMockSFNOEncoder(),
+            )
+        self.assertTrue(metadata["unfreeze_final_encoder_stage"])
+        self.assertTrue(torch.equal(
+            loaded.encoder.model.sfno_model.last_encoder_block.weight,
+            torch.full_like(loaded.encoder.model.sfno_model.last_encoder_block.weight, 0.25),
+        ))
+        self.assertTrue(torch.equal(
+            loaded.encoder.model.sfno_model.channel_down_scaling.weight,
+            torch.full_like(loaded.encoder.model.sfno_model.channel_down_scaling.weight, 0.5),
+        ))
 
     def test_residual_mlp_and_checkpoint_round_trip(self):
         encoder = MockSFNOEncoder()
