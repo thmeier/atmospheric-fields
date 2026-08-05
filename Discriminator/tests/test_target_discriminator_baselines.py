@@ -23,6 +23,7 @@ from Discriminator.scripts.train_target_discriminator_baselines import (
     create_interpretability_gallery,
     integrated_gradients,
     resolve_attribution_baseline,
+    sfno_representation_ratio_rows,
     load_sfno_probe_checkpoint,
     save_sfno_probe_checkpoint,
     training_corruption_severity,
@@ -294,6 +295,23 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
             self.assertTrue(all(row["baseline_kind"] == "sfno_checkpoint_mean" for row in rows))
             self.assertTrue(all("attribution_sum_mean_sea_level_pressure" in row for row in rows))
             self.assertTrue(all(abs(row["completeness_residual"]) < 1e-4 for row in rows))
+
+    def test_sfno_representation_ratio_is_zero_for_identity_and_normalized_by_era5_pairs(self):
+        cfg = target_config()
+        cfg.target_discriminator.corruption_steps = 3
+        cfg.target_discriminator.corruption_severity_max_overrides = {"pixel_replace": 1.0}
+        encoder = MockSFNOEncoder()
+        model = FrozenSFNOProbe(encoder, LinearProbe(encoder.feature_dim), "sfno_linear").eval()
+        data = four_field_target_dataset()
+        rows = sfno_representation_ratio_rows(
+            model, data, data, None, "pixel_replace", cfg, torch.device("cpu"),
+            maximum=0, batch_size=3,
+        )
+        self.assertEqual(len(rows), 3)
+        self.assertGreater(rows[0]["reference_distance"], 0.0)
+        self.assertAlmostEqual(rows[0]["candidate_distance"], 0.0, places=6)
+        self.assertAlmostEqual(rows[0]["r_corr"], 0.0, places=6)
+        self.assertGreater(rows[-1]["r_corr"], 0.0)
 
     def test_integrated_gradients_is_complete_for_linear_logit(self):
         class LinearLogit(torch.nn.Module):
