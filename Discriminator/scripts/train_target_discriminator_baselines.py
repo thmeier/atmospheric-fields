@@ -1491,8 +1491,9 @@ def train_target_discriminator_baselines(cfg, tracker=None):
             gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
                             f"{safe_target_name(label)}_integrated_gradients.png")
             try:
+                input_variables = list(getattr(model, "input_variables", variables))
                 rows = create_interpretability_gallery(
-                    model, cases, dataset, variables, means, stds, interpretability,
+                    model, cases, dataset, input_variables, means, stds, interpretability,
                     device, gallery_path, architecture, kind, label,
                 )
                 interpretability_rows.extend(rows)
