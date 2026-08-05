@@ -203,6 +203,9 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
         self.assertEqual(float(label), 1.0)
         self.assertEqual(float(sample[0, 0, 0]), 280.0)
         self.assertEqual(float(sample[3, 0, 0]), 100000.0)
+        self.assertEqual(dataset.sample_metadata(0)["true_class"], "real")
+        self.assertEqual(dataset.sample_metadata(dataset.n)["true_class"], "fake")
+        self.assertIn("time", dataset.sample_metadata(dataset.n))
 
     def test_sfno_corruption_operates_in_encoder_standardized_space(self):
         encoder = MockSFNOEncoder()

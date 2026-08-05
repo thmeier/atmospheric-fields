@@ -1156,6 +1156,44 @@ class SFNOTargetDataset(Dataset):
                 len(self.fake_i), self.donor_seed, int(epoch)
             )
 
+    @staticmethod
+    def _time(dataset, index):
+        return str(np.asarray(dataset.time.values)[int(index)])
+
+    def sample_metadata(self, index):
+        """Describe a held-out raw SFNO sample for logit-selected galleries."""
+        is_fake, position = index >= self.n, index % self.n
+        metadata = {"dataset_index": int(index), "true_class": "fake" if is_fake else "real"}
+        if not is_fake:
+            if self.paired_records:
+                record = self.paired_records[position % len(self.paired_records)]
+                metadata.update(time=str(record.valid_time), valid_time=str(record.valid_time))
+            else:
+                metadata.update(time=self._time(self.real, int(self.real_i[position % len(self.real_i)])))
+            return metadata
+        if self.corruption:
+            fake_index = int(self.fake_i[position % len(self.fake_i)])
+            # Evaluation corruption severities are sampled on access; do not attach
+            # a misleading reconstructed severity to a selected input.
+            metadata.update(time=self._time(self.fake, fake_index), corruption=str(self.corruption))
+            return metadata
+        if self.paired_records:
+            record = self.paired_records[position % len(self.paired_records)]
+            metadata.update(
+                time=str(record.valid_time), initialization_time=str(record.initialization_time),
+                valid_time=str(record.valid_time), lead_hour=int(record.lead_hour),
+            )
+            return metadata
+        time_position, lead_position = divmod(position, len(self.leads))
+        sample_index = int(self.fake_i[time_position % len(self.fake_i)])
+        lead_index = self.leads[lead_position]
+        lead_hour = 0 if lead_index is None else int(
+            np.asarray(self.fake.prediction_timedelta.values)[lead_index]
+            .astype("timedelta64[h]").astype(int)
+        )
+        metadata.update(time=self._time(self.fake, sample_index), lead_hour=lead_hour)
+        return metadata
+
     def __getitem__(self, index):
         is_fake = index >= self.n
         position = index % self.n
