@@ -104,9 +104,17 @@ class MockSFNOEncoder(torch.nn.Module):
         self.register_buffer("norm_std", torch.tensor([10.0, 5.0, 5.0, 1000.0]).view(1, 4, 1, 1))
 
     def extract_features(self, inputs, enable_input_grad=False):
+        return self.extract_representation_maps(inputs)["pooled_embedding"]
+
+    def extract_representation_maps(self, inputs):
         normalized = (inputs - self.norm_mean) / self.norm_std
-        pooled = torch.nn.functional.adaptive_avg_pool2d(normalized[:, :2], (2, 2))
-        return pooled.flatten(1) * self.anchor
+        block6 = normalized * self.anchor
+        block7 = torch.nn.functional.adaptive_avg_pool2d(block6, (2, 2))
+        return {
+            "block6_post_residual": block6,
+            "block7_pre_projection": block7,
+            "pooled_embedding": block7[:, :2].flatten(1),
+        }
 
 
 class TargetDiscriminatorBaselineTest(unittest.TestCase):
@@ -307,11 +315,18 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
             model, data, data, None, "pixel_replace", cfg, torch.device("cpu"),
             maximum=0, batch_size=3,
         )
-        self.assertEqual(len(rows), 3)
-        self.assertGreater(rows[0]["reference_distance"], 0.0)
-        self.assertAlmostEqual(rows[0]["candidate_distance"], 0.0, places=6)
-        self.assertAlmostEqual(rows[0]["r_corr"], 0.0, places=6)
-        self.assertGreater(rows[-1]["r_corr"], 0.0)
+        self.assertEqual(len(rows), 9)
+        self.assertEqual(
+            {row["representation_layer"] for row in rows},
+            {"block6_post_residual", "block7_pre_projection", "pooled_embedding"},
+        )
+        zero_rows = [row for row in rows if row["severity"] == 0.0]
+        self.assertEqual(len(zero_rows), 3)
+        self.assertTrue(all(row["reference_distance"] > 0.0 for row in zero_rows))
+        self.assertTrue(all(abs(row["candidate_distance"]) < 1e-6 for row in zero_rows))
+        self.assertTrue(all(abs(row["r_corr"]) < 1e-6 for row in zero_rows))
+        strongest_rows = [row for row in rows if row["severity"] == 1.0]
+        self.assertTrue(all(row["r_corr"] > 0.0 for row in strongest_rows))
 
     def test_integrated_gradients_is_complete_for_linear_logit(self):
         class LinearLogit(torch.nn.Module):
