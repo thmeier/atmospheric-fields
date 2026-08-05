@@ -1226,7 +1226,7 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
         lr=float(get(cfg, "learning_rate")),
         weight_decay=float(get(cfg, "weight_decay")),
     )
-    epochs = int(get(cfg, "epochs"))
+    epochs = int(sfno_settings(cfg).get("epochs", get(cfg, "epochs")))
     target_label = label or corruption or "forecast"
     encoder.eval()
     for head in heads.values():

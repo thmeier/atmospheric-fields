@@ -29,6 +29,8 @@ target_discriminator:
     embedding_resolution: [31, 60]
     pooling: grid
     pool_grid: [7, 8]
+    # Probe training may use a longer schedule than the CNN target discriminators.
+    epochs: 5
     mlp_hidden_multiplier: 2.0
     mlp_dropout: 0.1
   device: auto
