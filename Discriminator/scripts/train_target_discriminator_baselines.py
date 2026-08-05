@@ -84,30 +84,62 @@ class ResidualMLPProbe(torch.nn.Module):
         return self.output(F.gelu(features + residual))
 
 
+def sfno_last_encoder_block(encoder):
+    """Return the seventh SFNO block exposed by the supported adapter."""
+    core = getattr(getattr(encoder, "model", None), "sfno_model", None)
+    block = getattr(core, "last_encoder_block", None)
+    if block is None:
+        raise RuntimeError("The configured SFNO encoder does not expose last_encoder_block.")
+    return block
+
+
+def sfno_channel_projection(encoder):
+    """Return the final 34-to-8 encoder channel projection."""
+    core = getattr(getattr(encoder, "model", None), "sfno_model", None)
+    projection = getattr(core, "channel_down_scaling", None)
+    if projection is None:
+        raise RuntimeError("The configured SFNO encoder does not expose channel_down_scaling.")
+    return projection
+
+
+def configure_sfno_trainability(encoder, unfreeze_final_encoder_stage=False):
+    """Freeze the encoder except, optionally, its final block and projection."""
+    encoder.requires_grad_(False)
+    if unfreeze_final_encoder_stage:
+        sfno_last_encoder_block(encoder).requires_grad_(True)
+        sfno_channel_projection(encoder).requires_grad_(True)
+
+
 class FrozenSFNOProbe(torch.nn.Module):
-    """Frozen four-field SFNO encoder with a trainable scalar probe."""
+    """SFNO encoder with a scalar probe and optional final-stage finetuning."""
 
     expects_raw_fields = True
 
-    def __init__(self, encoder, head, architecture):
+    def __init__(self, encoder, head, architecture, unfreeze_final_encoder_stage=False):
         super().__init__()
         self.encoder = encoder
         self.head = head
         self.architecture = str(architecture)
         self.input_variables = tuple(SFNO_VARIABLES)
-        self.encoder.requires_grad_(False)
+        self.unfreeze_final_encoder_stage = bool(unfreeze_final_encoder_stage)
+        configure_sfno_trainability(self.encoder, self.unfreeze_final_encoder_stage)
         self.encoder.eval()
 
     def train(self, mode=True):
         super().train(mode)
         self.encoder.eval()
+        if self.unfreeze_final_encoder_stage:
+            sfno_last_encoder_block(self.encoder).train(mode)
+            sfno_channel_projection(self.encoder).train(mode)
         return self
 
     def forward(self, inputs):
-        # Encoder parameters are frozen, but do not suppress input gradients:
-        # integrated gradients needs to differentiate a logit back to raw fields.
+        # IG needs input gradients; finetuning needs a graph through block seven.
         features = self.encoder.extract_features(
-            inputs, enable_input_grad=bool(torch.is_grad_enabled() and inputs.requires_grad)
+            inputs,
+            enable_input_grad=bool(torch.is_grad_enabled() and (
+                inputs.requires_grad or self.unfreeze_final_encoder_stage
+            )),
         )
         return self.head(features)
 
@@ -147,8 +179,10 @@ def load_sfno_encoder(cfg, device):
     return encoder.eval()
 
 
-def build_sfno_probe(encoder, architecture, cfg):
+def build_sfno_probe(encoder, architecture, cfg, unfreeze_final_encoder_stage=None):
     settings = sfno_settings(cfg)
+    if unfreeze_final_encoder_stage is None:
+        unfreeze_final_encoder_stage = bool(settings.get("unfreeze_final_encoder_stage", False))
     if architecture == "sfno_linear":
         head = LinearProbe(encoder.feature_dim)
     elif architecture == "sfno_mlp":
@@ -159,7 +193,10 @@ def build_sfno_probe(encoder, architecture, cfg):
         )
     else:
         raise ValueError(f"Unknown SFNO probe architecture: {architecture}")
-    return FrozenSFNOProbe(encoder, head.to(next(encoder.parameters()).device), architecture)
+    return FrozenSFNOProbe(
+        encoder, head.to(next(encoder.parameters()).device), architecture,
+        unfreeze_final_encoder_stage=unfreeze_final_encoder_stage,
+    )
 
 
 def target_corruption_max(cfg, corruption):
@@ -890,7 +927,6 @@ def plot_target_discriminator_interpretability(cfg):
             if checkpoint.is_file():
                 tasks.append((architecture, kind, label, paths, corruption, checkpoint, variables, None))
 
-    sfno_encoder = None
     sfno_tasks = []
     for architecture in ("sfno_linear", "sfno_mlp"):
         for kind, label, paths, corruption in target_specs(cfg, SFNO_VARIABLES):
@@ -899,7 +935,7 @@ def plot_target_discriminator_interpretability(cfg):
                 sfno_tasks.append((architecture, kind, label, paths, corruption, checkpoint, SFNO_VARIABLES, None))
     if sfno_tasks:
         try:
-            sfno_encoder = load_sfno_encoder(cfg, device)
+            load_sfno_encoder(cfg, device)
             tasks.extend(sfno_tasks)
         except FileNotFoundError as error:
             print(f"Skipping SFNO target interpretability: {error}")
@@ -928,7 +964,9 @@ def plot_target_discriminator_interpretability(cfg):
             try:
                 test_real, test_fake, test_records = target_test_inputs(real, fake, cfg, corruption)
                 if raw_sfno:
-                    model, _ = load_sfno_probe_checkpoint(checkpoint, cfg, device, encoder=sfno_encoder)
+                    # Reload the base encoder for each checkpoint so a finetuned
+                    # seventh block cannot leak into a subsequently frozen model.
+                    model, _ = load_sfno_probe_checkpoint(checkpoint, cfg, device)
                     model.sfno_use_era5_context, model.sfno_target_variables = sfno_context_settings(cfg)
                     dataset = SFNOTargetDataset(
                         test_real, test_fake, model.encoder, cfg.lead_times, corruption, maximum,
@@ -1428,7 +1466,10 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
             dropout=float(sfno_settings(cfg).get("mlp_dropout", 0.1)),
         ).to(device),
     }
+    unfreeze_final_encoder_stage = bool(sfno_settings(cfg).get("unfreeze_final_encoder_stage", False))
+    configure_sfno_trainability(encoder, unfreeze_final_encoder_stage)
     parameters = [parameter for head in heads.values() for parameter in head.parameters()]
+    parameters.extend(parameter for parameter in encoder.parameters() if parameter.requires_grad)
     optimizer = torch.optim.AdamW(
         parameters,
         lr=float(get(cfg, "learning_rate")),
@@ -1437,6 +1478,9 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
     epochs = int(sfno_settings(cfg).get("epochs", get(cfg, "epochs")))
     target_label = label or corruption or "forecast"
     encoder.eval()
+    if unfreeze_final_encoder_stage:
+        sfno_last_encoder_block(encoder).train()
+        sfno_channel_projection(encoder).train()
     for head in heads.values():
         head.train()
     global_step = 0
@@ -1453,8 +1497,11 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
                 continue
             inputs = inputs.to(device=device, dtype=torch.float32)
             labels = labels.to(device=device, dtype=torch.float32)
-            with torch.no_grad():
-                features = encoder.extract_features(inputs)
+            if unfreeze_final_encoder_stage:
+                features = encoder.extract_features(inputs, enable_input_grad=True)
+            else:
+                with torch.no_grad():
+                    features = encoder.extract_features(inputs)
             optimizer.zero_grad()
             logits_by_head = {name: head(features) for name, head in heads.items()}
             losses = {
@@ -1498,14 +1545,17 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
                 metric_logger(payload)
     probes = {}
     for name, head in heads.items():
-        probe = FrozenSFNOProbe(encoder, head.eval(), name).eval()
+        probe = FrozenSFNOProbe(
+            encoder, head.eval(), name,
+            unfreeze_final_encoder_stage=unfreeze_final_encoder_stage,
+        ).eval()
         probe.target_train_metrics = final_metrics.get(name, {})
         probe.sfno_use_era5_context, probe.sfno_target_variables = sfno_context_settings(cfg)
         probes[name] = probe
     return probes
 
 
-def sfno_checkpoint_metadata(encoder, architecture):
+def sfno_checkpoint_metadata(encoder, architecture, unfreeze_final_encoder_stage=False):
     return {
         "architecture": str(architecture),
         "input_variables": list(SFNO_VARIABLES),
@@ -1514,20 +1564,24 @@ def sfno_checkpoint_metadata(encoder, architecture):
         "pooling": str(encoder.pooling),
         "pool_grid": list(encoder.pool_grid),
         "feature_dim": int(encoder.feature_dim),
-        "encoder_frozen": True,
+        "encoder_frozen": not bool(unfreeze_final_encoder_stage),
+        "unfreeze_final_encoder_stage": bool(unfreeze_final_encoder_stage),
         "encoder_pretraining": "ERA5 1975-2019; overlaps the temporal test partition",
     }
 
 
 def save_sfno_probe_checkpoint(model, path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "head_state_dict": model.head.state_dict(),
-            "metadata": sfno_checkpoint_metadata(model.encoder, model.architecture),
-        },
-        path,
-    )
+    payload = {
+        "head_state_dict": model.head.state_dict(),
+        "metadata": sfno_checkpoint_metadata(
+            model.encoder, model.architecture, model.unfreeze_final_encoder_stage,
+        ),
+    }
+    if model.unfreeze_final_encoder_stage:
+        payload["last_encoder_block_state_dict"] = sfno_last_encoder_block(model.encoder).state_dict()
+        payload["channel_down_scaling_state_dict"] = sfno_channel_projection(model.encoder).state_dict()
+    torch.save(payload, path)
 
 
 def load_sfno_probe_checkpoint(path, cfg, device, encoder=None):
@@ -1546,7 +1600,17 @@ def load_sfno_probe_checkpoint(path, cfg, device, encoder=None):
                 f"SFNO probe checkpoint {path} has {key}={metadata.get(key)!r}; "
                 f"configured encoder expects {expected[key]!r}."
             )
-    model = build_sfno_probe(encoder, architecture, cfg).to(device)
+    unfreeze_final_encoder_stage = bool(metadata.get("unfreeze_final_encoder_stage", False))
+    model = build_sfno_probe(
+        encoder, architecture, cfg, unfreeze_final_encoder_stage=unfreeze_final_encoder_stage,
+    ).to(device)
+    if unfreeze_final_encoder_stage:
+        block_state = payload.get("last_encoder_block_state_dict")
+        projection_state = payload.get("channel_down_scaling_state_dict")
+        if block_state is None or projection_state is None:
+            raise ValueError(f"Finetuned SFNO checkpoint {path} is missing final encoder-stage weights.")
+        sfno_last_encoder_block(model.encoder).load_state_dict(block_state)
+        sfno_channel_projection(model.encoder).load_state_dict(projection_state)
     model.head.load_state_dict(payload["head_state_dict"])
     return model.eval(), metadata
 
@@ -1839,12 +1903,14 @@ def train_target_discriminator_baselines(cfg, tracker=None):
             real.close()
             return outputs
         targets = target_specs(cfg, SFNO_VARIABLES)
+        finetune_final_encoder_stage = bool(sfno_settings(cfg).get("unfreeze_final_encoder_stage", False))
         for kind,label,paths,corruption in tqdm(targets, desc="Training SFNO probe targets"):
+            target_encoder = load_sfno_encoder(cfg, device) if finetune_final_encoder_stage else encoder
             with tracked_context("sfno", kind, label) as run:
                 fake = corruption_train if corruption else open_model_forecasts(paths)
                 records = None if corruption else forecast_pairs(fake, real, cfg, "train", cfg.lead_times)
                 probes = train_sfno_target(
-                    real if not corruption else corruption_train, fake, encoder, cfg, device, corruption=corruption, label=label,
+                    real if not corruption else corruption_train, fake, target_encoder, cfg, device, corruption=corruption, label=label,
                     metric_logger=None if run is None else run.log, log_every_n_steps=log_every,
                     paired_records=records,
                 )

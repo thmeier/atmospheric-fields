@@ -29,8 +29,10 @@ target_discriminator:
     embedding_resolution: [31, 60]
     pooling: grid
     pool_grid: [7, 8]
-    # Probe training may use a longer schedule than the CNN target discriminators.
-    epochs: 5
+    # Probe training follows the same three-epoch schedule as the CNN targets.
+    epochs: 3
+    # Opt-in finetuning: seventh SFNO block plus its final 34-to-8 projection.
+    unfreeze_final_encoder_stage: false
     representation_ratio:
       enabled: true
       # Match the standard-corruption evaluation budget rather than materializing all ERA5 maps.
