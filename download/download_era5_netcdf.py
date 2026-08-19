@@ -132,6 +132,7 @@ def download_era5_netcdf(
     time_end: str,
     levels: list[float] | None,
     lead_hours: list[int] | None,
+    output_format: str = "netcdf",
 ):
     print(f"Opening {source}...")
     ds = _open_zarr(source)
@@ -149,14 +150,42 @@ def download_era5_netcdf(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ds = _sanitize_dataset_attrs(ds)
     print(f"Saving to {output_path}")
-    ds.to_netcdf(output_path, format="NETCDF4")
+    if output_format == "zarr":
+        # Keep the WeatherBench2 store layout so downstream code that expects the
+        # upstream zarr (e.g. U-Cast's data module) can read it with only a path change.
+        #
+        # Two pieces of inherited encoding have to be dealt with first:
+        #  1. zarr_format=2 is required, not cosmetic. The upstream store is v2 and its
+        #     variables carry numcodecs Blosc compressors in .encoding. zarr-python 3.x
+        #     defaults to writing v3, which rejects a v2 codec with
+        #     "Expected a BytesBytesCodec. Got <class 'numcodecs.blosc.Blosc'>".
+        #  2. encoding['chunks'] is inherited as (8, ...) along time. A month-long slice
+        #     rarely starts on one of those 8-step boundaries, so the dask chunks straddle
+        #     zarr chunks and to_zarr refuses ("would overlap multiple Dask chunks").
+        #     Rechunk time uniformly and drop the stale chunk encoding so the written
+        #     chunks are derived from the dask layout instead.
+        if "time" in ds.dims:
+            ds = ds.chunk({"time": 8})
+        for name in ds.variables:
+            ds[name].encoding.pop("chunks", None)
+            ds[name].encoding.pop("preferred_chunks", None)
+        ds.to_zarr(output_path, mode="w", consolidated=True, zarr_format=2)
+    else:
+        ds.to_netcdf(output_path, format="NETCDF4")
     print("Done!")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="WeatherBench2 Zarr path or URL")
-    parser.add_argument("output", type=Path, help="Output .nc/.netcdf file")
+    parser.add_argument("output", type=Path, help="Output .nc/.netcdf file or .zarr store")
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("netcdf", "zarr"),
+        default="netcdf",
+        help="Output format. Default: netcdf.",
+    )
     parser.add_argument("-v", "--variables", nargs="+")
     parser.add_argument("-s", "--time-start", required=True)
     parser.add_argument("-e", "--time-end", required=True)
@@ -186,6 +215,7 @@ def main():
         time_end=args.time_end,
         levels=args.level,
         lead_hours=args.lead_hours,
+        output_format=args.output_format,
     )
 
 

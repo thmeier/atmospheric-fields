@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=pmlr_jobs
 #SBATCH --job-name=download_wb2
-#SBATCH --partition=normal
+#SBATCH --partition=jobs
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --mem=32G
@@ -26,6 +26,7 @@
 #   LEVEL=850
 #   LEAD_HOURS="6 12 24 48 96 192" | all
 #   OUTPUT_DIR=/cluster/courses/pmlr/teams/team07/data
+#   OUTPUT_FORMAT=netcdf|zarr
 #   SKIP_EXISTING=1|0
 #   CONDA_ENV_NAME=pmlr
 #   PYTHON=python
@@ -34,6 +35,11 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# See note in download_gen_data.sh: under sbatch the script runs from a spool dir,
+# so resolve back to the repo checkout when the sibling worker is not alongside.
+if [[ ! -f "${SCRIPT_DIR}/download_era5_netcdf.py" ]]; then
+  SCRIPT_DIR="${DOWNLOAD_DIR:-${HOME}/atmospheric-fields/download}"
+fi
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 SOURCE_PATH="${1:-${SOURCE_PATH:-era5/1959-2023_01_10-6h-240x121_equiangular_with_poles_conservative.zarr}}"
@@ -45,6 +51,7 @@ VARIABLES="${VARIABLES:-2m_temperature 10m_u_component_of_wind 10m_v_component_o
 LEVEL="${LEVEL:-}"
 LEAD_HOURS="${LEAD_HOURS:-6 12 24 48 96 192}"
 OUTPUT_DIR="${OUTPUT_DIR:-/cluster/courses/pmlr/teams/team07/data}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-netcdf}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-pmlr}"
@@ -131,9 +138,14 @@ download_month() {
     return
   fi
 
-  output_file="${OUTPUT_DIR}/${TAG}_6steps_1.5deg_${month}.nc"
-  if [[ "${SKIP_EXISTING}" == "1" && -f "${output_file}" ]]; then
-    echo "Skipping ${month}; NetCDF already exists: ${output_file}"
+  if [[ "${OUTPUT_FORMAT}" == "zarr" ]]; then
+    output_file="${OUTPUT_DIR}/${TAG}_6steps_1.5deg_${month}.zarr"
+  else
+    output_file="${OUTPUT_DIR}/${TAG}_6steps_1.5deg_${month}.nc"
+  fi
+  # -e not -f: a zarr store is a directory, not a regular file.
+  if [[ "${SKIP_EXISTING}" == "1" && -e "${output_file}" ]]; then
+    echo "Skipping ${month}; output already exists: ${output_file}"
     return
   fi
 
@@ -148,6 +160,7 @@ download_month() {
     --time-end "${end}" \
     --variables ${VARIABLES} \
     --lead-hours "${LEAD_HOURS}" \
+    --format "${OUTPUT_FORMAT}" \
     "${level_args[@]}"
 }
 
