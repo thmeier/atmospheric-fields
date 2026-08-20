@@ -21,12 +21,15 @@ from Discriminator.scripts.train_target_discriminator_baselines import (
     apply_sfno_corruption,
     binary_classification_metrics,
     create_interpretability_gallery,
+    create_sfno_representation_magnitude_gallery,
     integrated_gradients,
     resolve_attribution_baseline,
     sfno_representation_ratio_rows,
     build_sfno_probe,
     load_sfno_probe_checkpoint,
     save_sfno_probe_checkpoint,
+    sample_target_corruption_severity,
+    target_fake_severity_levels,
     training_corruption_severity,
     target_corruption_min,
     train_sfno_target,
@@ -57,6 +60,7 @@ def target_config():
                 "pool_grid": [2, 2],
                 "mlp_hidden_multiplier": 2.0,
                 "mlp_dropout": 0.1,
+                "finetune_probe_architecture": None,
             },
         },
     })
@@ -142,6 +146,45 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
             )
         np.random.seed(7)
         self.assertLess(training_corruption_severity("grf", 0.2, 2.0), 0.2)
+
+    def test_default_corruption_sampler_is_uniform_over_nonzero_test_levels(self):
+        cfg = target_config()
+        cfg.target_discriminator.corruption_steps = 4
+        expected = target_fake_severity_levels(cfg, "grf", 0.2)
+        self.assertTrue(np.array_equal(expected, [0.2 / 3.0, 2.0 * 0.2 / 3.0, 0.2]))
+        np.random.seed(13)
+        draws = np.asarray([
+            sample_target_corruption_severity(cfg, "grf", 0.2, power=2.0)
+            for _ in range(300)
+        ])
+        self.assertTrue(np.all(np.isin(draws, expected)))
+        counts = np.asarray([(draws == level).sum() for level in expected])
+        self.assertTrue(np.all(counts > 60))
+        self.assertTrue(np.all(counts < 140))
+
+    def test_discrete_test_severities_match_between_cnn_and_sfno(self):
+        cfg = target_config()
+        cfg.target_discriminator.corruption_steps = 5
+        source = four_field_target_dataset()
+        cnn = BalancedTargetDataset(
+            source, source, ["2m_temperature"], {"2m_temperature": 0.0},
+            {"2m_temperature": 1.0}, [6], corruption="pixel_replace", cfg=cfg,
+            severity_max=0.05, deterministic_seed=17,
+        )
+        sfno = SFNOTargetDataset(
+            source, source, MockSFNOEncoder(), [6], corruption="pixel_replace", cfg=cfg,
+            severity_max=0.05, deterministic_seed=17,
+        )
+        for position in range(min(len(cnn.fake_i), 4)):
+            self.assertEqual(cnn._severity(position), sfno._severity(position))
+        levels = target_fake_severity_levels(cfg, "pixel_replace", 0.05)
+        self.assertTrue(np.isin(cnn._severity(0), levels))
+
+    def test_power_law_mode_remains_available(self):
+        cfg = target_config()
+        cfg.target_discriminator.corruption_severity_sampling = "power_law"
+        value = sample_target_corruption_severity(cfg, "gaussian_blur", 1.0, 2.0, seed=3)
+        self.assertGreaterEqual(value, 0.0)
 
     def test_gaussian_blur_training_floor_avoids_identity_samples(self):
         np.random.seed(7)
@@ -252,6 +295,7 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
     def test_sfno_final_encoder_stage_finetuning_is_checkpointed(self):
         cfg = target_config()
         cfg.target_discriminator.sfno.unfreeze_final_encoder_stage = True
+        cfg.target_discriminator.sfno.finetune_probe_architecture = "linear"
         encoder = FinetunableMockSFNOEncoder()
         model = build_sfno_probe(encoder, "sfno_linear", cfg)
         block = encoder.model.sfno_model.last_encoder_block
@@ -262,7 +306,8 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
         source = four_field_target_dataset()
         initial_block = block.weight.detach().clone()
         initial_projection = projection.weight.detach().clone()
-        train_sfno_target(source, source, encoder, cfg, torch.device("cpu"), label="finetune-fixture")
+        models = train_sfno_target(source, source, encoder, cfg, torch.device("cpu"), label="finetune-fixture")
+        self.assertEqual(set(models), {"sfno_linear"})
         self.assertFalse(torch.equal(block.weight, initial_block))
         self.assertFalse(torch.equal(projection.weight, initial_projection))
         with torch.no_grad():
@@ -283,6 +328,25 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
             loaded.encoder.model.sfno_model.channel_down_scaling.weight,
             torch.full_like(loaded.encoder.model.sfno_model.channel_down_scaling.weight, 0.5),
         ))
+
+    def test_sfno_finetuning_requires_one_explicit_probe(self):
+        cfg = target_config()
+        cfg.target_discriminator.sfno.unfreeze_final_encoder_stage = True
+        source = four_field_target_dataset()
+        with self.assertRaisesRegex(ValueError, "finetune_probe_architecture"):
+            train_sfno_target(
+                source, source, FinetunableMockSFNOEncoder(), cfg, torch.device("cpu"), label="fixture",
+            )
+
+    def test_sfno_mlp_finetuning_trains_only_mlp(self):
+        cfg = target_config()
+        cfg.target_discriminator.sfno.unfreeze_final_encoder_stage = True
+        cfg.target_discriminator.sfno.finetune_probe_architecture = "mlp"
+        source = four_field_target_dataset()
+        models = train_sfno_target(
+            source, source, FinetunableMockSFNOEncoder(), cfg, torch.device("cpu"), label="fixture",
+        )
+        self.assertEqual(set(models), {"sfno_mlp"})
 
     def test_residual_mlp_and_checkpoint_round_trip(self):
         encoder = MockSFNOEncoder()
@@ -357,6 +421,13 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
             self.assertTrue(all(row["baseline_kind"] == "sfno_checkpoint_mean" for row in rows))
             self.assertTrue(all("attribution_sum_mean_sea_level_pressure" in row for row in rows))
             self.assertTrue(all(abs(row["completeness_residual"]) < 1e-4 for row in rows))
+
+            representation_output = Path(directory) / "sfno_representation_magnitudes.png"
+            create_sfno_representation_magnitude_gallery(
+                model, cases, Coordinates(), representation_output,
+                "sfno_linear", "forecast", "fixture",
+            )
+            self.assertTrue(representation_output.is_file())
 
     def test_sfno_representation_ratio_is_zero_for_identity_and_normalized_by_era5_pairs(self):
         cfg = target_config()

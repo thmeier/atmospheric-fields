@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
+    from .plot_bundles import plot_bundle_paths, save_figure_bundle
     from .train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from .plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -30,6 +31,7 @@ try:
         select_era5_split,
     )
 except ImportError:
+    from plot_bundles import plot_bundle_paths, save_figure_bundle
     from train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -152,6 +154,24 @@ def sfno_settings(cfg):
     return discriminator.get("sfno", {}) or {}
 
 
+def sfno_finetune_probe_architecture(cfg):
+    """Return the one probe architecture allowed to update unfrozen SFNO weights."""
+    selected = sfno_settings(cfg).get("finetune_probe_architecture")
+    aliases = {"linear": "sfno_linear", "mlp": "sfno_mlp"}
+    if selected is None or str(selected).strip() == "":
+        raise ValueError(
+            "SFNO final-stage finetuning requires "
+            "target_discriminator.sfno.finetune_probe_architecture=linear or mlp."
+        )
+    try:
+        return aliases[str(selected).strip().lower()]
+    except KeyError as error:
+        raise ValueError(
+            "Unknown SFNO finetune probe architecture "
+            f"{selected!r}; expected 'linear' or 'mlp'."
+        ) from error
+
+
 def sfno_context_settings(cfg):
     settings = sfno_settings(cfg)
     targets = tuple(settings.get("target_variables", ["2m_temperature"]))
@@ -179,22 +199,24 @@ def load_sfno_encoder(cfg, device):
     return encoder.eval()
 
 
-def build_sfno_probe(encoder, architecture, cfg, unfreeze_final_encoder_stage=None):
+def build_sfno_head(encoder, architecture, cfg):
     settings = sfno_settings(cfg)
-    if unfreeze_final_encoder_stage is None:
-        unfreeze_final_encoder_stage = bool(settings.get("unfreeze_final_encoder_stage", False))
     if architecture == "sfno_linear":
-        head = LinearProbe(encoder.feature_dim)
+        return LinearProbe(encoder.feature_dim)
     elif architecture == "sfno_mlp":
-        head = ResidualMLPProbe(
+        return ResidualMLPProbe(
             encoder.feature_dim,
             hidden_multiplier=float(settings.get("mlp_hidden_multiplier", 2.0)),
             dropout=float(settings.get("mlp_dropout", 0.1)),
         )
-    else:
-        raise ValueError(f"Unknown SFNO probe architecture: {architecture}")
+    raise ValueError(f"Unknown SFNO probe architecture: {architecture}")
+
+
+def build_sfno_probe(encoder, architecture, cfg, unfreeze_final_encoder_stage=None):
+    if unfreeze_final_encoder_stage is None:
+        unfreeze_final_encoder_stage = bool(sfno_settings(cfg).get("unfreeze_final_encoder_stage", False))
     return FrozenSFNOProbe(
-        encoder, head.to(next(encoder.parameters()).device), architecture,
+        encoder, build_sfno_head(encoder, architecture, cfg).to(next(encoder.parameters()).device), architecture,
         unfreeze_final_encoder_stage=unfreeze_final_encoder_stage,
     )
 
@@ -212,6 +234,44 @@ def target_corruption_min(cfg, corruption):
     minimum = section.get('corruption_severity_min', 0.0)
     overrides = section.get('corruption_severity_min_overrides', {}) or {}
     return float(overrides.get(str(corruption), minimum))
+
+
+def target_corruption_sampling_mode(cfg):
+    mode = str(get(cfg, "corruption_severity_sampling", "discrete_uniform"))
+    if mode not in {"discrete_uniform", "power_law"}:
+        raise ValueError(
+            "target_discriminator.corruption_severity_sampling must be "
+            "'discrete_uniform' or 'power_law'."
+        )
+    return mode
+
+
+def target_fake_severity_levels(cfg, corruption, severity_max=None):
+    """Fake-class strengths aligned with the target corruption plot grid."""
+    maximum = target_corruption_max(cfg, corruption) if severity_max is None else float(severity_max)
+    if corruption == "hemisphere_splice":
+        return np.asarray([maximum], dtype=np.float64)
+    steps = int(get(cfg, "corruption_steps", 7))
+    if steps < 2:
+        raise ValueError("target_discriminator.corruption_steps must be at least 2.")
+    # Zero is the identity transform and belongs only to the real class.
+    return np.linspace(0.0, maximum, steps, dtype=np.float64)[1:]
+
+
+def sample_target_corruption_severity(cfg, corruption, severity_max, power, *, seed=None):
+    """Draw one train/test fake severity under the configured target protocol."""
+    if corruption == "hemisphere_splice":
+        return float(severity_max)
+    mode = target_corruption_sampling_mode(cfg)
+    if mode == "power_law":
+        minimum = target_corruption_min(cfg, corruption)
+        if seed is None:
+            return training_corruption_severity(corruption, severity_max, power, minimum)
+        return deterministic_corruption_severity(corruption, severity_max, power, minimum, seed)
+    levels = target_fake_severity_levels(cfg, corruption, severity_max)
+    if seed is None:
+        return float(levels[np.random.randint(len(levels))])
+    return float(levels[np.random.default_rng(int(seed)).integers(len(levels))])
 
 
 def training_corruption_severity(corruption, severity_max, power, severity_min=0.0):
@@ -494,7 +554,10 @@ def _plot_logit_histogram(reference, candidate, title, candidate_label, output_p
     axis.set(title=title, xlabel="Real-vs-fake logit", ylabel="Density")
     axis.grid(alpha=0.25); axis.legend(); figure.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=200); plt.close(figure)
+    save_figure_bundle(
+        figure, output_path, plot_type="target_logit_histogram",
+        payload={"reference_logits": reference, "candidate_logits": candidate, "bin_edges": edges}, dpi=200,
+    ); plt.close(figure)
 
 
 def _plot_logit_histogram_overlay(groups, title, output_path):
@@ -509,7 +572,12 @@ def _plot_logit_histogram_overlay(groups, title, output_path):
     axis.set(title=title, xlabel="Real-vs-fake logit", ylabel="Density")
     axis.grid(alpha=0.25); axis.legend(fontsize=8, ncol=2); figure.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=200); plt.close(figure)
+    payload = {"bin_edges": edges, "pooled_reference_logits": pooled_reference}
+    for index, group in enumerate(groups):
+        payload[f"reference_logits_{index}"] = group["reference"]
+        payload[f"candidate_logits_{index}"] = group["candidate"]
+        payload[f"label_{index}"] = np.asarray(group["label"])
+    save_figure_bundle(figure, output_path, plot_type="target_logit_histogram_overlay", payload=payload, dpi=200); plt.close(figure)
 
 
 def plot_target_test_logit_histograms(model, architecture, kind, label, test_real, test_fake, records,
@@ -709,7 +777,7 @@ def plot_sfno_representation_ratio(rows, architecture, kind, label, output_path)
     axis.grid(alpha=0.25)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.tight_layout()
-    figure.savefig(output_path, dpi=200)
+    save_figure_bundle(figure, output_path, plot_type="sfno_representation_ratio", dpi=200)
     plt.close(figure)
     return output_path
 
@@ -806,7 +874,7 @@ def create_interpretability_gallery(
         ])
         relevance_limit = max(float(np.nanpercentile(np.abs(relevance_values), 99.0)), np.finfo(np.float32).eps)
         figure, axes = plt.subplots(
-            len(rows) * 2, 5, figsize=(22, max(4.5 * len(rows), 8.0)),
+            len(rows) * 2, 5, figsize=(24, max(5.0 * len(rows), 9.0)),
             subplot_kw={"projection": projection}, squeeze=False,
         )
         field_artists, relevance_artist = [None] * len(variables), None
@@ -823,8 +891,10 @@ def create_interpretability_gallery(
                     dataset.longitudes, dataset.latitudes, attribution[channel], shading="auto", cmap="RdBu_r",
                     vmin=-relevance_limit, vmax=relevance_limit, transform=projection,
                 )
-                top[channel].set_title(variable if channel else top[channel].get_title() + f" | {variable}", fontsize=8, loc="left")
-                bottom[channel].set_title(f"IG: {variable}", fontsize=8)
+                # Keep the case title on the first panel's left side; using a
+                # centered field label avoids overwriting it.
+                top[channel].set_title(variable, fontsize=8, loc="center")
+                bottom[channel].set_title(f"IG: {variable}", fontsize=8, loc="center")
             aggregate = attribution.sum(axis=0)
             relevance_artist = bottom[4].pcolormesh(
                 dataset.longitudes, dataset.latitudes, aggregate, shading="auto", cmap="RdBu_r",
@@ -843,9 +913,105 @@ def create_interpretability_gallery(
             figure.colorbar(field_artists[channel], cax=figure.add_axes([0.03 + channel * 0.23, 0.045, 0.17, 0.012]), orientation="horizontal", label=variable)
         figure.colorbar(relevance_artist, cax=figure.add_axes([0.83, 0.045, 0.14, 0.012]), orientation="horizontal", label="IG relevance")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    save_figure_bundle(
+        figure, output_path, plot_type="target_integrated_gradients",
+        payload={
+            "latitudes": np.asarray(dataset.latitudes), "longitudes": np.asarray(dataset.longitudes),
+            "physical_inputs": np.stack([row[1] for row in rows]),
+            "integrated_gradients": np.stack([row[2] for row in rows]),
+            "logits": np.asarray([row[0]["logit"] for row in rows]),
+            "true_classes": np.asarray([row[0]["true_class"] for row in rows]),
+            "selections": np.asarray([row[0]["selection"] for row in rows]),
+        }, dpi=180, bbox_inches="tight",
+    )
     plt.close(figure)
     return metadata_rows
+
+
+def create_sfno_representation_magnitude_gallery(model, cases, dataset, output_path,
+                                                 architecture, kind, target):
+    """Render held-out SFNO block-six/seven per-position channel magnitudes."""
+    if not bool(getattr(model, "expects_raw_fields", False)):
+        raise ValueError("SFNO representation maps require an SFNO probe.")
+    layers = ("block6_post_residual", "block7_pre_projection")
+    layer_titles = {
+        "block6_post_residual": "Block 6 post-residual | channel L2 magnitude",
+        "block7_pre_projection": "Block 7 pre-projection | channel L2 magnitude",
+    }
+    maps_by_case = []
+    model.eval()
+    with torch.no_grad():
+        for case in cases:
+            inputs = case["input"].unsqueeze(0).to(
+                device=next(model.parameters()).device, dtype=torch.float32,
+            )
+            representations = model.encoder.extract_representation_maps(inputs)
+            maps_by_case.append({
+                layer: torch.linalg.vector_norm(representations[layer][0], dim=0).cpu().numpy()
+                for layer in layers
+            })
+    if not maps_by_case:
+        raise ValueError("No held-out cases were selected for SFNO representation maps.")
+
+    limits = {
+        layer: max(
+            float(np.nanpercentile(np.concatenate([maps[layer].ravel() for maps in maps_by_case]), 99.0)),
+            np.finfo(np.float32).eps,
+        )
+        for layer in layers
+    }
+    projection = ccrs.PlateCarree()
+    figure, axes = plt.subplots(
+        len(cases), len(layers), figsize=(12, max(3.3 * len(cases), 5.0)),
+        subplot_kw={"projection": projection}, squeeze=False,
+    )
+    artists = {}
+    latitude = np.asarray(dataset.latitudes)
+    longitude = np.asarray(dataset.longitudes)
+    for row_index, (case, magnitude_maps) in enumerate(zip(cases, maps_by_case)):
+        for column, layer in enumerate(layers):
+            magnitude = magnitude_maps[layer]
+            # The seventh block is lower resolution; retain the shared global extent.
+            map_latitude = np.linspace(float(latitude.min()), float(latitude.max()), magnitude.shape[0])
+            map_longitude = np.linspace(float(longitude.min()), float(longitude.max()), magnitude.shape[1], endpoint=False)
+            axis = axes[row_index, column]
+            artists[layer] = axis.pcolormesh(
+                map_longitude, map_latitude, magnitude, shading="auto", cmap="magma",
+                vmin=0.0, vmax=limits[layer], transform=projection,
+            )
+            if column == 0:
+                details = [case.get("time"),
+                           f"+{case['lead_hour']}h" if case.get("lead_hour") is not None else None,
+                           f"severity={case['severity']:.4g}" if case.get("severity") is not None else None]
+                axis.set_title(
+                    f"{case['true_class']} {case['selection']} | "
+                    f"logit={case['logit']:.3f} | {', '.join(str(value) for value in details if value)}\n"
+                    f"{layer_titles[layer]}", fontsize=8, loc="left",
+                )
+            else:
+                axis.set_title(layer_titles[layer], fontsize=8)
+            axis.coastlines(linewidth=0.4)
+            axis.set_global()
+    figure.suptitle(f"{architecture}: {kind}/{target} — held-out SFNO representation magnitudes", fontsize=12)
+    figure.subplots_adjust(top=0.94, bottom=0.12, left=0.035, right=0.965, hspace=0.28, wspace=0.12)
+    figure.colorbar(artists[layers[0]], cax=figure.add_axes([0.10, 0.045, 0.32, 0.014]),
+                    orientation="horizontal", label="Block 6 channel L2 magnitude")
+    figure.colorbar(artists[layers[1]], cax=figure.add_axes([0.58, 0.045, 0.32, 0.014]),
+                    orientation="horizontal", label="Block 7 channel L2 magnitude")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_figure_bundle(
+        figure, output_path, plot_type="sfno_representation_magnitudes",
+        payload={
+            "latitudes": latitude, "longitudes": longitude,
+            "block6_magnitudes": np.stack([maps[layers[0]] for maps in maps_by_case]),
+            "block7_magnitudes": np.stack([maps[layers[1]] for maps in maps_by_case]),
+            "logits": np.asarray([case["logit"] for case in cases]),
+            "true_classes": np.asarray([case["true_class"] for case in cases]),
+            "selections": np.asarray([case["selection"] for case in cases]),
+        }, dpi=180, bbox_inches="tight",
+    )
+    plt.close(figure)
+    return output_path
 
 
 def _title_interpretability_case(axis, case, diagnostics):
@@ -855,9 +1021,9 @@ def _title_interpretability_case(axis, case, diagnostics):
                "severity={:.4g}".format(case.get("severity")) if case.get("severity") is not None else None]
     details = ", ".join(str(value) for value in details if value)
     axis.set_title(
-        "{} {} | {} | logit={:.3f}, predicted={}, IG residual={:.2e}".format(
-            case["true_class"], case["selection"], details, case["logit"], predicted,
-            diagnostics["completeness_residual"],
+        "{} {} | logit={:.3f} → classified {}\n{} | IG residual={:.2e}".format(
+            case["true_class"].upper(), case["selection"], case["logit"], predicted.upper(),
+            details or "no temporal/corruption context", diagnostics["completeness_residual"],
         ), fontsize=8, loc="left",
     )
 
@@ -915,7 +1081,7 @@ def plot_target_discriminator_interpretability(cfg):
         return [], None
     variables = list(get(cfg, "variables"))
     root = Path(str(get(cfg, "output_dir")))
-    checkpoint_root = root / "models" / "target_discriminators"
+    checkpoint_root = Path(str(get(cfg, "checkpoint_dir") or (root / "models" / "target_discriminators")))
     seed = int(settings.get("seed", get(cfg, "seed", 0)))
     device = target_device(cfg)
     tasks = []
@@ -972,7 +1138,7 @@ def plot_target_discriminator_interpretability(cfg):
                         test_real, test_fake, model.encoder, cfg.lead_times, corruption, maximum,
                         float(get(cfg, "corruption_power")),
                         target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
-                        cfg, test_records,
+                        cfg, test_records, deterministic_seed=seed,
                     )
                     gallery_means, gallery_stds = {}, {}
                 else:
@@ -1004,6 +1170,15 @@ def plot_target_discriminator_interpretability(cfg):
                 )
                 galleries.append(gallery_path); rows.extend(gallery_rows)
                 print(f"Saved target interpretability gallery to: {gallery_path}")
+                if raw_sfno and bool(settings.get("sfno_representation_maps", True)):
+                    representation_path = gallery_path.with_name(
+                        gallery_path.name.replace("_integrated_gradients.png", "_representation_magnitudes.png")
+                    )
+                    create_sfno_representation_magnitude_gallery(
+                        model, cases, dataset, representation_path, architecture, kind, label,
+                    )
+                    galleries.append(representation_path)
+                    print(f"Saved SFNO representation magnitude gallery to: {representation_path}")
             finally:
                 if not corruption:
                     fake.close()
@@ -1066,14 +1241,9 @@ class BalancedTargetDataset(Dataset):
         return corruption_sample_seed(self.deterministic_seed, str(self.corruption), int(position))
 
     def _severity(self, position):
-        minimum = target_corruption_min(self.cfg, self.corruption)
         seed = self._sample_seed(position)
-        if seed is None:
-            return training_corruption_severity(
-                self.corruption, self.severity_max, self.power, minimum
-            )
-        return deterministic_corruption_severity(
-            self.corruption, self.severity_max, self.power, minimum, seed
+        return sample_target_corruption_severity(
+            self.cfg, self.corruption, self.severity_max, self.power, seed=seed,
         )
 
     @staticmethod
@@ -1156,7 +1326,8 @@ class SFNOTargetDataset(Dataset):
     """Balanced raw four-field samples for a frozen SFNO encoder."""
 
     def __init__(self, real, fake, encoder, leads, corruption=None, max_samples=0,
-                 power=2.0, severity_max=0.2, cfg=None, paired_records=None):
+                 power=2.0, severity_max=0.2, cfg=None, paired_records=None,
+                 deterministic_seed=None):
         self.real = real
         self.fake = fake
         self.encoder = encoder
@@ -1174,6 +1345,7 @@ class SFNOTargetDataset(Dataset):
         self.power = float(power)
         self.severity_max = float(severity_max)
         self.cfg = cfg
+        self.deterministic_seed = None if deterministic_seed is None else int(deterministic_seed)
         self.use_era5_context, self.target_variables = sfno_context_settings(cfg)
         self.paired_records = evenly_spaced_pairs(paired_records or [], max_samples)
         self.latitudes = np.asarray(fake.latitude.values, dtype=np.float64)
@@ -1198,6 +1370,17 @@ class SFNOTargetDataset(Dataset):
     def _time(dataset, index):
         return str(np.asarray(dataset.time.values)[int(index)])
 
+    def _sample_seed(self, position):
+        if self.deterministic_seed is None:
+            return None
+        return corruption_sample_seed(self.deterministic_seed, str(self.corruption), int(position))
+
+    def _severity(self, position):
+        return sample_target_corruption_severity(
+            self.cfg, self.corruption, self.severity_max, self.power,
+            seed=self._sample_seed(position),
+        )
+
     def sample_metadata(self, index):
         """Describe a held-out raw SFNO sample for logit-selected galleries."""
         is_fake, position = index >= self.n, index % self.n
@@ -1211,9 +1394,10 @@ class SFNOTargetDataset(Dataset):
             return metadata
         if self.corruption:
             fake_index = int(self.fake_i[position % len(self.fake_i)])
-            # Evaluation corruption severities are sampled on access; do not attach
-            # a misleading reconstructed severity to a selected input.
-            metadata.update(time=self._time(self.fake, fake_index), corruption=str(self.corruption))
+            metadata.update(
+                time=self._time(self.fake, fake_index), corruption=str(self.corruption),
+                severity=float(self._severity(position % len(self.fake_i))),
+            )
             return metadata
         if self.paired_records:
             record = self.paired_records[position % len(self.paired_records)]
@@ -1249,13 +1433,11 @@ class SFNOTargetDataset(Dataset):
             if self.donor_positions is not None:
                 donor_index = int(self.fake_i[int(self.donor_positions[fake_position])])
                 donor = raw_fields(self.fake, SFNO_VARIABLES, donor_index)
-            severity = training_corruption_severity(
-                self.corruption, self.severity_max, self.power,
-                target_corruption_min(self.cfg, self.corruption),
-            )
+            severity = self._severity(fake_position)
             corrupted = apply_sfno_corruption(
                 sample, self.encoder, self.corruption, severity, self.latitudes,
                 self.cfg, donor, maximum_severity=self.severity_max,
+                random_seed=self._sample_seed(fake_position),
                 target_variables=self.target_variables if self.use_era5_context else None,
             )
             return corrupted, torch.tensor([0.0])
@@ -1440,7 +1622,7 @@ def train_target(real, fake, variables, means, stds, cfg, device, *, corruption=
 
 def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, label=None,
                       metric_logger=None, log_every_n_steps=20, paired_records=None):
-    """Train linear and residual-MLP heads from each shared frozen embedding."""
+    """Train both frozen heads, or exactly one head when SFNO layers are unfrozen."""
     if int(get(cfg, "num_workers", 0)) != 0:
         raise ValueError("SFNO target training requires target_discriminator.num_workers=0.")
     severity_max = (
@@ -1458,15 +1640,15 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
         shuffle=True,
         num_workers=0,
     )
-    heads = {
-        "sfno_linear": LinearProbe(encoder.feature_dim).to(device),
-        "sfno_mlp": ResidualMLPProbe(
-            encoder.feature_dim,
-            hidden_multiplier=float(sfno_settings(cfg).get("mlp_hidden_multiplier", 2.0)),
-            dropout=float(sfno_settings(cfg).get("mlp_dropout", 0.1)),
-        ).to(device),
-    }
     unfreeze_final_encoder_stage = bool(sfno_settings(cfg).get("unfreeze_final_encoder_stage", False))
+    selected_architectures = (
+        (sfno_finetune_probe_architecture(cfg),)
+        if unfreeze_final_encoder_stage else ("sfno_linear", "sfno_mlp")
+    )
+    heads = {
+        architecture: build_sfno_head(encoder, architecture, cfg).to(device)
+        for architecture in selected_architectures
+    }
     configure_sfno_trainability(encoder, unfreeze_final_encoder_stage)
     parameters = [parameter for head in heads.values() for parameter in head.parameters()]
     parameters.extend(parameter for parameter in encoder.parameters() if parameter.requires_grad)
@@ -1524,10 +1706,10 @@ def train_sfno_target(real, fake, encoder, cfg, device, *, corruption=None, labe
                         ((logits_by_head[name].detach() >= 0.0) == (labels >= 0.5)).float().mean().item()
                     )
                 metric_logger(payload)
-            batches.set_postfix(
-                linear=f"{losses['sfno_linear'].detach().item():.4f}",
-                mlp=f"{losses['sfno_mlp'].detach().item():.4f}",
-            )
+            batches.set_postfix(**{
+                name.removeprefix("sfno_"): f"{loss.detach().item():.4f}"
+                for name, loss in losses.items()
+            })
         if epoch_count:
             final_metrics = {
                 name: {
@@ -1715,7 +1897,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 test_real, test_fake, model.encoder, cfg.lead_times, corruption, maximum,
                 float(get(cfg, "corruption_power")),
                 target_corruption_max(cfg, corruption) if corruption else float(get(cfg, "corruption_severity_max")),
-                cfg, test_records,
+                cfg, test_records, deterministic_seed=attribution_seed,
             )
         else:
             dataset = BalancedTargetDataset(
@@ -1752,10 +1934,16 @@ def train_target_discriminator_baselines(cfg, tracker=None):
             })
             run.summary[f"{prefix}test/loss"] = record["test_loss"]
             run.summary[f"{prefix}test/accuracy"] = record["test_accuracy"]
+            if corruption:
+                run.summary["corruption/severity_sampling"] = target_corruption_sampling_mode(cfg)
+                run.summary["corruption/fake_severity_levels"] = target_fake_severity_levels(
+                    cfg, corruption,
+                ).tolist()
         logit_histogram_paths = plot_target_test_logit_histograms(
             model, architecture, kind, label, test_real, test_fake, test_records, corruption,
             variables, means, stds, cfg, device, maximum, int(get(cfg, "batch_size")),
         )
+        plot_paths = list(logit_histogram_paths)
         record["test_logit_histograms"] = [str(path) for path in logit_histogram_paths]
         if run is not None:
             tracker.log_images(run, logit_histogram_paths, root / "plots")
@@ -1790,6 +1978,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 run.summary["sfno/representation_ratio_points"] = len(ratios)
                 if ratio_path is not None:
                     tracker.log_images(run, [ratio_path], root / "plots")
+                    plot_paths.append(ratio_path)
         if attribution_enabled:
             gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
                             f"{safe_target_name(label)}_integrated_gradients.png")
@@ -1801,6 +1990,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 )
                 interpretability_rows.extend(rows)
                 record["interpretability_gallery"] = str(gallery_path)
+                plot_paths.append(gallery_path)
                 residuals = [abs(float(row["completeness_residual"])) for row in rows]
                 if run is not None:
                     tracker.log_images(run, [gallery_path], root / "plots")
@@ -1809,6 +1999,19 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                     run.summary["interpretability/n_cases"] = len(rows)
                     run.summary["interpretability/max_abs_completeness_residual"] = max(residuals)
                 print(f"Saved target interpretability gallery to: {gallery_path}")
+                if (bool(getattr(model, "expects_raw_fields", False)) and
+                        bool(interpretability.get("sfno_representation_maps", True))):
+                    representation_path = gallery_path.with_name(
+                        gallery_path.name.replace("_integrated_gradients.png", "_representation_magnitudes.png")
+                    )
+                    create_sfno_representation_magnitude_gallery(
+                        model, cases, dataset, representation_path, architecture, kind, label,
+                    )
+                    record["sfno_representation_magnitude_gallery"] = str(representation_path)
+                    plot_paths.append(representation_path)
+                    if run is not None:
+                        tracker.log_images(run, [representation_path], root / "plots")
+                    print(f"Saved SFNO representation magnitude gallery to: {representation_path}")
             except Exception as error:
                 print(f"Interpretability failed for {architecture} {kind}/{label}: {error}")
                 if run is not None:
@@ -1816,6 +2019,14 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                     run.summary["interpretability/error"] = str(error)
         elif run is not None:
             run.summary["interpretability/status"] = "not_applicable"
+        if run is not None and tracker is not None and upload:
+            bundle_paths = [
+                member for path in plot_paths for member in plot_bundle_paths(path)
+                if member.is_file()
+            ]
+            tracker.log_artifact(
+                run, f"target-test-plots-{architecture}-{kind}-{label}", "plots", bundle_paths,
+            )
         return record
 
     if bool(get(cfg, "train_squeezenet", True)):
