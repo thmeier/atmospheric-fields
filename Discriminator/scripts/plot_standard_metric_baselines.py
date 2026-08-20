@@ -47,6 +47,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 try:
+    from .plot_bundles import save_figure_bundle
     from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
         WeatherDiscriminator,
@@ -63,6 +64,7 @@ try:
         select_era5_split,
     )
 except ImportError:
+    from plot_bundles import save_figure_bundle
     from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
         WeatherDiscriminator,
@@ -1759,7 +1761,7 @@ def plot_mmd_global_moment_matching(rows, output_root):
     axis.legend(fontsize=8, ncol=2)
     figure.tight_layout()
     path = plot_root / "lead_time_raw_vs_global_moment_matched_mmd.png"
-    figure.savefig(path, dpi=220)
+    save_figure_bundle(figure, path, plot_type="mmd_global_moment_matching", payload={"rows": np.asarray([str(row) for row in rows])}, dpi=220)
     plt.close(figure)
     return [path]
 
@@ -2422,7 +2424,16 @@ def plot_global_mean_wasserstein_distributions(diagnostics, output_root):
         figure.suptitle(f"Global-mean Wasserstein distributions: {label}", fontsize=14)
         figure.tight_layout(rect=[0, 0, 1, 0.94])
         output_path = root / f"{label.replace(' ', '_').replace('/', '_')}.png"
-        figure.savefig(output_path, dpi=220, bbox_inches="tight")
+        payload = {"fields": np.asarray(fields)}
+        for index, item in enumerate(series):
+            payload[f"candidate_global_means_{index}"] = item["candidate"]
+            payload[f"reference_global_means_{index}"] = item["reference"]
+            payload[f"lead_hour_{index}"] = np.asarray(item["lead_hour"])
+            payload[f"wasserstein_distance_{index}"] = np.asarray(item["distance"])
+        save_figure_bundle(
+            figure, output_path, plot_type="global_mean_wasserstein_distributions",
+            payload=payload, dpi=220, bbox_inches="tight",
+        )
         plt.close(figure)
         print(f"Saved global-mean Wasserstein distributions to: {output_path}")
 
@@ -2690,7 +2701,7 @@ def plot_scwd_anchor_diagnostics(diagnostics, output_root):
         )
         kind_root = scwd_plot_root(output_root, comparison_kind)
         output_path = kind_root / f"{scwd_output_stem(series[0])}.png"
-        figure.savefig(output_path, dpi=220, bbox_inches="tight")
+        save_figure_bundle(figure, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
         plt.close(figure)
         print(f"Saved SCWD anchor map to: {output_path}")
 
@@ -2749,7 +2760,19 @@ def plot_scwd_top_w1_distributions(diagnostics, cfg, output_root):
         kind_root = scwd_plot_root(output_root, scwd_comparison_kind(diagnostic), top_w1=True)
         suffix = f"_{int(diagnostic['lead_hour']):03d}h" if scwd_comparison_kind(diagnostic) == "forecast" else ""
         output_path = kind_root / f"{scwd_output_stem(diagnostic)}{suffix}.png"
-        figure.savefig(output_path, dpi=220, bbox_inches="tight")
+        payload = {}
+        for index, item in enumerate(distributions):
+            payload[f"candidate_responses_{index}"] = item["candidate"]
+            payload[f"reference_responses_{index}"] = item["reference"]
+            payload[f"bin_edges_{index}"] = np.histogram_bin_edges(
+                np.concatenate([item["candidate"], item["reference"]]), bins=n_bins,
+            )
+            payload[f"anchor_latitude_{index}"] = np.asarray(item["latitude"])
+            payload[f"anchor_longitude_{index}"] = np.asarray(item["longitude"])
+        save_figure_bundle(
+            figure, output_path, plot_type="scwd_top_w1_distributions",
+            payload=payload, dpi=220, bbox_inches="tight",
+        )
         plt.close(figure)
         print(f"Saved top-W1 SCWD response distributions to: {output_path}")
 
@@ -2804,7 +2827,7 @@ def plot_scwd_mean_response_differences(diagnostics, output_root):
         )
         kind_root = scwd_plot_root(output_root, comparison_kind)
         output_path = kind_root / f"{scwd_output_stem(series[0])}_mean_response_difference.png"
-        figure.savefig(output_path, dpi=220, bbox_inches="tight")
+        save_figure_bundle(figure, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
         plt.close(figure)
         print(f"Saved mean SCWD response-difference map to: {output_path}")
 
@@ -3298,7 +3321,7 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
     output_path = output_root / "plots" / "lead_time_by_model_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved normalized lead-time-by-model plot to: {output_path}")
 def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, output_root):
@@ -3345,7 +3368,7 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
     output_path = output_root / "plots" / "corruption_by_type_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
 def plot_lead_metrics(rows, metric_names, variables, output_root):
     """Plot point-estimate metrics versus configured forecast lead time."""
     metric_names = plotted_metric_names(metric_names)
@@ -3399,7 +3422,7 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
     fig.tight_layout(rect=[0, 0, 0.82, 0.96])
     output_path = output_root / "plots" / "lead_time.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved lead-time metric plot to: {output_path}")
 
@@ -3456,7 +3479,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
         )
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         output_path = metric_output_dir / f"{metric_name}.png"
-        fig.savefig(output_path, dpi=220, bbox_inches="tight")
+        save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved corruption metric plot to: {output_path}")
 
@@ -3501,7 +3524,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
     )
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.96])
     output_path = output_root / "plots" / "corruption_strength.png"
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved combined corruption metric plot to: {output_path}")
 
@@ -3688,7 +3711,7 @@ def plot_corruption_field_gallery(
     figure.suptitle(f"{corruption_type}: {title} at each severity\nERA5 {timestamp}", fontsize=14)
     figure.subplots_adjust(left=0.03, right=0.87, bottom=0.03, top=0.88, wspace=0.07, hspace=0.25)
     output_path = output_dir / filename
-    figure.savefig(output_path, dpi=220, bbox_inches="tight")
+    save_figure_bundle(figure, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
     plt.close(figure)
     print(f"Saved corruption gallery to: {output_path}")
 
@@ -3742,7 +3765,7 @@ def plot_combined_corruption_gallery(output_dir, corruptions, levels, corrupted_
         figure.colorbar(difference_artist, cax=difference_colorbar_axis, orientation="horizontal", label="Corrupted − ERA5")
         suffix = "all_corruptions_gallery.png" if n_variables == 1 else f"all_corruptions_gallery_{variable}.png"
         output_path = output_dir / suffix
-        figure.savefig(output_path, dpi=160, bbox_inches="tight")
+        save_figure_bundle(figure, output_path, plot_type="corruption_gallery", dpi=160, bbox_inches="tight")
         plt.close(figure)
         print(f"Saved combined corruption gallery to: {output_path}")
 
@@ -4036,7 +4059,7 @@ def plot_discriminator_baselines(rows, cfg, output_root):
             axis.grid(alpha=0.3, which="both")
             axis.legend()
             figure.tight_layout()
-            figure.savefig(architecture_root / filename, dpi=220); plt.close(figure)
+            save_figure_bundle(figure, architecture_root / filename, plot_type="discriminator_reverse_kl", dpi=220); plt.close(figure)
 
 
 def evaluate_standard_metrics(cfg):
