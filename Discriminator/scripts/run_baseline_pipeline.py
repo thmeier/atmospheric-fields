@@ -12,7 +12,8 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 try:
-    from .baseline_pipeline_tracking import PipelineTracker
+    from .baseline_pipeline_tracking import PipelineTracker, safe_name
+    from .plot_bundles import plot_bundle_paths
     from .plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -30,7 +31,8 @@ try:
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
 except ImportError:
-    from baseline_pipeline_tracking import PipelineTracker
+    from baseline_pipeline_tracking import PipelineTracker, safe_name
+    from plot_bundles import plot_bundle_paths
     from plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -62,6 +64,44 @@ STAGES = (
 def generated_pipeline_id():
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"baseline-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def pipeline_runs_dir(cfg):
+    """Resolve the immutable parent that holds isolated pipeline-run directories."""
+    configured = cfg.pipeline.get("runs_dir")
+    # ``manifest_dir`` is retained as a compatibility fallback for older
+    # experiment configs and minimal unit-test fixtures.
+    return Path(str(configured if configured is not None else cfg.pipeline.manifest_dir))
+
+
+def configure_run_output_dirs(cfg, pipeline_id, run_dir, runs_parent):
+    """Point all baseline stages at one non-shared pipeline-run directory."""
+    original_target_dir = Path(str(cfg.target_discriminator.output_dir))
+    target_leaf = original_target_dir.name
+    OmegaConf.update(cfg, "pipeline.id", pipeline_id, merge=False)
+    OmegaConf.update(cfg, "pipeline.run_dir", str(run_dir), force_add=True)
+    # Freeze this interpolation before changing baseline.output_dir so the
+    # resolved per-run config still records the actual common run parent.
+    OmegaConf.update(cfg, "pipeline.runs_dir", str(runs_parent), force_add=True)
+    OmegaConf.update(cfg, "baseline.output_dir", str(run_dir), merge=False)
+    # Some experiments deliberately override target_discriminator.output_dir
+    # (e.g. an SFNO fine-tuning run). Preserve that final directory name while
+    # moving it under this invocation's isolated root.
+    target_output_dir = Path(run_dir) / target_leaf
+    OmegaConf.update(cfg, "target_discriminator.output_dir", str(target_output_dir), merge=False)
+    input_checkpoint_dir = cfg.pipeline.get("input_checkpoint_dir")
+    checkpoint_dir = (
+        Path(str(input_checkpoint_dir)) if input_checkpoint_dir is not None
+        else target_output_dir / "models" / "target_discriminators"
+    )
+    OmegaConf.update(cfg, "target_discriminator.checkpoint_dir", str(checkpoint_dir), merge=False)
+    if cfg.baseline.get("discriminator") is not None:
+        OmegaConf.update(
+            cfg,
+            "baseline.discriminator.checkpoint_dir",
+            str(checkpoint_dir),
+            merge=False,
+        )
 
 
 def selected_stages(cfg):
@@ -110,6 +150,18 @@ def changed_plot_paths(output_root, before):
     return [path for path in paths if before.get(path) != path.stat().st_mtime_ns]
 
 
+def plot_bundle_members(paths):
+    """Expand rendered PNG paths to their sibling PDF and NPZ plot data."""
+    members = []
+    for path in paths:
+        path = Path(path)
+        if path.suffix.lower() == ".png":
+            members.extend(member for member in plot_bundle_paths(path) if member.is_file())
+        elif path.is_file():
+            members.append(path)
+    return list(dict.fromkeys(members))
+
+
 def run_stage(stage, cfg, tracker, output_root, resolved_path):
     upload_data = bool(cfg.pipeline.wandb.get("upload_evaluation_data", True))
     if stage == "train_discriminators":
@@ -129,11 +181,13 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
         paths = [record["path"] for record in records]
         paths.extend(record["interpretability_gallery"] for record in records
                      if record.get("interpretability_gallery"))
+        paths.extend(record["sfno_representation_magnitude_gallery"] for record in records
+                     if record.get("sfno_representation_magnitude_gallery"))
         if summary_path.is_file():
             paths.append(str(summary_path))
         if cases_path.is_file():
             paths.append(str(cases_path))
-        return paths, records
+        return [str(path) for path in plot_bundle_members(paths)], records
 
     if stage == "evaluate_standard_metrics":
         require_files(standard_input_paths(cfg), stage)
@@ -153,7 +207,7 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
                     run, "standard-metric-evaluation", "evaluation", [*paths, resolved_path],
                     metadata={"pipeline_id": tracker.group},
                 )
-            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
+            return [str(path) for path in plot_bundle_members(paths)], [{"run_url": getattr(run, "url", None)}]
 
     if stage == "evaluate_mmd_global_moment_matching":
         require_files(standard_input_paths(cfg), stage)
@@ -170,7 +224,7 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
                     run, "mmd-global-moment-matching", "evaluation", [*paths, resolved_path],
                     metadata={"pipeline_id": tracker.group},
                 )
-            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
+            return [str(path) for path in plot_bundle_members(paths)], [{"run_url": getattr(run, "url", None)}]
 
     if stage == "plot_mmd_global_moment_matching":
         mmd_root = mmd_global_moment_matching_output_dir(cfg, variables_from_config(cfg))
@@ -179,13 +233,14 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
         with tracker.run("plotting/mmd-global-moment-matching", "mmd-global-moment-matching-plots", cfg,
                          tags=["plotting", "mmd", "global-moment-matching"]) as run:
             paths = plot_mmd_global_moment_matching(read_mmd_global_moment_matching(mmd_root), mmd_root)
+            bundle_paths = plot_bundle_members(paths)
             tracker.log_images(run, paths, mmd_root / "plots")
             if bool(cfg.pipeline.wandb.get("upload_plots", True)):
                 tracker.log_artifact(
-                    run, "mmd-global-moment-matching-plots", "plots", [*paths, csv_path, resolved_path],
+                    run, "mmd-global-moment-matching-plots", "plots", [*bundle_paths, csv_path, resolved_path],
                     metadata={"pipeline_id": tracker.group},
                 )
-            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
+            return [str(path) for path in bundle_paths], [{"run_url": getattr(run, "url", None)}]
 
     if stage == "evaluate_discriminator_metrics":
         require_files([cfg.real_nc_file], stage)
@@ -229,8 +284,9 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
             tracker.log_images(run, interpretability_paths, target_root / "plots")
             if cases_path is not None:
                 tracker.log_csv_table(run, "interpretability/cases", cases_path)
-            all_paths = list(dict.fromkeys([*paths, *interpretability_paths]))
-            run.summary["plots/count"] = len(all_paths)
+            rendered_paths = list(dict.fromkeys([*paths, *interpretability_paths]))
+            all_paths = plot_bundle_members(rendered_paths)
+            run.summary["plots/count"] = len(rendered_paths)
             run.summary["interpretability/galleries"] = len(interpretability_paths)
             if cases_path is not None and Path(cases_path).is_file():
                 run.summary["interpretability/case_rows"] = csv_row_count(cases_path)
@@ -245,12 +301,22 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
 
 
 def execute_pipeline(cfg):
-    pipeline_id = str(cfg.pipeline.id or generated_pipeline_id())
+    pipeline_id = safe_pipeline_id = str(cfg.pipeline.id or generated_pipeline_id())
+    # Keep local directory names portable and exactly aligned with W&B names.
+    pipeline_id = safe_name(pipeline_id)
     stages = selected_stages(cfg)
-    manifest_root = Path(str(cfg.pipeline.manifest_dir)) / pipeline_id
-    manifest_root.mkdir(parents=True, exist_ok=True)
-    resolved_path = manifest_root / "resolved_config.yaml"
-    manifest_path = manifest_root / "manifest.json"
+    runs_parent = pipeline_runs_dir(cfg)
+    run_dir = runs_parent / pipeline_id
+    resume = bool(cfg.pipeline.get("resume", False))
+    if run_dir.exists() and not resume:
+        raise FileExistsError(
+            f"Pipeline run directory already exists: {run_dir}. "
+            "Choose a new pipeline.id or set pipeline.resume=true to reuse it intentionally."
+        )
+    run_dir.mkdir(parents=True, exist_ok=resume)
+    configure_run_output_dirs(cfg, pipeline_id, run_dir, runs_parent)
+    resolved_path = run_dir / "resolved_config.yaml"
+    manifest_path = run_dir / "manifest.json"
     OmegaConf.save(cfg, resolved_path, resolve=True)
     tracker = PipelineTracker(cfg, pipeline_id)
     variables = variables_from_config(cfg)
@@ -278,6 +344,8 @@ def execute_pipeline(cfg):
 
     manifest = {
         "pipeline_id": pipeline_id,
+        "requested_pipeline_id": safe_pipeline_id,
+        "run_dir": str(run_dir),
         "status": "failed" if first_error is not None else "completed",
         "selected_stages": stages,
         "stages": records,
@@ -296,6 +364,7 @@ def execute_pipeline(cfg):
         tracker.log_records_table(run, "pipeline/stages", summary_records)
         run.summary["pipeline/status"] = manifest["status"]
         run.summary["pipeline/stages_completed"] = sum(r["status"] == "completed" for r in records)
+        run.summary["pipeline/run_dir"] = str(run_dir)
         tracker.log_artifact(run, "pipeline-manifest", "pipeline", [manifest_path, resolved_path])
     if first_error is not None:
         raise first_error
