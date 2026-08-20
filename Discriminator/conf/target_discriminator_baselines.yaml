@@ -5,6 +5,9 @@ defaults:
 # One discriminator per target source; scores use the reverse-KL critic form.
 target_discriminator:
   output_dir: "${baseline.output_dir}/2m_temperature"
+  # Optional read-only source for plot-time checkpoint loading. Training always
+  # writes new checkpoints beneath output_dir.
+  checkpoint_dir: null
   variables: ["2m_temperature"]
   model_name: squeezenet
   pretrained_backbone: true
@@ -23,8 +26,8 @@ target_discriminator:
     # If enabled, only target_variables come from forecasts/corruptions;
     # all other SFNO input channels are matched ERA5 context.
     target_variables: ["2m_temperature"]
-    #use_era5_context_for_non_target_fields: false
-    use_era5_context_for_non_target_fields: true
+    use_era5_context_for_non_target_fields: false
+    #use_era5_context_for_non_target_fields: true
     embedding_channels: 8
     embedding_resolution: [31, 60]
     pooling: grid
@@ -33,6 +36,9 @@ target_discriminator:
     epochs: 3
     # Opt-in finetuning: seventh SFNO block plus its final 34-to-8 projection.
     unfreeze_final_encoder_stage: false
+    # Required when unfreezing the encoder: choose the sole head whose loss updates it.
+    # Accepted values: linear, mlp.
+    finetune_probe_architecture: null
     representation_ratio:
       enabled: true
       # Match the standard-corruption evaluation budget rather than materializing all ERA5 maps.
@@ -52,6 +58,8 @@ target_discriminator:
   max_eval_samples: 0
   interpretability:
     enabled: true
+    # For SFNO probes, also render per-position L2 magnitudes after blocks six and seven.
+    sfno_representation_maps: true
     method: integrated_gradients
     baseline:
       kind: global_training_mean
@@ -60,7 +68,11 @@ target_discriminator:
     random_samples_per_class: 2
     seed: ${target_discriminator.seed}
   corruption_power: 2.0
-  corruption_steps: 7
+  # Fake corruption samples are drawn uniformly from the nonzero strengths used
+  # in the held-out corruption curves. Set power_law to restore legacy sampling.
+  corruption_severity_sampling: discrete_uniform
+  # Share the exact discrete grid used by standard corruption-curve plots.
+  corruption_steps: ${baseline.corruption_steps}
   corruption_severity_max: 0.2
   corruption_severity_max_overrides:
     gaussian_blur: 1.0
