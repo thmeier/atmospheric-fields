@@ -46,6 +46,14 @@ import xarray as xr
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+
+# Make independently labelled curves distinguishable without relying on colour.
+SERIES_MARKERS = ("o", "s", "^", "v", "D", "P", "X", "<", ">", "h")
+
+
+def series_marker(index):
+    return SERIES_MARKERS[int(index) % len(SERIES_MARKERS)]
+
 try:
     from .plot_bundles import save_figure_bundle
     from .corruptions import U10_CHANNEL, V10_CHANNEL
@@ -1746,12 +1754,12 @@ def plot_mmd_global_moment_matching(rows, output_root):
     figure, axis = plt.subplots(figsize=(9.0, 5.0))
     labels = sorted({row["label"] for row in rows})
     colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(labels), 1)))
-    for color, label in zip(colors, labels):
+    for label_index, (color, label) in enumerate(zip(colors, labels)):
         series = sorted((row for row in rows if row["label"] == label), key=lambda row: row["lead_hour"])
         leads = [row["lead_hour"] for row in series]
-        axis.plot(leads, [row["raw_mmd_rbf"] for row in series], marker="o", color=color,
+        axis.plot(leads, [row["raw_mmd_rbf"] for row in series], marker=series_marker(2 * label_index), color=color,
                   linestyle="--", alpha=0.7, label=f"{label} raw")
-        axis.plot(leads, [row["matched_mmd_rbf"] for row in series], marker="o", color=color,
+        axis.plot(leads, [row["matched_mmd_rbf"] for row in series], marker=series_marker(2 * label_index + 1), color=color,
                   linestyle="-", linewidth=2.0, label=f"{label} moment-matched")
     axis.set(
         xlabel="Lead time (hours)", ylabel="RBF MMD",
@@ -3298,11 +3306,11 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
     era5_rows = [row for row in variable_rows if row["label"] == era5_shift_label]
     for axis, label in zip(axes.ravel(), labels):
         series = sorted([row for row in variable_rows if row["label"] == label], key=lambda row: row["lead_hour"])
-        for metric_name in metric_names:
+        for metric_index, metric_name in enumerate(metric_names):
             axis.plot(
                 [row["lead_hour"] for row in series],
                 [normalized_metric_value(row, metric_name, scales) for row in series],
-                marker="o", linewidth=1.6, color=colors[metric_name], label=metric_name,
+                marker=series_marker(metric_index), linewidth=1.6, color=colors[metric_name], label=metric_name,
             )
             if era5_rows:
                 axis.scatter(
@@ -3345,11 +3353,11 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
             key=lambda row: row["severity"],
         )
         null_row = next((row for row in variable_rows if row["corruption"] == corruption and row_is_null(row)), None)
-        for metric_name in metric_names:
+        for metric_index, metric_name in enumerate(metric_names):
             axis.plot(
                 [row["severity"] for row in series],
                 [normalized_metric_value(row, metric_name, scales) for row in series],
-                marker="o", linewidth=1.6, color=colors[metric_name], label=metric_name,
+                marker=series_marker(metric_index), linewidth=1.6, color=colors[metric_name], label=metric_name,
             )
             if null_row is not None:
                 axis.scatter(
@@ -3394,7 +3402,7 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
     for metric_idx, metric_name in enumerate(metric_names):
         metric_label = displayed_metric_name(metric_name)
         ax = axes[metric_idx]
-        for color, label in zip(colors, labels):
+        for label_index, (color, label) in enumerate(zip(colors, labels)):
             series = sorted(
                 [row for row in variable_rows if row["label"] == label],
                 key=lambda row: row["lead_hour"],
@@ -3402,7 +3410,7 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
             ax.plot(
                 [row["lead_hour"] for row in series],
                 [display_metric_value(row, metric_name) for row in series],
-                marker="o", linewidth=1.8, color=color, label=label,
+                marker=series_marker(label_index), linewidth=1.8, color=color, label=label,
             )
         era5_rows = [row for row in variable_rows if row["label"] == era5_shift_label]
         if era5_rows:
@@ -3491,7 +3499,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
     for metric_idx, metric_name in enumerate(metric_names):
         metric_label = displayed_metric_name(metric_name)
         ax = axes[metric_idx]
-        for color, corruption_type in zip(colors, corruptions):
+        for corruption_index, (color, corruption_type) in enumerate(zip(colors, corruptions)):
             series = sorted(
                 [row for row in variable_rows if row["corruption"] == corruption_type and not row_is_null(row)],
                 key=lambda row: row["severity"],
@@ -3499,7 +3507,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
             ax.plot(
                 relative_corruption_coordinates(series, "severity"),
                 [display_metric_value(row, metric_name) for row in series],
-                marker="o", linewidth=1.8, color=color, label=corruption_range_label(corruption_type, series, "severity"),
+                marker=series_marker(corruption_index), linewidth=1.8, color=color, label=corruption_range_label(corruption_type, series, "severity"),
             )
             null_row = next((row for row in variable_rows if row["corruption"] == corruption_type and row_is_null(row)), None)
             if null_row is not None:
@@ -4028,7 +4036,7 @@ def plot_discriminator_baselines(rows, cfg, output_root):
             figure, axis = plt.subplots(figsize=(9, 5))
             targets = sorted({row["target"] for row in architecture_rows if row["kind"] == kind})
             colors = plt.cm.tab10(np.linspace(0, 1, max(len(targets), 1)))
-            for color, target in zip(colors, targets):
+            for target_index, (color, target) in enumerate(zip(colors, targets)):
                 series = sorted(
                     [row for row in architecture_rows if row["kind"] == kind and row["target"] == target and not row["is_era5_test_null"]],
                     key=lambda row: row["x"],
@@ -4039,7 +4047,7 @@ def plot_discriminator_baselines(rows, cfg, output_root):
                 label = (corruption_range_label(target, series, "x")
                          if visual_corruption_scale else target)
                 axis.errorbar(x_values, [row["score"] for row in series],
-                              yerr=[row["stderr"] for row in series], marker="o",
+                              yerr=[row["stderr"] for row in series], marker=series_marker(target_index),
                               color=color, label=label)
                 null = next(row for row in target_rows if row["is_era5_test_null"])
                 axis.scatter([0], [null["score"]], marker="D", color=color, zorder=4)

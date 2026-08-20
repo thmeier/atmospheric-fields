@@ -1,6 +1,7 @@
 """Portable PNG/PDF/NPZ bundles for baseline-pipeline figures."""
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,19 @@ def plot_bundle_paths(png_path):
     if png_path.suffix.lower() != ".png":
         raise ValueError(f"Plot bundle path must end in .png, got {png_path}")
     return png_path, png_path.with_suffix(".pdf"), png_path.with_suffix(".npz")
+
+
+def titleless_plot_path(png_path):
+    """Return the title-less companion path for a rendered PNG."""
+    png_path = Path(png_path)
+    if png_path.suffix.lower() != ".png":
+        raise ValueError(f"Plot bundle path must end in .png, got {png_path}")
+    return png_path.with_name(f"{png_path.stem}_notitle.png")
+
+
+def all_plot_bundle_paths(png_path):
+    """Return the normal and title-less PNG/PDF/NPZ bundles for a figure."""
+    return (*plot_bundle_paths(png_path), *plot_bundle_paths(titleless_plot_path(png_path)))
 
 
 def _safe_array(value):
@@ -59,9 +73,29 @@ def _artist_arrays(figure):
     return arrays, metadata_axes
 
 
-def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=None,
-                       dpi=220, bbox_inches=None):
-    """Save one figure as PNG, PDF, and a no-pickle NPZ replot sidecar."""
+@contextmanager
+def without_titles(figure):
+    """Temporarily remove axes and figure titles while preserving layout."""
+    axes_titles = [
+        (axis, location, axis.get_title(loc=location))
+        for axis in figure.axes for location in ("left", "center", "right")
+    ]
+    supertitle = getattr(figure, "_suptitle", None)
+    supertitle_text = None if supertitle is None else supertitle.get_text()
+    try:
+        for axis, location, _ in axes_titles:
+            axis.set_title("", loc=location)
+        if supertitle is not None:
+            supertitle.set_text("")
+        yield
+    finally:
+        for axis, location, title in axes_titles:
+            axis.set_title(title, loc=location)
+        if supertitle is not None:
+            supertitle.set_text(supertitle_text)
+
+
+def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, dpi, bbox_inches):
     png_path, pdf_path, npz_path = plot_bundle_paths(png_path)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs = {"dpi": int(dpi)}
@@ -98,3 +132,19 @@ def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=No
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return [png_path, pdf_path, npz_path]
+
+
+def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=None,
+                       dpi=220, bbox_inches=None):
+    """Save titled and title-less PNG/PDF/NPZ bundles for one figure."""
+    paths = _save_one_figure_bundle(
+        figure, png_path, plot_type=plot_type, payload=payload, metadata=metadata,
+        dpi=dpi, bbox_inches=bbox_inches,
+    )
+    with without_titles(figure):
+        paths.extend(_save_one_figure_bundle(
+            figure, titleless_plot_path(png_path), plot_type=plot_type,
+            payload=payload, metadata={**(metadata or {}), "titleless": True},
+            dpi=dpi, bbox_inches=bbox_inches,
+        ))
+    return paths

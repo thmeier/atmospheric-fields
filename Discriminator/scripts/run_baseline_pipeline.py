@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 
 try:
     from .baseline_pipeline_tracking import PipelineTracker, safe_name
-    from .plot_bundles import plot_bundle_paths
+    from .plot_bundles import all_plot_bundle_paths
     from .plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -32,7 +32,7 @@ try:
     )
 except ImportError:
     from baseline_pipeline_tracking import PipelineTracker, safe_name
-    from plot_bundles import plot_bundle_paths
+    from plot_bundles import all_plot_bundle_paths
     from plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -156,7 +156,7 @@ def plot_bundle_members(paths):
     for path in paths:
         path = Path(path)
         if path.suffix.lower() == ".png":
-            members.extend(member for member in plot_bundle_paths(path) if member.is_file())
+            members.extend(member for member in all_plot_bundle_paths(path) if member.is_file())
         elif path.is_file():
             members.append(path)
     return list(dict.fromkeys(members))

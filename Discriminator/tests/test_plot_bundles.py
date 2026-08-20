@@ -6,7 +6,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from Discriminator.scripts.plot_bundles import plot_bundle_paths, save_figure_bundle
+from Discriminator.scripts.plot_bundles import all_plot_bundle_paths, save_figure_bundle, titleless_plot_path
 
 
 class PlotBundleTests(unittest.TestCase):
@@ -20,7 +20,7 @@ class PlotBundleTests(unittest.TestCase):
                 payload={"raw_x": np.array([0.0, 1.0]), "raw_y": np.array([2.0, 3.0])},
             )
             plt.close(figure)
-            self.assertEqual(paths, list(plot_bundle_paths(output)))
+            self.assertEqual(paths, list(all_plot_bundle_paths(output)))
             self.assertTrue(all(path.is_file() for path in paths))
             with np.load(output.with_suffix(".npz"), allow_pickle=False) as data:
                 self.assertTrue(np.array_equal(data["input_raw_x"], [0.0, 1.0]))
@@ -29,6 +29,12 @@ class PlotBundleTests(unittest.TestCase):
             self.assertEqual(metadata["plot_type"], "unit_curve")
             manifest = json.loads((output.parent / "plot_data_manifest.json").read_text())
             self.assertEqual(manifest["plots"]["curve"]["npz"], "curve.npz")
+            self.assertEqual(manifest["plots"]["curve_notitle"]["png"], "curve_notitle.png")
+            self.assertTrue(titleless_plot_path(output).is_file())
+            with np.load(titleless_plot_path(output).with_suffix(".npz"), allow_pickle=False) as data:
+                titleless_metadata = json.loads(str(data["metadata_json"]))
+            self.assertTrue(titleless_metadata["titleless"])
+            self.assertEqual(titleless_metadata["axes"][0]["title"], "")
 
     def test_bundle_rejects_pickle_requiring_payloads(self):
         figure, _ = plt.subplots()

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
-    from .plot_bundles import plot_bundle_paths, save_figure_bundle
+    from .plot_bundles import all_plot_bundle_paths, save_figure_bundle
     from .train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from .plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -31,7 +31,7 @@ try:
         select_era5_split,
     )
 except ImportError:
-    from plot_bundles import plot_bundle_paths, save_figure_bundle
+    from plot_bundles import all_plot_bundle_paths, save_figure_bundle
     from train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -758,14 +758,15 @@ def plot_sfno_representation_ratio(rows, architecture, kind, label, output_path)
         "pooled_embedding": "Pooled 8-channel embedding",
     }
     colors = {layer: color for layer, color in zip(layer_order, plt.cm.tab10.colors)}
-    for layer in layer_order:
+    markers = ("o", "s", "^", "v", "D")
+    for layer_index, layer in enumerate(layer_order):
         layer_rows = [row for row in rows if row.get("representation_layer", "pooled_embedding") == layer]
         if not layer_rows:
             continue
         x = np.asarray([row["severity"] if corruptions else row["lead_hour"] for row in layer_rows], dtype=float)
         y = np.asarray([row["r_corr"] for row in layer_rows], dtype=float)
         finite = np.isfinite(y)
-        axis.plot(x[finite], y[finite], marker="o", color=colors[layer], label=labels[layer])
+        axis.plot(x[finite], y[finite], marker=markers[layer_index], color=colors[layer], label=labels[layer])
         if np.any(~finite):
             axis.scatter(x[~finite], np.zeros(np.count_nonzero(~finite)), marker="x", color=colors[layer])
     axis.legend(fontsize=8)
@@ -2021,7 +2022,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
             run.summary["interpretability/status"] = "not_applicable"
         if run is not None and tracker is not None and upload:
             bundle_paths = [
-                member for path in plot_paths for member in plot_bundle_paths(path)
+                member for path in plot_paths for member in all_plot_bundle_paths(path)
                 if member.is_file()
             ]
             tracker.log_artifact(
