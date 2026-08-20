@@ -12,7 +12,6 @@ monthly_split:
   null_comparison_days: [16, 31]
   corruption_time_range: ["2004-01-01", "2022-12-31"]
   model_valid_time_ranges:
-    - ["2018-01-01", "2018-12-31"]
     - ["2020-01-01", "2020-12-31"]
   require_exact_era5_match: true
 

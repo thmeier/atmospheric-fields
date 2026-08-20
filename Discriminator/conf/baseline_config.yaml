@@ -13,15 +13,12 @@ baseline:
   # valid-time test days and paired to ERA5 at that exact timestamp.
   forecast_files:
     "GraphCast":
-      - "${data_dir}/graphcast_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
       - "${data_dir}/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
     "Pangu-Weather":
-      - "${data_dir}/pangu_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
       - "${data_dir}/pangu_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
     "FuXi":
       - "${data_dir}/fuxi_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
     "IFS HRES":
-      - "${data_dir}/ifs_hres_6steps_surf_1.5deg_2018-01-01_2018-12-31.nc"
       - "${data_dir}/ifs_hres_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
     "ERA5 Forecast":
       - "${data_dir}/era5_forecast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
@@ -53,7 +50,7 @@ baseline:
     - "scwd"
     - "scwd_area_weighted"
 
-  output_dir: "${output_dir}/baselines/monthly_valid_time_2018_2020/surface"
+  output_dir: "${output_dir}/baselines/monthly_valid_time_2020/surface"
   # Use every timestamp in each configured range. The two quadratic metrics
   # retain an evenly spaced subset to keep their exact all-pairs estimators
   # tractable.
