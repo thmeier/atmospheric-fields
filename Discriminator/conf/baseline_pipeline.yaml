@@ -9,8 +9,14 @@ pipeline:
     - evaluate_discriminator_metrics
     - plot
   id: null
+  # Every invocation writes beneath this parent in an isolated directory named
+  # after its pipeline id. Reusing an id requires an explicit resume opt-in.
+  runs_dir: "${baseline.output_dir}/pipeline_runs"
+  resume: false
+  # Exact existing models/target_discriminators directory to load when this
+  # invocation evaluates or plots without training its own critics.
+  input_checkpoint_dir: null
   fail_fast: true
-  manifest_dir: "${target_discriminator.output_dir}/pipeline_runs"
   wandb:
     enabled: true
     project: "weather-discriminator-baselines"

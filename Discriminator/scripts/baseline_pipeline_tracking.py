@@ -51,6 +51,8 @@ class PipelineTracker:
         self.group = str(pipeline_id)
         self.tags = [str(tag) for tag in settings.get("tags", [])]
         self.pipeline_alias = safe_name(pipeline_id)
+        run_dir = cfg.pipeline.get("run_dir")
+        self.run_dir = None if run_dir is None else Path(str(run_dir))
         self.logged_artifacts = []
         self._wandb = None
         if self.enabled:
@@ -74,15 +76,17 @@ class PipelineTracker:
             entity=None if self.entity is None else str(self.entity),
             group=self.group,
             job_type=str(job_type),
-            name=str(name),
-            tags=self.tags + [str(tag) for tag in (tags or [])],
+            name=f"{self.pipeline_alias}/{name}",
+            tags=self.tags + [f"pipeline:{self.pipeline_alias}"] + [str(tag) for tag in (tags or [])],
             config=config,
             mode=self.mode,
             save_code=True,
             reinit="create_new",
+            **({"dir": str(self.run_dir / "wandb")} if self.run_dir is not None else {}),
         )
         try:
             run.summary["pipeline_id"] = self.group
+            run.summary["pipeline_run_directory"] = self.pipeline_alias
             run.summary["status"] = "running"
             yield run
         except BaseException as error:
@@ -98,8 +102,10 @@ class PipelineTracker:
         paths = [Path(path) for path in paths if Path(path).is_file()]
         if not self.enabled or not paths:
             return None
+        artifact_metadata = {"pipeline_id": self.group}
+        artifact_metadata.update(dict(metadata or {}))
         artifact = self._wandb.Artifact(
-            safe_name(name), type=str(artifact_type), metadata=dict(metadata or {})
+            f"{self.pipeline_alias}-{safe_name(name)}", type=str(artifact_type), metadata=artifact_metadata,
         )
         common_root = Path(Path(paths[0]).anchor)
         try:
@@ -113,7 +119,7 @@ class PipelineTracker:
                 artifact_name = path.name
             artifact.add_file(str(path), name=artifact_name)
         logged = run.log_artifact(
-            artifact, aliases=["latest", self.pipeline_alias]
+            artifact, aliases=[self.pipeline_alias]
         )
         self.logged_artifacts.append(logged)
         return logged
