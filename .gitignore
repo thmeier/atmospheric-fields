@@ -54,3 +54,11 @@ Discriminator/slurm_baseline_pipeline_*.err
 Discriminator/tea_debug.log
 sfno_8c_31x60/
 sfno_8c_31x60_code_and_weights/
+
+# U-Cast evaluation working log + its raw logs/figures (local working notes)
+ucast_eval/
+
+# job / run logs (complements *.out above)
+*.log
+*.err
+slurm_logs/
