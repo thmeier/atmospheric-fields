@@ -115,14 +115,21 @@ if [[ -n "${DRAWS}" ]]; then
   "${PYTHON}" scripts/plot_bootstrap_blindspots.py "+bootstrap_null.data_dir=${BLINDSPOTS}"
 fi
 
-# Scratch is auto-cleaned every 1-7 days. Copy the small deliverables (figures,
-# CSVs, LaTeX) home, but not the multi-GB NetCDF diagnostics or the per-resample
-# child directories -- home only has a few GB free.
+# Scratch is auto-cleaned every 1-7 days, so anything worth reusing has to leave
+# it. Trained critics are ~2.8 MB each (~250 MB for all 90) and are what makes a
+# rerun cheap: pass the copied tree back as temporal_resampling.input_run_dir to
+# evaluate or replot without retraining. The bulky NetCDF diagnostics and the
+# per-fold plot trees are left behind -- home has only a few GB free, and the
+# canonical fold's plots are already copied up to the parent.
 KEEP="$HOME/paper_temporal_results/${PIPELINE_ID}"
 mkdir -p "${KEEP}"
-rsync -a --exclude='*.nc' --exclude='resamples/' --exclude='models/' \
+rsync -a --prune-empty-dirs \
+      --include='*/' --include='model.pth' --include='*.json' --exclude='*' \
+      "${RUN_DIR}/resamples/" "${KEEP}/resamples/" 2>/dev/null || true
+rsync -a --exclude='*.nc' --exclude='resamples/' \
       "${RUN_DIR}/" "${KEEP}/" 2>/dev/null || \
   cp -r "${RUN_DIR}"/* "${KEEP}/" 2>/dev/null || true
+echo "  critics kept: $(find "${KEEP}" -name model.pth 2>/dev/null | wc -l)"
 echo
 echo "Run directory : ${RUN_DIR}"
 echo "Copied home to: ${KEEP}  ($(du -sh "${KEEP}" 2>/dev/null | cut -f1))"
