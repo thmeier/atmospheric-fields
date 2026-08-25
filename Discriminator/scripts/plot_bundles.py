@@ -246,7 +246,16 @@ def without_suptitle(figure):
 
 
 def rasterize_field_artists(figure):
-    """Rasterize dense field artists in PDF while retaining vector annotations."""
+    """Rasterize the artists that make field plots enormous as vectors.
+
+    A 121x240 pcolormesh is ~29k individually drawn patches, and a gallery stacks
+    several per figure. As vectors those reach 50-70 MB per PDF and dominate the
+    plot stage; embedding them as a bitmap instead is visually identical at print
+    resolution. Only meshes and images are rasterized -- axes, text, lines,
+    legends and colorbars stay vector, so the PDF remains crisp and searchable.
+
+    Returns the number of artists rasterized.
+    """
     from matplotlib.collections import Collection
     from matplotlib.image import AxesImage
 
@@ -268,6 +277,10 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
         save_kwargs["bbox_inches"] = bbox_inches
     figure.savefig(png_path, **save_kwargs)
     if save_pdf:
+        # Rasterize after the PNG (which is a bitmap regardless) and before the PDF,
+        # so only the PDF path pays for it. dpi is passed explicitly here: it sets
+        # the resolution of the embedded raster, and without it savefig would fall
+        # back to the figure default and produce a soft image.
         rasterize_field_artists(figure)
         figure.savefig(pdf_path, dpi=int(dpi), bbox_inches=bbox_inches)
 
