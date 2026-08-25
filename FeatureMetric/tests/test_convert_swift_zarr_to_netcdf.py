@@ -43,3 +43,32 @@ class SwiftConverterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForecastEncodingTests(unittest.TestCase):
+    """The layout choice that made SWIFT ~49x slower to train against."""
+
+    def _dataset(self):
+        import numpy as np
+        import xarray as xr
+        shape = (4, 2, 3, 5)
+        return xr.Dataset(
+            {"2m_temperature": (("time", "prediction_timedelta", "latitude", "longitude"),
+                                np.zeros(shape, dtype="float32"))},
+            coords={"time": np.arange(shape[0]), "prediction_timedelta": np.arange(shape[1]),
+                    "latitude": np.arange(shape[2]), "longitude": np.arange(shape[3])},
+        )
+
+    def test_default_is_uncompressed_and_contiguous(self):
+        from FeatureMetric.scripts.convert_swift_zarr_to_netcdf import forecast_encoding
+        encoding = forecast_encoding(self._dataset(), 0)["2m_temperature"]
+        self.assertFalse(encoding["zlib"])
+        self.assertTrue(encoding["contiguous"])
+
+    def test_compression_chunks_one_timestep_and_lead(self):
+        from FeatureMetric.scripts.convert_swift_zarr_to_netcdf import forecast_encoding
+        encoding = forecast_encoding(self._dataset(), 4)["2m_temperature"]
+        self.assertTrue(encoding["zlib"])
+        self.assertEqual(encoding["complevel"], 4)
+        # (time, lead, lat, lon) -> one field per chunk, never a span of timesteps.
+        self.assertEqual(encoding["chunksizes"], (1, 1, 3, 5))

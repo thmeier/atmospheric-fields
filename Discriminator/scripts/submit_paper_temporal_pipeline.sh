@@ -59,6 +59,30 @@ STAGES="${STAGES:-[train_discriminators,evaluate_standard_metrics,evaluate_discr
 RESUME="${RESUME:-false}"
 
 cd "$HOME/atmospheric-fields/Discriminator"
+
+# The shipped SWIFT export is zlib-compressed with chunks spanning 244 timesteps,
+# so a single-field read decompresses ~57 MB. Every stage here reads one
+# (time, lead) field at a time in shuffled order, which made SWIFT train at
+# 7.8 s/step against GraphCast's 0.16 s/step. A contiguous, uncompressed rewrite
+# is byte-identical and reads 154x faster (123 ms -> 0.8 ms per field). Rebuild it
+# on scratch when absent -- scratch is auto-cleaned, and the shared team copy is
+# deliberately left untouched.
+FAST_DATA="${FAST_DATA:-/work/scratch/ddemler/data}"
+SWIFT_NAME=swift_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc
+if [[ ! -f "${FAST_DATA}/${SWIFT_NAME}" ]]; then
+  echo "Rebuilding a contiguous SWIFT copy under ${FAST_DATA}"
+  mkdir -p "${FAST_DATA}"
+  "${PYTHON}" - "${DATA_DIR}/${SWIFT_NAME}" "${FAST_DATA}/${SWIFT_NAME}" <<'PYEOF'
+import sys, xarray as xr
+source, target = sys.argv[1], sys.argv[2]
+ds = xr.open_dataset(source)
+ds.to_netcdf(target, engine="netcdf4", encoding={
+    v: {"zlib": False, "complevel": 0, "contiguous": True} for v in ds.data_vars})
+ds.close()
+print(f"wrote {target}")
+PYEOF
+fi
+
 echo "node=$(hostname) workers=${WORKERS} pipeline=${PIPELINE_ID} resume=${RESUME}"
 echo "stages=${STAGES}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
@@ -73,6 +97,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
   baseline.discriminator.sfno.enabled=false \
   target_discriminator.train_attention_squeezenet=false \
   "baseline.corruptions=[hemisphere_splice,checkerboard_2px,equatorial_checker_texture,zonal_scanlines,meridional_scanlines,gaussian_blur,grf,hf_noise,pixel_replace]" \
+  "baseline.forecast_files.SWIFT=[${FAST_DATA}/${SWIFT_NAME}]" \
   plotting.profile=paper \
   plotting.save_pdf=true \
   "pipeline.wandb.enabled=true" \
