@@ -5,7 +5,7 @@
 #SBATCH --output=slurm_nosfno_smoke_%j.out
 #SBATCH --error=slurm_nosfno_smoke_%j.err
 
-# Small end-to-end validation: all stages, no SFNO, and paper-profile bundles.
+# Small end-to-end validation: two learned folds, three fixed resamples, no SFNO.
 set -euo pipefail
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 if [[ -f "${SUBMIT_DIR}/scripts/run_baseline_pipeline.py" ]]; then
@@ -27,6 +27,11 @@ cd "${REPO_DIR}"
 python scripts/run_baseline_pipeline.py \
   "pipeline.id=nosfno-smoke-${SLURM_JOB_ID:-local}" \
   "pipeline.stages=[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]" \
+  temporal_resampling.learned_replicates=2 \
+  temporal_resampling.fixed_replicates=3 \
+  "temporal_resampling.learned_test_windows=[[5,11],[20,26]]" \
+  "~baseline.forecast_files" \
+  '+baseline.forecast_files.GraphCast=[${data_dir}/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc]' \
   target_discriminator.sfno.enabled=false \
   baseline.discriminator.sfno.enabled=false \
   target_discriminator.train_attention_squeezenet=false \
@@ -40,7 +45,7 @@ python scripts/run_baseline_pipeline.py \
   baseline.corruption_eval_samples=32 \
   baseline.eval_samples=32 \
   "baseline.metrics=[mean_bias,std_ratio_error]" \
-  plotting.profile=paper \
-  plotting.save_pdf=true \
-  "pipeline.wandb.tags=[smoke,nosfno,paper]" \
+  plotting.profile=dashboard \
+  plotting.save_pdf=false \
+  "pipeline.wandb.tags=[smoke,nosfno,temporal-resampling]" \
   "$@"

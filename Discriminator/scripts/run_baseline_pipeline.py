@@ -33,6 +33,8 @@ try:
     from .fit_histogram_matching import fit_histogram_matching_maps
     from .evaluate_bootstrap_null import bootstrap_null_output_dir, evaluate_bootstrap_null
     from .plot_bootstrap_blindspots import plot_bootstrap_blindspots
+    from .temporal_resampling import active_schedule, enabled as temporal_resampling_enabled
+    from .temporal_resampling_pipeline import finalize_resampling_manifest, run_resampled_stage
 except ImportError:
     from baseline_pipeline_tracking import PipelineTracker, safe_name
     from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg
@@ -55,6 +57,8 @@ except ImportError:
     from fit_histogram_matching import fit_histogram_matching_maps
     from evaluate_bootstrap_null import bootstrap_null_output_dir, evaluate_bootstrap_null
     from plot_bootstrap_blindspots import plot_bootstrap_blindspots
+    from temporal_resampling import active_schedule, enabled as temporal_resampling_enabled
+    from temporal_resampling_pipeline import finalize_resampling_manifest, run_resampled_stage
 
 
 STAGES = (
@@ -175,6 +179,10 @@ def plot_bundle_members(paths):
 
 
 def run_stage(stage, cfg, tracker, output_root, resolved_path):
+    if temporal_resampling_enabled(cfg) and active_schedule(cfg) is None:
+        resampled = run_resampled_stage(stage, cfg, tracker, output_root, resolved_path)
+        if resampled is not None:
+            return resampled
     upload_data = bool(cfg.pipeline.wandb.get("upload_evaluation_data", True))
     if stage == "fit_histogram_matching":
         with tracker.run("preprocessing/histogram-matching", "histogram-matching", cfg, tags=["preprocessing", "histogram-matching"]) as run:
@@ -191,6 +199,7 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
         records = train_target_discriminator_baselines(cfg, tracker=tracker)
         summary_path = Path(str(cfg.target_discriminator.output_dir)) / "data" / "target_train_test_metrics.csv"
         cases_path = Path(str(cfg.target_discriminator.output_dir)) / "data" / "target_interpretability_cases.csv"
+        split_path = Path(str(cfg.target_discriminator.output_dir)) / "data" / "split_manifest.csv.gz"
         with tracker.run("training/summary", "discriminator-training-summary", cfg, tags=["training", "summary"]) as run:
             tracker.log_csv_table(run, "metrics/target_train_test", summary_path)
             tracker.log_csv_table(run, "interpretability/cases", cases_path)
@@ -198,8 +207,9 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
                 run.summary["metrics/target_train_test_rows"] = csv_row_count(summary_path)
             if cases_path.is_file():
                 run.summary["interpretability/case_rows"] = csv_row_count(cases_path)
-                if upload_data:
-                    tracker.log_artifact(run, "target-train-test-metrics", "evaluation", [summary_path, cases_path, resolved_path])
+            if upload_data:
+                training_data = [path for path in (summary_path, cases_path, split_path, resolved_path) if path.is_file()]
+                tracker.log_artifact(run, "target-train-test-metrics", "evaluation", training_data)
         paths = [record["path"] for record in records]
         paths.extend(record["interpretability_gallery"] for record in records
                      if record.get("interpretability_gallery"))
@@ -209,6 +219,8 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
             paths.append(str(summary_path))
         if cases_path.is_file():
             paths.append(str(cases_path))
+        if split_path.is_file():
+            paths.append(str(split_path))
         return [str(path) for path in plot_bundle_members(paths)], records
 
     if stage == "evaluate_standard_metrics":
@@ -386,7 +398,8 @@ def execute_pipeline(cfg):
     pipeline_id = safe_name(pipeline_id)
     stages = selected_stages(cfg)
     histogram_enabled = bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False))
-    if histogram_enabled and "fit_histogram_matching" not in stages:
+    if (histogram_enabled and "fit_histogram_matching" not in stages
+            and not (temporal_resampling_enabled(cfg) and active_schedule(cfg) is None)):
         input_maps = cfg.pipeline.get("input_histogram_matching_dir")
         if input_maps is None:
             raise ValueError(
@@ -412,6 +425,11 @@ def execute_pipeline(cfg):
     variables = variables_from_config(cfg)
     output_root = baseline_output_dir(cfg, variables)
     records = []
+    if resume and manifest_path.is_file():
+        try:
+            records = list(json.loads(manifest_path.read_text()).get("stages", []))
+        except (json.JSONDecodeError, OSError):
+            records = []
     first_error = None
 
     for stage in stages:
@@ -427,6 +445,7 @@ def execute_pipeline(cfg):
             )
             first_error = first_error or error
         record["duration_seconds"] = time.monotonic() - started
+        records = [existing for existing in records if existing.get("stage") != stage]
         records.append(record)
         manifest_path.write_text(json.dumps({"pipeline_id": pipeline_id, "stages": records}, indent=2))
         if first_error is not None and bool(cfg.pipeline.get("fail_fast", True)):
@@ -437,11 +456,16 @@ def execute_pipeline(cfg):
         "requested_pipeline_id": safe_pipeline_id,
         "run_dir": str(run_dir),
         "status": "failed" if first_error is not None else "completed",
-        "selected_stages": stages,
+        "selected_stages": [record["stage"] for record in records],
         "stages": records,
         "resolved_config": str(resolved_path),
+        "manifest_path": str(manifest_path),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2))
+    if temporal_resampling_enabled(cfg) and active_schedule(cfg) is None:
+        resampling_manifest = finalize_resampling_manifest(cfg)
+        manifest["resampling_manifest"] = str(resampling_manifest)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
     with tracker.run("pipeline-summary", "pipeline-summary", cfg, tags=["summary"]) as run:
         summary_records = [
             {
@@ -455,7 +479,10 @@ def execute_pipeline(cfg):
         run.summary["pipeline/status"] = manifest["status"]
         run.summary["pipeline/stages_completed"] = sum(r["status"] == "completed" for r in records)
         run.summary["pipeline/run_dir"] = str(run_dir)
-        tracker.log_artifact(run, "pipeline-manifest", "pipeline", [manifest_path, resolved_path])
+        pipeline_artifacts = [manifest_path, resolved_path]
+        if manifest.get("resampling_manifest"):
+            pipeline_artifacts.append(Path(manifest["resampling_manifest"]))
+        tracker.log_artifact(run, "pipeline-manifest", "pipeline", pipeline_artifacts)
     if first_error is not None:
         raise first_error
     return manifest

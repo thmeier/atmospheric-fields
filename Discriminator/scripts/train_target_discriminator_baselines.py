@@ -18,6 +18,7 @@ try:
     from .plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle
     from .histogram_matching_apply import match_raw, match_standardized
     from .histogram_checkpoint import binding_path, validate_binding, write_binding
+    from .temporal_resampling import write_split_membership
     from .train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from .plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -37,6 +38,7 @@ except ImportError:
     from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle
     from histogram_matching_apply import match_raw, match_standardized
     from histogram_checkpoint import binding_path, validate_binding, write_binding
+    from temporal_resampling import write_split_membership
     from train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -1628,7 +1630,10 @@ def logits_for(
                     random_seed=corruption_sample_seed(get(cfg, "seed", 0), corruption, int(i)),
                 ))
             elif corruption:
-                x=apply_configured_corruption(x,corruption,severity)
+                sample_seed = corruption_sample_seed(get(cfg, "seed", 0), corruption, int(i))
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(int(sample_seed))
+                    x = apply_configured_corruption(x, corruption, severity)
             histogram_target = getattr(model, "histogram_target", None)
             if histogram_target is not None and (corruption is not None or lead is not None):
                 coordinate = severity if corruption is not None else int(
@@ -2217,6 +2222,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
         except FileNotFoundError as error:
             print(f"Skipping optional SFNO target training: {error}")
             write_target_train_test_metrics(root, outputs)
+            write_split_membership(cfg, real, root)
             write_interpretability_cases(root, interpretability_rows)
             write_sfno_representation_ratios(root, representation_ratio_rows)
             real.close()
@@ -2245,6 +2251,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                     tracker.log_artifact(run, f"target-discriminator-sfno-{kind}-{label}", "model", [*paths, *[binding_path(path) for path in paths], resolved_path])
                 if not corruption: fake.close()
     write_target_train_test_metrics(root, outputs)
+    write_split_membership(cfg, real, root)
     write_interpretability_cases(root, interpretability_rows)
     write_sfno_representation_ratios(root, representation_ratio_rows)
     real.close()

@@ -30,6 +30,7 @@ Metrics:
 """
 
 import csv
+import json
 import math
 from fractions import Fraction
 import tempfile
@@ -61,6 +62,7 @@ try:
     from .plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
     from .histogram_matching_apply import match_standardized
     from .histogram_checkpoint import validate_binding
+    from .temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
     from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
         WeatherDiscriminator,
@@ -80,6 +82,7 @@ except ImportError:
     from plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
     from histogram_matching_apply import match_standardized
     from histogram_checkpoint import validate_binding
+    from temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
     from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
         WeatherDiscriminator,
@@ -110,7 +113,7 @@ DEFAULT_METRICS = [
     "scwd",
 ]
 
-ERA5_NULL_LABEL = "ERA5 second-half null"
+ERA5_NULL_LABEL = "ERA5 test-vs-train null"
 PLOTTING_DISABLED_METRICS = {
     "crps_like_field_energy",
     "sliced_wasserstein",
@@ -2905,7 +2908,7 @@ def scwd_comparison_detail(item):
     if comparison_kind == "corruption":
         return f"severity={float(item['severity']):.3g}"
     if comparison_kind == "null":
-        return "ERA5 days 16–31 vs days 1–15"
+        return "ERA5 test vs buffered training complement"
     return f"+{int(item['lead_hour'])} h"
 
 
@@ -3006,7 +3009,7 @@ def plot_scwd_top_wasserstein_distributions(diagnostics, cfg, output_root):
                 reference = item["reference"][:, field_index]
                 edges = np.histogram_bin_edges(np.concatenate([candidate, reference]), bins=n_bins)
                 axis.hist(reference, bins=edges, density=True, histtype="step", linewidth=1.5,
-                          color="black", label=("ERA5 days 1–15" if scwd_comparison_kind(diagnostic) == "null" else "ERA5 test"))
+                          color="black", label=("ERA5 training complement" if scwd_comparison_kind(diagnostic) == "null" else "ERA5 test"))
                 axis.hist(candidate, bins=edges, density=True, histtype="step", linewidth=1.5,
                           color="tab:red", label=diagnostic["label"])
                 latitude = item["latitude"]
@@ -3365,7 +3368,7 @@ def evaluate_corruption_metrics(
     null_features = streaming_joint_features(
         cfg, null_ds, variables, null_reference_stats, null_indices, metric_names,
         Path(temporary_dir) / "corruption-null-scwd.dat",
-        description="ERA5 second-half null features",
+        description="ERA5 test-vs-train null features",
     )
 
     for corruption_type in compatible_corruption_types(corruption_types_from_config(cfg), variables):
@@ -3501,7 +3504,7 @@ def read_metric_csv(output_path, metric_names, experiment):
         )
     with open(output_path, newline="") as handle:
         rows = list(csv.DictReader(handle))
-    numeric = set(metric_names) | {"n_samples", "pairwise_n_samples"}
+    numeric = set(metric_names) | {f"{name}_{suffix}" for name in metric_names for suffix in ("lower", "upper")} | {"n_samples", "pairwise_n_samples", "n_resamples"}
     numeric.add("lead_hour" if experiment == "lead_time" else "severity")
     for row in rows:
         for field in numeric:
@@ -3523,6 +3526,16 @@ def display_metric_value(row, metric_name):
     """Return a presentation-only metric value for baseline figures."""
     value = float(row.get(metric_name, np.nan))
     return abs(value) if metric_name in ABSOLUTE_DISPLAY_METRICS else value
+
+
+def display_metric_bounds(row, metric_name):
+    lower = float(row.get(f"{metric_name}_lower", row.get(metric_name, np.nan)))
+    upper = float(row.get(f"{metric_name}_upper", row.get(metric_name, np.nan)))
+    if metric_name in ABSOLUTE_DISPLAY_METRICS:
+        if lower <= 0.0 <= upper:
+            return 0.0, max(abs(lower), abs(upper))
+        return min(abs(lower), abs(upper)), max(abs(lower), abs(upper))
+    return lower, upper
 
 
 def displayed_metric_name(metric_name):
@@ -3561,6 +3574,11 @@ def normalized_metric_value(row, metric_name, scales):
     return value / scales[metric_name] if np.isfinite(value) else np.nan
 
 
+def normalized_metric_bounds(row, metric_name, scales):
+    lower, upper = display_metric_bounds(row, metric_name)
+    return lower / scales[metric_name], upper / scales[metric_name]
+
+
 def metric_colors(metric_names):
     return {
         metric_name: color
@@ -3593,6 +3611,11 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
                 [normalized_metric_value(row, metric_name, scales) for row in series],
                 marker=series_marker(metric_index), linewidth=1.6, color=colors[metric_name], label=metric_name,
             )
+            if series and f"{metric_name}_lower" in series[0]:
+                bounds = [normalized_metric_bounds(row, metric_name, scales) for row in series]
+                axis.fill_between([row["lead_hour"] for row in series],
+                                  [bound[0] for bound in bounds], [bound[1] for bound in bounds],
+                                  color=colors[metric_name], alpha=0.14, linewidth=0)
             if era5_rows:
                 axis.scatter(
                     [0], [normalized_metric_value(era5_rows[0], metric_name, scales)],
@@ -3606,7 +3629,7 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
     fig.supylabel("Normalized divergence (metric maximum = 1)")
     handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
     fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
-    fig.suptitle(f"Normalized Distributional Metrics by Forecast Model: {variable}\nDiamonds: ERA5 days 16–end vs days 1–15", fontsize=14)
+    fig.suptitle(f"Normalized Distributional Metrics by Forecast Model: {variable}\nDiamonds: ERA5 test vs buffered training complement", fontsize=14)
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
     output_path = output_root / "plots" / "lead_time_by_model_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3640,6 +3663,11 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
                 [normalized_metric_value(row, metric_name, scales) for row in series],
                 marker=series_marker(metric_index), linewidth=1.6, color=colors[metric_name], label=metric_name,
             )
+            if series and f"{metric_name}_lower" in series[0]:
+                bounds = [normalized_metric_bounds(row, metric_name, scales) for row in series]
+                axis.fill_between([row["severity"] for row in series],
+                                  [bound[0] for bound in bounds], [bound[1] for bound in bounds],
+                                  color=colors[metric_name], alpha=0.14, linewidth=0)
             if null_row is not None:
                 axis.scatter(
                     [0], [normalized_metric_value(null_row, metric_name, scales)],
@@ -3653,7 +3681,7 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
     fig.supylabel("Normalized divergence (metric maximum = 1)")
     handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
     fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
-    fig.suptitle(f"Normalized Distributional Metrics by Corruption: {variable}\nDiamonds: ERA5 second-half null", fontsize=14)
+    fig.suptitle(f"Normalized Distributional Metrics by Corruption: {variable}\nDiamonds: ERA5 test-vs-train null", fontsize=14)
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
     output_path = output_root / "plots" / "corruption_by_type_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3695,6 +3723,11 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
                 [display_metric_value(row, metric_name) for row in series],
                 marker=series_marker(label_index), linewidth=1.8, color=color, label=label,
             )
+            if series and f"{metric_name}_lower" in series[0]:
+                bounds = [display_metric_bounds(row, metric_name) for row in series]
+                ax.fill_between([row["lead_hour"] for row in series],
+                                [bound[0] for bound in bounds], [bound[1] for bound in bounds],
+                                color=color, alpha=0.16, linewidth=0)
         era5_rows = [row for row in variable_rows if row["label"] == era5_shift_label]
         if era5_rows:
             ax.plot(
@@ -3750,11 +3783,16 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
                 [display_metric_value(row, metric_name) for row in series],
                 marker="o", linewidth=1.8,
             )
+            if series and f"{metric_name}_lower" in series[0]:
+                bounds = [display_metric_bounds(row, metric_name) for row in series]
+                ax.fill_between([row["severity"] for row in series],
+                                [bound[0] for bound in bounds], [bound[1] for bound in bounds],
+                                alpha=0.16, linewidth=0)
             null_row = next((row for row in variable_rows if row["corruption"] == corruption_type and row_is_null(row)), None)
             if null_row is not None:
                 ax.scatter(
                     [0.0], [display_metric_value(null_row, metric_name)], marker="D", s=42,
-                    color="black", zorder=3, label="ERA5 second-half null",
+                    color="black", zorder=3, label="ERA5 test-vs-train null",
                 )
             ax.set_title(corruption_type)
             ax.set_xlabel("Corruption severity")
@@ -3766,7 +3804,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
             ax.axis("off")
         fig.suptitle(
             f"{metric_label} vs Corruption Strength: {variable}\n"
-            "Diamond at zero: ERA5 second-half null",
+            "Diamond at zero: ERA5 test-vs-train null",
             fontsize=15,
         )
         fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -3796,6 +3834,11 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
                 [display_metric_value(row, metric_name) for row in series],
                 marker=series_marker(corruption_index), linewidth=1.8, color=color, label=corruption_range_label(corruption_type, series, "severity"),
             )
+            if series and f"{metric_name}_lower" in series[0]:
+                bounds = [display_metric_bounds(row, metric_name) for row in series]
+                ax.fill_between(relative_corruption_coordinates(series, "severity"),
+                                [bound[0] for bound in bounds], [bound[1] for bound in bounds],
+                                color=color, alpha=0.14, linewidth=0)
             null_row = next((row for row in variable_rows if row["corruption"] == corruption_type and row_is_null(row)), None)
             if null_row is not None:
                 ax.scatter(
@@ -3814,7 +3857,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
     fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
     fig.suptitle(
         f"Distributional Metrics vs Corruption Strength: {variable}\n"
-        "Diamond at zero: ERA5 second-half null",
+        "Diamond at zero: ERA5 test-vs-train null",
         fontsize=15,
     )
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.96])
@@ -4117,12 +4160,12 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
     try:
         from .train_target_discriminator_baselines import (
             SFNO_VARIABLES, compatible, load_sfno_encoder,
-            load_sfno_probe_checkpoint, matched_statistics, real_term, score, sfno_context_settings,
+            load_sfno_probe_checkpoint, matched_statistics, data_dependent_donor_positions, indices, logits_for, sfno_context_settings,
         )
     except ImportError:
         from train_target_discriminator_baselines import (
             SFNO_VARIABLES, compatible, load_sfno_encoder,
-            load_sfno_probe_checkpoint, matched_statistics, real_term, score, sfno_context_settings,
+            load_sfno_probe_checkpoint, matched_statistics, data_dependent_donor_positions, indices, logits_for, sfno_context_settings,
         )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     corruption_train = select_era5_split(real_ds, cfg, "train", coverage="corruption")
@@ -4136,6 +4179,7 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
     )
     discriminator_overrides = settings.get("corruption_severity_max_overrides", {}) or {}
     rows = []
+    term_rows = []
     architectures = [("squeezenet", variables, None)]
     masked = settings.get("equator_masked_hemisphere_splice", {}) or {}
     masked_root = checkpoint_root / "squeezenet_equator_mask"
@@ -4191,6 +4235,7 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
                 print(f"Skipping {architecture} {kind}/{label}: checkpoint not found at {checkpoint}")
                 continue
             validate_binding(checkpoint, cfg)
+            checkpoint_hash = file_sha256(checkpoint)
             if architecture in {"squeezenet", "squeezenet_attention", "squeezenet_equator_mask"}:
                 model_name = (
                     settings.get("model_name", "squeezenet")
@@ -4240,12 +4285,28 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
                 null_dataset = model_null.isel(
                     time=np.flatnonzero(np.isin(null_years, model_years))
                 )
-            ep, epse = real_term(
-                model, ep_dataset, input_variables, means, stds,
-                device, maximum, batch_size,
-                progress_description=f"{architecture} {label}: ERA5 days 1–15 reference",
-                selected_indices=train_indices,
+            ep_selected = indices(ep_dataset, maximum) if train_indices is None else np.asarray(train_indices, dtype=int)
+            if maximum > 0 and len(ep_selected) > maximum:
+                ep_selected = ep_selected[np.linspace(0, len(ep_selected) - 1, maximum, dtype=int)]
+            ep_logits = logits_for(
+                model, ep_dataset, input_variables, means, stds, device, maximum, batch_size,
+                progress_description=f"{architecture} {label}: ERA5 training reference",
+                selected_indices=ep_selected,
             )
+            ep_terms = -np.exp(np.minimum(-ep_logits, 80))
+            ep = float(ep_terms.mean())
+            epse = float(ep_terms.std(ddof=1) / np.sqrt(len(ep_terms))) if len(ep_terms) > 1 else 0.0
+            for position, (source_index, logit, term) in enumerate(zip(ep_selected, ep_logits, ep_terms)):
+                term_rows.append({
+                    "architecture": architecture, "kind": kind, "target": label,
+                    "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_hash,
+                    "role": "ep_train", "source": "ERA5 train", "x": "",
+                    "sample_position": position, "source_index": int(source_index),
+                    "time": str(np.asarray(ep_dataset.time.values)[int(source_index)]),
+                    "initialization_time": "", "valid_time": str(np.asarray(ep_dataset.time.values)[int(source_index)]),
+                    "lead_hour": "", "severity": "", "logit": float(logit),
+                    "transformed_term": float(term),
+                })
             points = [(0.0, None, None, ERA5_NULL_LABEL, None, None)]
             if corruption:
                 points.append((0.0, None, 0.0, label, None, None))
@@ -4260,32 +4321,75 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
                     if int(lead) in set(cfg.lead_times) and selected:
                         points.append((float(lead), lead_index, None, label, selected, context_selected))
             for x, lead_index, severity, source, selected, context_selected in points:
-                mean, stderr, count = score(
-                    model, null_dataset if source == ERA5_NULL_LABEL else candidate,
-                    input_variables, means, stds, device,
+                evaluation_ds = null_dataset if source == ERA5_NULL_LABEL else candidate
+                eval_selected = indices(evaluation_ds, maximum) if selected is None else np.asarray(selected, dtype=int)
+                eval_context = None if context_selected is None else np.asarray(context_selected, dtype=int)
+                if maximum > 0 and len(eval_selected) > maximum:
+                    keep = np.linspace(0, len(eval_selected) - 1, maximum, dtype=int)
+                    eval_selected = eval_selected[keep]
+                    if eval_context is not None:
+                        eval_context = eval_context[keep]
+                eval_logits = logits_for(
+                    model, evaluation_ds, input_variables, means, stds, device, maximum, batch_size,
                     lead=lead_index, corruption=corruption if severity is not None else None,
-                    severity=severity or 0.0, maximum=maximum, batch_size=batch_size, cfg=cfg,
+                    severity=severity or 0.0, cfg=cfg,
                     maximum_severity=(maximum_severity if corruption else None),
-                    selected_indices=selected,
-                    context_ds=(real_ds if context_selected is not None and getattr(model, "sfno_use_era5_context", False) else None),
-                    context_indices=context_selected,
+                    selected_indices=eval_selected,
+                    context_ds=(real_ds if eval_context is not None and getattr(model, "sfno_use_era5_context", False) else None),
+                    context_indices=eval_context,
                     progress_description=(
                         f"{architecture} {label}: {source} "
                         f"({'severity' if severity is not None else 'lead'}={x:g})"
                     ),
                 )
+                eval_terms = eval_logits - 1.0
+                mean = float(eval_terms.mean())
+                stderr = float(eval_terms.std(ddof=1) / np.sqrt(len(eval_terms))) if len(eval_terms) > 1 else 0.0
+                count = len(eval_terms)
+                pair_lookup = ({pair.forecast_index: pair for pair in test_pairs if pair.lead_index == lead_index}
+                               if test_pairs is not None and lead_index is not None else {})
+                eval_donors = (data_dependent_donor_positions(
+                    corruption, len(eval_selected), len(input_variables), int(cfg.get("seed", 0))
+                ) if corruption in DATA_DEPENDENT_CORRUPTIONS else None)
+                for position, (source_index, logit, term) in enumerate(zip(eval_selected, eval_logits, eval_terms)):
+                    pair = pair_lookup.get(int(source_index))
+                    timestamp = str(np.asarray(evaluation_ds.time.values)[int(source_index)])
+                    if eval_donors is None:
+                        donor_indices = []
+                    elif eval_donors.ndim == 1:
+                        donor_indices = [int(eval_selected[int(eval_donors[position])])]
+                    else:
+                        donor_indices = [int(eval_selected[int(eval_donors[field, position])])
+                                         for field in range(eval_donors.shape[0])]
+                    term_rows.append({
+                        "architecture": architecture, "kind": kind, "target": label,
+                        "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_hash,
+                        "role": "candidate", "source": source, "x": float(x),
+                        "sample_position": position, "source_index": int(source_index),
+                        "time": str(pair.valid_time) if pair is not None else timestamp,
+                        "initialization_time": str(pair.initialization_time) if pair is not None else "",
+                        "valid_time": str(pair.valid_time) if pair is not None else timestamp,
+                        "lead_hour": int(pair.lead_hour) if pair is not None else "",
+                        "severity": "" if severity is None else float(severity),
+                        "corruption_seed": ("" if corruption is None else int(corruption_sample_seed(
+                            cfg.get("seed", 0), corruption, int(source_index)
+                        ))),
+                        "donor_source_indices": json.dumps(donor_indices),
+                        "logit": float(logit), "transformed_term": float(term),
+                    })
                 rows.append({
                     "architecture": architecture,
+                    "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_hash,
                     "input_variables": ",".join(input_variables),
                     "encoder_pretraining": metadata.get("encoder_pretraining", ""),
                     "kind": kind, "target": label, "x": x, "source": source,
                     "is_era5_test_null": source == ERA5_NULL_LABEL, "score": ep - mean,
                     "stderr": float(np.hypot(epse, stderr)), "n_samples": count,
-                    "ep_train": ep,
+                    "ep_train": ep, "ep_n_samples": len(ep_terms),
                 })
             if not corruption:
                 candidate.close()
-    return rows
+    return rows, term_rows
 
 
 def write_discriminator_baselines(rows, cfg, output_root):
@@ -4307,9 +4411,13 @@ def read_discriminator_baselines(output_root):
     with open(data_path, newline="") as handle:
         rows = list(csv.DictReader(handle))
     for row in rows:
-        for field in ("x", "score", "stderr", "ep_train"):
+        for field in ("x", "score", "score_lower", "score_upper", "stderr", "ep_train"):
+            if field not in row or row[field] == "":
+                continue
             row[field] = float(row[field])
         row["n_samples"] = int(float(row["n_samples"]))
+        if row.get("ep_n_samples", "") != "":
+            row["ep_n_samples"] = int(float(row["ep_n_samples"]))
         row["is_era5_test_null"] = str(row["is_era5_test_null"]).lower() == "true"
     return rows
 
@@ -4341,17 +4449,27 @@ def plot_discriminator_baselines(rows, cfg, output_root):
                             if visual_corruption_scale else [row["x"] for row in series])
                 label = (corruption_range_label(target, series, "x")
                          if visual_corruption_scale else target)
-                axis.errorbar(x_values, [row["score"] for row in series],
-                              yerr=[row["stderr"] for row in series], marker=series_marker(target_index),
-                              color=color, label=label)
+                axis.plot(x_values, [row["score"] for row in series],
+                          marker=series_marker(target_index), color=color, label=label)
+                if series and "score_lower" in series[0]:
+                    axis.fill_between(x_values, [row["score_lower"] for row in series],
+                                      [row["score_upper"] for row in series],
+                                      color=color, alpha=0.18, linewidth=0)
                 null = next(row for row in target_rows if row["is_era5_test_null"])
-                axis.scatter([0], [null["score"]], marker="D", color=color, zorder=4)
-            input_label = "four fields" if architecture.startswith("sfno_") else "T2M"
+                if "score_lower" in null:
+                    axis.errorbar([0], [null["score"]],
+                                  yerr=[[null["score"] - null["score_lower"]],
+                                        [null["score_upper"] - null["score"]]],
+                                  marker="D", linestyle="None", color=color, capsize=3, zorder=4)
+                else:
+                    axis.scatter([0], [null["score"]], marker="D", color=color, zorder=4)
+            input_count = len(str(architecture_rows[0].get("input_variables", "")).split(","))
+            input_label = "four fields" if input_count == 4 else architecture_rows[0].get("input_variables", "field")
             comparison_label = "Lead Time" if kind == "forecast" else "Corruption Strength"
             axis.set(
                 xlabel=xlabel, ylabel="Reverse-KL critic score",
                 title=(f"Reverse-KL Critic vs {comparison_label}: {architecture} ({input_label})\n"
-                       "Diamond at zero: ERA5 second-half null"),
+                       "Diamond at zero: ERA5 test-vs-train null"),
             )
             if visual_corruption_scale:
                 axis.set_xlim(0.0, 1.0)
@@ -4392,16 +4510,19 @@ def evaluate_standard_metrics(cfg):
         max_samples = int(baseline_get(cfg, "eval_samples", cfg_get(cfg, "max_samples", 100)))
         train_indices = sample_time_indices(model_train, max_samples)
         null_indices = sample_time_indices(model_null, max_samples)
+        if active_schedule(cfg) is not None and len(train_indices) > len(null_indices):
+            keep = np.linspace(0, len(train_indices) - 1, len(null_indices), dtype=int)
+            train_indices = [train_indices[int(position)] for position in keep]
         null_stats = streaming_reference_stats(cfg, model_train, variables, train_indices)
         train_features = streaming_joint_features(
             cfg, model_train, variables, null_stats, train_indices, metric_names,
             Path(temporary_dir) / "model-train-null-scwd.dat",
-            description="ERA5 days 1–15 model-range reference",
+            description="ERA5 training complement model-range reference",
         )
         null_features = streaming_joint_features(
             cfg, model_null, variables, null_stats, null_indices, metric_names,
             Path(temporary_dir) / "model-second-half-null-scwd.dat",
-            description="ERA5 days 16–end model-range null",
+            description="ERA5 model-range test null",
         )
         null_row = evaluate_era5_train_shift_metrics(
             null_features, train_features, variables, metric_names, cfg
@@ -4449,15 +4570,21 @@ def evaluate_standard_metrics(cfg):
     write_metric_csv(
         corruption_rows, metric_names, corruption_path, "corruption_strength"
     )
-    write_scwd_anchor_diagnostics(
-        null_scwd_diagnostics + scwd_diagnostics + corruption_scwd_diagnostics, output_root
-    )
-    write_global_mean_wasserstein_diagnostics(global_mean_diagnostics, variables, output_root)
-    evaluate_corruption_disturbances(
-        cfg, real_ds, corruption_reference_stats, variables, output_root
-    )
+    schedule = active_schedule(cfg)
+    retain_diagnostics = schedule is None or schedule.ordinal == 4
+    if retain_diagnostics:
+        write_scwd_anchor_diagnostics(
+            null_scwd_diagnostics + scwd_diagnostics + corruption_scwd_diagnostics, output_root
+        )
+        write_global_mean_wasserstein_diagnostics(global_mean_diagnostics, variables, output_root)
+        evaluate_corruption_disturbances(
+            cfg, real_ds, corruption_reference_stats, variables, output_root
+        )
+    split_manifest_path = write_split_membership(cfg, real_ds, output_root)
     real_ds.close()
     paths = [output_root / "resolved_config.yaml", lead_path, corruption_path]
+    if split_manifest_path is not None:
+        paths.append(split_manifest_path)
     paths += [
         path for path in (
             output_root / "data" / "scwd_anchor_contributions.nc",
@@ -4479,11 +4606,21 @@ def evaluate_discriminator_metrics(cfg):
         raise ValueError(f"Variables missing from ERA5/reference data: {missing}")
     output_root.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(config=cfg, f=output_root / "resolved_config.yaml", resolve=True)
-    discriminator_rows = discriminator_baseline_rows(cfg, real_ds, variables, output_root)
+    discriminator_rows, term_rows = discriminator_baseline_rows(cfg, real_ds, variables, output_root)
+    schedule = active_schedule(cfg)
+    resample_id = schedule.resample_id if schedule is not None else "single"
+    for row in discriminator_rows:
+        row["resample_id"] = resample_id
+    for row in term_rows:
+        row["resample_id"] = resample_id
     write_discriminator_baselines(discriminator_rows, cfg, output_root)
+    terms_path = output_root / "data" / "discriminator_terms.csv.gz"
+    if term_rows:
+        write_csv_gz(terms_path, term_rows)
+    split_manifest_path = write_split_membership(cfg, real_ds, output_root)
     real_ds.close()
     data_path = output_root / "data" / "discriminator_reverse_kl.csv"
-    return [output_root / "resolved_config.yaml"] + ([data_path] if data_path.is_file() else [])
+    return [output_root / "resolved_config.yaml"] + ([data_path] if data_path.is_file() else []) + ([terms_path] if terms_path.is_file() else []) + ([split_manifest_path] if split_manifest_path is not None else [])
 
 
 def evaluate_standard_metric_baselines(cfg):
@@ -4514,7 +4651,8 @@ def plot_saved_standard_metric_baselines(cfg):
     plot_normalized_corruption_metrics_by_type(corruption_rows, metric_names, variables, output_root)
     plot_corruption_disturbances(output_root)
     plot_scwd_anchor_diagnostics(scwd_diagnostics, output_root)
-    plot_scwd_top_wasserstein_distributions(scwd_diagnostics, cfg, output_root)
+    if bool((cfg.get("plotting", {}) or {}).get("scwd_response_histograms", False)):
+        plot_scwd_top_wasserstein_distributions(scwd_diagnostics, cfg, output_root)
     plot_scwd_mean_response_differences(scwd_diagnostics, output_root)
     plot_global_mean_wasserstein_distributions(global_mean_diagnostics, output_root)
     plot_discriminator_baselines(discriminator_rows, cfg, output_root)

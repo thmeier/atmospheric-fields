@@ -200,10 +200,13 @@ srun -A pmlr -t 00:10 python scripts/plot_logits_vs_corruption_kfold.py
 ### Standard Metric Baselines
 
 The tracked baseline pipeline compares unpaired forecast or corrupted-field
-distributions with ERA5. Its canonical recurring split uses days 1–15 of every
-month for training, days 20–26 for testing, and days 16–31 for the separate ERA5
-null comparison. Forecast membership is determined by valid time, and every
-forecast must have an exact ERA5 match; there is no nearest-time fallback.
+distributions with ERA5. Temporal resampling is enabled by default. Learned
+metrics train five independent critics with seven-day test windows on days
+5–11, 9–15, 13–19, 17–23, and 20–26 of every month. Four complete days on each
+side of a test window are excluded from that fold's training data. Fixed metrics
+reuse those folds and add 45 deterministic within-month seven-day schedules.
+Forecast membership is determined by valid time, and every forecast must have
+an exact ERA5 match; there is no nearest-time fallback.
 Forecast evaluation is restricted to the shared configured 2020 coverage.
 Corruption evaluation uses ERA5 from 2004–2022 and an evenly spaced cap of 1,000
 test samples by default.
@@ -239,9 +242,11 @@ Metric extraction is streamed. Full-sample mean, variance, spectra, and global
 means are accumulated without retaining all fields. Pairwise field energy and
 MMD use 256 evenly spaced samples, sliced metrics retain 4,096 total spatial
 coordinates and 64 projections, and multi-field SCWD uses 256 samples. CSV
-outputs record both `n_samples` and `pairwise_n_samples`. Bootstrap uncertainty
-is disabled on the standard curves; reported values are point estimates. The
-optional bootstrap-null workflow instead resamples disjoint ERA5 partitions to estimate a
+outputs record both `n_samples` and `pairwise_n_samples`. Standard curves show
+the mean and 5th–95th percentiles over 50 temporal resamples. Learned curves show
+the mean and full min–max envelope over five independently trained critics. No
+within-test bootstrap is applied. The optional legacy bootstrap-null workflow
+instead resamples disjoint ERA5 partitions to estimate a
 null distribution and its configured upper-quantile detection threshold. Run it
 separately with:
 
@@ -263,9 +268,11 @@ Every invocation writes to an immutable directory:
 results/baselines/monthly_valid_time_2020/surface/pipeline_runs/<pipeline-id>/
 ├── resolved_config.yaml
 ├── manifest.json
+├── resamples/
+│   ├── learned/<pipeline-id>--learned_XX/
+│   └── fixed/<pipeline-id>--fixed_XXX/
 └── <variable-tag>/
     ├── data/
-    ├── models/target_discriminators/
     └── plots/
         └── paper/
 ```
@@ -273,6 +280,26 @@ results/baselines/monthly_valid_time_2020/surface/pipeline_runs/<pipeline-id>/
 Every figure is accompanied by an NPZ data bundle and a title-less variant.
 Dashboard mode saves PNG/NPZ by default; paper mode additionally saves PDF,
 uses manuscript-scale typography, and places outputs under `plots/paper/`.
+SCWD anchor-response histograms are disabled by default; enable them with
+`plotting.scwd_response_histograms=true`. Anchor maps and mean-response maps are
+still generated.
+
+The parent `data/` directory retains `metric_draws.csv`, the learned and fixed
+draw tables, `split_manifest.csv.gz`, and raw `discriminator_terms.csv.gz`.
+These are uploaded as W&B evaluation artifacts. Every reverse-KL draw is checked
+against the raw saved training and candidate terms before aggregation. For
+example, count a model's null draws above its mean 12-hour score with:
+
+```bash
+python scripts/analyze_temporal_resamples.py \
+  <run>/<variable-tag>/data/discriminator_metric_draws.csv \
+  --architecture squeezenet --target GraphCast --coordinate 12
+```
+
+Set `temporal_resampling.enabled=false` for the original single-split debugging
+workflow. Evaluation-only temporal runs accept
+`temporal_resampling.input_run_dir=<prior-pipeline-run>` and resolve the matching
+checkpoint separately for every learned fold.
 Evaluation CSV/NetCDF artifacts and PNG/PDF/NPZ plot bundles are uploaded to W&B
 when the corresponding pipeline upload switches are enabled.
 
@@ -702,9 +729,9 @@ A small end-to-end check is available as:
 sbatch scripts/submit_nosfno_pipeline_smoke_test.sh
 ```
 
-It uses one epoch, 32 train/evaluation samples, Gaussian blur and field splice,
-and the two inexpensive moment metrics, while still traversing every pipeline
-stage and exercising online W&B uploads and paper bundle generation.
+It uses two learned folds, three fixed resamples, one epoch, 32 train/evaluation
+samples, GraphCast, Gaussian blur and field splice, and the two inexpensive moment metrics, while still traversing every pipeline
+stage and exercising online W&B uploads and aggregate plotting.
 
 For interactive or selective execution:
 

@@ -7,6 +7,9 @@ defaults:
 plotting:
   save_pdf: false
   profile: dashboard
+  # Dense per-anchor SCWD response histograms are expensive and rarely needed.
+  # Anchor maps and mean-response-difference maps remain enabled.
+  scwd_response_histograms: false
   paper:
     # Replace this after reading TEXTWIDTH from the final neurips_2026 compile.
     text_width_inches: 5.5
