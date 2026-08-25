@@ -81,6 +81,22 @@ $P eval/eval_real_vs_forecast.py --model mae --local
 $P eval/visualize_corruptions.py
 ```
 
+## SWIFT/UCast conversion
+
+Convert a SWIFT forecast Zarr store into the initialization-time NetCDF layout
+used by the discriminator pipeline while selecting one ensemble member:
+
+```bash
+python scripts/convert_swift_zarr_to_netcdf.py \
+  /cluster/courses/pmlr/teams/team07/data/swift_all2020_1memb.zarr \
+  /cluster/courses/pmlr/teams/team07/data/ucast2020_members/ucast-m0_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc \
+  --member 0 --lead-hours 6 12 24 48 96 192
+```
+
+The converter preserves initialization times, removes stale Zarr-only metadata,
+selects rather than averages the requested member, and writes through a temporary
+file so a failed conversion does not leave a partial destination.
+
 ## Cluster jobs
 
 ```bash
