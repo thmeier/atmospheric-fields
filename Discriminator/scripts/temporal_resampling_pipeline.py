@@ -106,8 +106,19 @@ def _child_cfg(cfg, schedule, stages, checkpoint=None, resume=False):
     return child
 
 
+def canonical_schedule(schedules):
+    """The fold whose checkpoints and training figures the parent adopts."""
+    return schedules[min(4, len(schedules) - 1)]
+
+
 def _child_configs(cfg, schedules, stages, *, require_checkpoints=False):
     """Build one child configuration per schedule, resolving checkpoints first."""
+    # Integrated-gradients attribution is the single most expensive part of
+    # training -- 32 forward/backward passes per case -- and only the canonical
+    # fold's galleries are ever copied up to the parent. Computing it in the
+    # other four folds costs hours and produces nothing anyone reads.
+    attribution_scope = str(settings(cfg).get("interpretability_folds", "canonical"))
+    keep_attribution = canonical_schedule(schedules).resample_id if schedules else None
     children = []
     for schedule in schedules:
         checkpoint = None
@@ -123,7 +134,12 @@ def _child_configs(cfg, schedules, stages, *, require_checkpoints=False):
         if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
             if "fit_histogram_matching" not in child_stages:
                 child_stages.insert(0, "fit_histogram_matching")
-        children.append(_child_cfg(cfg, schedule, child_stages, checkpoint=checkpoint, resume=resume))
+        child = _child_cfg(cfg, schedule, child_stages, checkpoint=checkpoint, resume=resume)
+        if (attribution_scope == "canonical" and schedule.resample_id != keep_attribution
+                and "train_discriminators" in child_stages):
+            OmegaConf.update(child, "target_discriminator.interpretability.enabled", False,
+                             merge=False)
+        children.append(child)
     return children
 
 
@@ -151,6 +167,20 @@ def _run_child(payload):
     return execute_pipeline(OmegaConf.create(container))
 
 
+def completed_stages(run_dir):
+    """Stages a previous invocation of this child recorded as completed."""
+    manifest = Path(run_dir) / "manifest.json"
+    if not manifest.is_file():
+        return set(), None
+    try:
+        payload = json.loads(manifest.read_text())
+    except (json.JSONDecodeError, OSError):
+        return set(), None
+    done = {record.get("stage") for record in payload.get("stages", [])
+            if record.get("status") == "completed"}
+    return done, payload
+
+
 def _execute_children(cfg, schedules, stages, *, require_checkpoints=False, parallel=False):
     """Run every child pipeline, optionally across a process pool.
 
@@ -158,13 +188,35 @@ def _execute_children(cfg, schedules, stages, *, require_checkpoints=False, para
     stays sequential because the children share one GPU.
     """
     children = _child_configs(cfg, schedules, stages, require_checkpoints=require_checkpoints)
+
+    # A 24h walltime is shorter than this stage can be, and without skipping,
+    # resuming would recompute all fifty resamples from scratch. Children that
+    # already recorded every requested stage as completed are reused as-is.
+    done_manifests = {}
+    if bool(cfg.pipeline.get("resume", False)):
+        pending = []
+        for schedule, child in zip(schedules, children):
+            finished, payload = completed_stages(_child_run_dir(cfg, schedule))
+            if payload is not None and set(stages) <= finished:
+                done_manifests[schedule.resample_id] = payload
+            else:
+                pending.append((schedule, child))
+        if done_manifests:
+            print(f"Resuming: {len(done_manifests)} of {len(children)} resamples already "
+                  f"completed {list(stages)}; running {len(pending)}.")
+        schedules = [schedule for schedule, _ in pending]
+        children = [child for _, child in pending]
+        if not children:
+            return [done_manifests[key] for key in sorted(done_manifests)]
+
     workers = worker_count(cfg, schedules) if parallel else 1
     if workers <= 1:
         try:
             from .run_baseline_pipeline import execute_pipeline
         except ImportError:
             from run_baseline_pipeline import execute_pipeline
-        return [execute_pipeline(child) for child in children]
+        fresh = [execute_pipeline(child) for child in children]
+        return [done_manifests[key] for key in sorted(done_manifests)] + fresh
 
     available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     thread_limit = max(1, available // workers)
@@ -185,7 +237,7 @@ def _execute_children(cfg, schedules, stages, *, require_checkpoints=False, para
             manifests[index] = future.result()
             print(f"  finished {children[index].pipeline.id} "
                   f"({sum(item is not None for item in manifests)}/{len(payloads)})")
-    return manifests
+    return [done_manifests[key] for key in sorted(done_manifests)] + manifests
 
 
 def _validate_counts(rows, group_fields, count_fields):

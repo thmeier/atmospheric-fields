@@ -34,6 +34,11 @@ temporal_resampling:
   # Give each pooled child its own W&B run. Off by default: 50 concurrent runs
   # add no signal over the parent aggregate, which uploads every draw anyway.
   child_wandb: false
+  # Which learned folds compute integrated-gradients attribution during training.
+  # "canonical" restricts it to the fold the parent actually copies galleries
+  # from; it is the most expensive part of training and the other folds' output
+  # is discarded. "all" restores per-fold attribution.
+  interpretability_folds: canonical
 
 # ERA5/reference file used for training real samples.
 real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"
