@@ -296,6 +296,73 @@ python scripts/analyze_temporal_resamples.py \
   --architecture squeezenet --target GraphCast --coordinate 12
 ```
 
+### Paper deliverables over the resampling protocol
+
+`scripts/submit_paper_temporal_pipeline.sh` runs the complete no-SFNO workflow
+against the nine published corruptions and writes, under
+`<run>/<variable-tag>/plots/`:
+
+| Figure | Path |
+|---|---|
+| Normalized metrics vs corruption severity | `corruption_by_type_normalized.png` |
+| Reverse-KL critic vs corruption strength | `discriminator/squeezenet/corruption_strength_reverse_kl.png` |
+| Reverse-KL critic vs lead time | `discriminator/squeezenet/lead_time_reverse_kl.png` |
+| Real-vs-fake logits per lead time | `target_logit_distributions/squeezenet/forecast/<model>/all_lead_times.png` |
+
+The logit distributions and attribution galleries are written per learned fold
+by the training stage; the plot stage copies the canonical fold's copies up to
+the parent run so every deliverable shares one fold identity.
+
+The blind-spot N/M table is rendered afterwards, from the same draws that band
+the curves:
+
+```bash
+python scripts/blindspots_from_temporal_draws.py \
+  <run>/<variable-tag>/data/fixed_metric_draws.csv --output-dir <run>/blindspots
+python scripts/plot_bootstrap_blindspots.py "+bootstrap_null.data_dir=<run>/blindspots"
+```
+
+`blindspots_from_temporal_draws.py` only reshapes. Each fixed resample supplies
+one null score -- its test window against its buffered training complement --
+and one score per corruption and severity; N compares the maximum-severity mean
+against the p95 of those null draws and M checks the ladder is non-decreasing.
+That is the same null the figure plots, so figure and table cannot disagree.
+The trade against `evaluate_bootstrap_null.py`'s 200-replicate sweep is
+resolution: p95 of 50 draws rests on its top few order statistics, and the two
+schemes estimate different quantities. Both write the same file schema, so
+either can drive the renderer.
+
+### Changing error bars and styling without re-running
+
+Every band is recoverable after the fact:
+
+* `data/fixed_metric_draws.csv` and `data/discriminator_metric_draws.csv` keep
+  one row per resample, metric and point. `data/metric_draws.csv` concatenates
+  them. Any interval -- p05-p95, IQR, +/-1 sd, min-max -- can be recomputed
+  from these; the shipped aggregates are the mean with p05-p95 (fixed) and
+  min-max (learned).
+* Every figure ships an NPZ bundle beside it. The blind-spot bundle also
+  carries `input_curve_scores` (corruption x severity x replicate x metric) and
+  `input_null_draws` (replicate x metric), so that figure can be re-banded from
+  the NPZ alone.
+* `scripts/render_npz_paper_plots.py` re-renders from bundles for styling
+  changes.
+
+### Parallelism and reproducibility
+
+`temporal_resampling.workers` spreads the fixed resamples over a process pool
+(`-1` uses every visible CPU; `1` restores the sequential path). Only that stage
+is pooled -- discriminator training stays sequential because the folds share one
+GPU. Request CPUs explicitly when submitting: the account otherwise grants two.
+
+Each worker is pinned to `cpus / workers` BLAS threads. That pinning is what
+makes runs reproducible rather than the pooling: `mean_bias` and
+`global_mean_wasserstein` are bit-identical regardless, but `mmd_rbf` moves by
+up to 2e-3 relative when the BLAS thread count changes, because its bandwidth is
+a median heuristic over the reference. Two pooled runs at the same worker count
+agree exactly, and a sequential run pinned to the same thread count reproduces
+them exactly.
+
 Set `temporal_resampling.enabled=false` for the original single-split debugging
 workflow. Evaluation-only temporal runs accept
 `temporal_resampling.input_run_dir=<prior-pipeline-run>` and resolve the matching

@@ -27,6 +27,13 @@ temporal_resampling:
   seed: 0
   active_schedule: null
   input_run_dir: null
+  # Process pool for the CPU-bound fixed-resample stage. 1 keeps the original
+  # sequential behaviour; -1 uses every visible CPU. Discriminator training is
+  # never pooled because the children share one GPU.
+  workers: 1
+  # Give each pooled child its own W&B run. Off by default: 50 concurrent runs
+  # add no signal over the parent aggregate, which uploads every draw anyway.
+  child_wandb: false
 
 # ERA5/reference file used for training real samples.
 real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"

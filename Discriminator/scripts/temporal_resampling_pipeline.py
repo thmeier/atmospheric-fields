@@ -5,7 +5,10 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import multiprocessing
+import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -103,12 +106,9 @@ def _child_cfg(cfg, schedule, stages, checkpoint=None, resume=False):
     return child
 
 
-def _execute_children(cfg, schedules, stages, *, require_checkpoints=False):
-    try:
-        from .run_baseline_pipeline import execute_pipeline
-    except ImportError:
-        from run_baseline_pipeline import execute_pipeline
-    manifests = []
+def _child_configs(cfg, schedules, stages, *, require_checkpoints=False):
+    """Build one child configuration per schedule, resolving checkpoints first."""
+    children = []
     for schedule in schedules:
         checkpoint = None
         resume = bool(cfg.pipeline.get("resume", False))
@@ -123,8 +123,68 @@ def _execute_children(cfg, schedules, stages, *, require_checkpoints=False):
         if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
             if "fit_histogram_matching" not in child_stages:
                 child_stages.insert(0, "fit_histogram_matching")
-        child = _child_cfg(cfg, schedule, child_stages, checkpoint=checkpoint, resume=resume)
-        manifests.append(execute_pipeline(child))
+        children.append(_child_cfg(cfg, schedule, child_stages, checkpoint=checkpoint, resume=resume))
+    return children
+
+
+def worker_count(cfg, schedules):
+    """Resolve the requested pool size, never exceeding the work available."""
+    requested = int(settings(cfg).get("workers", 1) or 1)
+    if requested < 0:
+        requested = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(1, min(requested, len(schedules)))
+
+
+def _run_child(payload):
+    """Execute one child pipeline in this process. Must stay module level to pickle."""
+    container, thread_limit = payload
+    for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                     "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[variable] = str(thread_limit)
+    try:
+        from .run_baseline_pipeline import execute_pipeline
+    except ImportError:
+        from run_baseline_pipeline import execute_pipeline
+    import torch
+
+    torch.set_num_threads(thread_limit)
+    return execute_pipeline(OmegaConf.create(container))
+
+
+def _execute_children(cfg, schedules, stages, *, require_checkpoints=False, parallel=False):
+    """Run every child pipeline, optionally across a process pool.
+
+    Only the CPU-bound fixed-resample stage is pooled. Discriminator training
+    stays sequential because the children share one GPU.
+    """
+    children = _child_configs(cfg, schedules, stages, require_checkpoints=require_checkpoints)
+    workers = worker_count(cfg, schedules) if parallel else 1
+    if workers <= 1:
+        try:
+            from .run_baseline_pipeline import execute_pipeline
+        except ImportError:
+            from run_baseline_pipeline import execute_pipeline
+        return [execute_pipeline(child) for child in children]
+
+    available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    thread_limit = max(1, available // workers)
+    if not bool(settings(cfg).get("child_wandb", False)):
+        # 50 concurrent child runs add no signal over the parent aggregate run
+        # and serialize on the W&B client. The parent still uploads every draw.
+        for child in children:
+            OmegaConf.update(child, "pipeline.wandb.enabled", False, merge=False)
+    payloads = [(OmegaConf.to_container(child, resolve=False), thread_limit) for child in children]
+    print(f"Running {len(children)} temporal resamples across {workers} processes "
+          f"({thread_limit} thread(s) each).")
+    manifests = [None] * len(payloads)
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+        futures = {pool.submit(_run_child, payload): index for index, payload in enumerate(payloads)}
+        for future in as_completed(futures):
+            index = futures[future]
+            manifests[index] = future.result()
+            print(f"  finished {children[index].pipeline.id} "
+                  f"({sum(item is not None for item in manifests)}/{len(payloads)})")
     return manifests
 
 
@@ -276,6 +336,36 @@ def aggregate_all_draws(cfg):
     return draw_path
 
 
+# Written per learned fold by the training stage rather than by the parent plot
+# stage, so without this the held-out logit histograms and attribution
+# galleries live only inside one child directory.
+CANONICAL_PLOT_DIRS = ("target_logit_distributions", "target_interpretability")
+
+
+def copy_canonical_training_plots(cfg, canonical):
+    """Lift the canonical fold's training figures into the parent run.
+
+    The parent already adopts that fold's checkpoints for the discriminator
+    figures; copying the matching plots keeps every deliverable in one place
+    and keeps the fold identity consistent across them.
+    """
+    source_root = _child_output_root(cfg, canonical) / "plots"
+    target_root = _parent_output_root(cfg) / "plots"
+    copied = []
+    for name in CANONICAL_PLOT_DIRS:
+        source = source_root / name
+        if not source.is_dir():
+            continue
+        target = target_root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target, dirs_exist_ok=True)
+        copied.append(target)
+    if copied:
+        print(f"Copied {canonical.resample_id} training plots to "
+              f"{', '.join(str(path) for path in copied)}")
+    return copied
+
+
 def run_resampled_stage(stage, cfg, tracker, output_root, resolved_path):
     """Run one parent stage over its required schedules."""
     learned = learned_schedules(cfg)
@@ -294,6 +384,7 @@ def run_resampled_stage(stage, cfg, tracker, output_root, resolved_path):
             target_maps = Path(str(cfg.baseline.output_dir)) / "data" / "histogram_matching"
             if source_maps.is_dir():
                 shutil.copytree(source_maps, target_maps, dirs_exist_ok=True)
+        copy_canonical_training_plots(cfg, canonical)
         return None
     if stage == "fit_histogram_matching":
         # Fitting is performed inside each consuming child so maps are train-fold specific.
@@ -302,7 +393,7 @@ def run_resampled_stage(stage, cfg, tracker, output_root, resolved_path):
         manifests = _execute_children(cfg, learned, ["train_discriminators"])
         return [m["manifest_path"] for m in manifests], manifests
     if stage == "evaluate_standard_metrics":
-        manifests = _execute_children(cfg, fixed, ["evaluate_standard_metrics"])
+        manifests = _execute_children(cfg, fixed, ["evaluate_standard_metrics"], parallel=True)
         paths = aggregate_standard(cfg, fixed); draw_path = aggregate_all_draws(cfg)
         if draw_path is not None:
             paths.append(draw_path)
