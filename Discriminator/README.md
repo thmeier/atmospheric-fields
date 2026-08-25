@@ -353,7 +353,15 @@ Every band is recoverable after the fact:
 `temporal_resampling.workers` spreads the fixed resamples over a process pool
 (`-1` uses every visible CPU; `1` restores the sequential path). Only that stage
 is pooled -- discriminator training stays sequential because the folds share one
-GPU. Request CPUs explicitly when submitting: the account otherwise grants two.
+GPU.
+
+On the student cluster the pool is limited to **three workers**, and there is no
+way to ask for more. Every per-task and per-node CPU request form is rejected
+(`--cpus-per-task`, `-c`, `--cpus-per-gpu`, `--gres` all error with
+`Specifying TRES per task is not allowed` or the `--gres` equivalent), and the
+site clamps each job to one GPU and three CPUs regardless: a job submitted with
+`--gpus=8 --constraint=2080ti` still allocates `cpu=3,gres/gpu=1`. Set `workers`
+from `nproc`, not from an intended allocation.
 
 Each worker is pinned to `cpus / workers` BLAS threads. That pinning is what
 makes runs reproducible rather than the pooling: `mean_bias` and

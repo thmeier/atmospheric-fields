@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=paper-temporal
 #SBATCH --account=pmlr_jobs
-#SBATCH --partition=jobs
-#SBATCH --time=3-00:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gpus=1
 #SBATCH --constraint=2080ti
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=200G
+#SBATCH --mem=64G
 #SBATCH --output=slurm_paper_temporal_%j.out
 #SBATCH --error=slurm_paper_temporal_%j.err
 
@@ -19,12 +17,20 @@
 #   target_logit_distributions/squeezenet/forecast/<model>/all_lead_times.png
 # and, after the follow-up command this script prints, the blind-spot N/M table.
 #
-# Resources: the account otherwise defaults to two CPUs, which would leave the
-# resample pool with nothing to spread over. --constraint=2080ti is chosen over
-# the newer 5060ti deliberately: those nodes are sm_120 and need torch >= 2.7 /
-# cu128, while the pmlr env ships torch 2.5.1+cu121. The 2080ti nodes also carry
-# 36 CPUs against the 5060ti's 28, and this pipeline is CPU-bound in the stage
-# that dominates wall clock.
+# Resources: this site rejects every per-task/per-node CPU request
+# (--cpus-per-task, -c, --cpus-per-gpu, --gres all error out) and clamps each job
+# to one GPU and three CPUs no matter what is asked for -- a job submitted with
+# --gpus=8 still allocates cpu=3,gres/gpu=1. So the resample pool gets three
+# workers, not the dozens a full node would allow, and WORKERS is read from nproc
+# rather than guessed.
+#
+# --constraint=2080ti over the newer 5060ti: those nodes are sm_120 and need
+# torch >= 2.7 / cu128, while the pmlr env ships torch 2.5.1+cu121. Their higher
+# core count is moot given the three-CPU clamp.
+#
+# Walltime is capped at 24h for pmlr_jobs. The pipeline writes a per-stage
+# manifest, so a run that does not finish can be continued with the same
+# PIPELINE_ID and RESUME=true rather than restarted.
 set -euo pipefail
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 if [[ -f "${SUBMIT_DIR}/scripts/run_baseline_pipeline.py" ]]; then
@@ -45,14 +51,19 @@ export DATA_DIR="${DATA_DIR:-/cluster/courses/pmlr/teams/team07/data}"
 cd "${REPO_DIR}"
 
 PIPELINE_ID="${PIPELINE_ID:-paper-temporal-${SLURM_JOB_ID:-local}}"
-# One worker per allocated CPU. Each child is pinned to a single BLAS thread by
-# the pool, which also makes the run bit-reproducible: mmd_rbf shifts by ~2e-3
-# relative when the BLAS thread count changes.
-WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-32}}"
+# One worker per genuinely allocated CPU. SLURM_CPUS_PER_TASK is unset here
+# because the request form is rejected, so nproc is the only honest source.
+# The pool pins each child to cpus/workers BLAS threads, which is also what makes
+# a run reproducible: mmd_rbf shifts by ~2e-3 relative when that count changes.
+WORKERS="${WORKERS:-$(nproc)}"
+STAGES="${STAGES:-[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]}"
+RESUME="${RESUME:-false}"
+echo "pipeline=${PIPELINE_ID} workers=${WORKERS} stages=${STAGES} resume=${RESUME}"
 
 python scripts/run_baseline_pipeline.py \
   "pipeline.id=${PIPELINE_ID}" \
-  "pipeline.stages=[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]" \
+  "pipeline.stages=${STAGES}" \
+  "pipeline.resume=${RESUME}" \
   "temporal_resampling.workers=${WORKERS}" \
   target_discriminator.sfno.enabled=false \
   baseline.discriminator.sfno.enabled=false \
