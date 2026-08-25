@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from Discriminator.scripts.plot_bundles import (
-    all_plot_bundle_paths, configure_plot_bundle_saving, save_figure_bundle,
+    all_plot_bundle_paths, configure_plot_bundle_saving, rasterize_field_artists, save_figure_bundle,
     titleless_plot_path,
 )
 from Discriminator.scripts.render_npz_paper_plots import load_bundle, reconstruct
@@ -167,6 +167,18 @@ class PlotBundleTests(unittest.TestCase):
             finally:
                 archive.close()
 
+
+    def test_rasterizes_dense_field_artists_only_when_requested(self):
+        figure, axis = plt.subplots()
+        mesh = axis.pcolormesh(np.arange(4), np.arange(3), np.arange(6.0).reshape(2, 3))
+        line, = axis.plot([0.0, 1.0], [0.0, 1.0])
+        try:
+            self.assertFalse(mesh.get_rasterized())
+            self.assertEqual(rasterize_field_artists(figure), 1)
+            self.assertTrue(mesh.get_rasterized())
+            self.assertFalse(line.get_rasterized())
+        finally:
+            plt.close(figure)
 
 
 if __name__ == "__main__":

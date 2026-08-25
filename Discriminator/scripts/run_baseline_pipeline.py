@@ -31,6 +31,8 @@ try:
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
     from .fit_histogram_matching import fit_histogram_matching_maps
+    from .evaluate_bootstrap_null import bootstrap_null_output_dir, evaluate_bootstrap_null
+    from .plot_bootstrap_blindspots import plot_bootstrap_blindspots
 except ImportError:
     from baseline_pipeline_tracking import PipelineTracker, safe_name
     from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg
@@ -51,6 +53,8 @@ except ImportError:
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
     from fit_histogram_matching import fit_histogram_matching_maps
+    from evaluate_bootstrap_null import bootstrap_null_output_dir, evaluate_bootstrap_null
+    from plot_bootstrap_blindspots import plot_bootstrap_blindspots
 
 
 STAGES = (
@@ -59,8 +63,10 @@ STAGES = (
     "evaluate_standard_metrics",
     "evaluate_discriminator_metrics",
     "evaluate_mmd_global_moment_matching",
+    "evaluate_bootstrap_null",
     "plot",
     "plot_mmd_global_moment_matching",
+    "plot_bootstrap_blindspots",
 )
 
 
@@ -259,6 +265,61 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
                     metadata={"pipeline_id": tracker.group},
                 )
             return [str(path) for path in bundle_paths], [{"run_url": getattr(run, "url", None)}]
+
+    if stage == "evaluate_bootstrap_null":
+        require_files([cfg.real_nc_file], stage)
+        with tracker.run("evaluation/bootstrap-null", "bootstrap-null-evaluation", cfg,
+                         tags=["evaluation", "bootstrap-null", "blindspots"]) as run:
+            paths = evaluate_bootstrap_null(cfg)
+            data_root = bootstrap_null_output_dir(cfg, variables_from_config(cfg)) / "data"
+            for filename, key in (
+                ("bootstrap_null_draws.csv", "metrics/bootstrap_null_draws"),
+                ("bootstrap_curves.csv", "metrics/bootstrap_curves"),
+                ("bootstrap_null_verdicts.csv", "metrics/bootstrap_null_verdicts"),
+            ):
+                path = data_root / filename
+                tracker.log_csv_table(run, key, path)
+                if path.is_file():
+                    run.summary[f"{key}_rows"] = csv_row_count(path)
+            summary_path = data_root / "bootstrap_null_summary.json"
+            if summary_path.is_file():
+                summary = json.loads(summary_path.read_text())
+                for name, value in summary["thresholds"].items():
+                    run.summary[f"bootstrap_null/threshold/{name}"] = value
+                    run.summary[f"bootstrap_null/shipped/{name}"] = summary["shipped_single_null"][name]
+                run.summary["bootstrap_null/replicates"] = summary["replicates"]
+                run.summary["bootstrap_null/curve_replicates"] = summary["curve_replicates"]
+            if upload_data:
+                tracker.log_artifact(
+                    run, "bootstrap-null-evaluation", "evaluation", [*paths, resolved_path],
+                    metadata={"pipeline_id": tracker.group},
+                )
+            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
+
+    if stage == "plot_bootstrap_blindspots":
+        data_root = bootstrap_null_output_dir(cfg, variables_from_config(cfg)) / "data"
+        require_files([data_root / "bootstrap_curves.csv", data_root / "bootstrap_null_draws.csv",
+                       data_root / "bootstrap_null_verdicts.csv",
+                       data_root / "bootstrap_null_summary.json"], stage)
+        with tracker.run("plotting/bootstrap-blindspots", "bootstrap-blindspot-plots", cfg,
+                         tags=["plotting", "bootstrap-null", "blindspots"]) as run:
+            paths = plot_bootstrap_blindspots(cfg)
+            bundle_paths = plot_bundle_members(paths)
+            table_paths = [
+                data_root / name for name in
+                ("blindspot_table.tex", "null_exceedance_table.tex", "null_exceedance.csv")
+            ]
+            tracker.log_images(run, paths, data_root.parent / "plots")
+            tracker.log_csv_table(run, "metrics/null_exceedance", data_root / "null_exceedance.csv")
+            if bool(cfg.pipeline.wandb.get("upload_plots", True)):
+                tracker.log_artifact(
+                    run, "bootstrap-blindspot-plots", "plots",
+                    [*bundle_paths, *table_paths, resolved_path],
+                    metadata={"pipeline_id": tracker.group},
+                )
+            return [str(path) for path in [*bundle_paths, *table_paths]], [
+                {"run_url": getattr(run, "url", None)}
+            ]
 
     if stage == "evaluate_discriminator_metrics":
         require_files([cfg.real_nc_file], stage)

@@ -176,3 +176,18 @@ baseline:
     plot_yscale: linear
     plot_linthresh: 1e-2
     forecast_files: ${baseline.forecast_files}
+
+# Resampled null for the corruption blind-spot table. The sweep's own null is a
+# single draw; these settings control the distribution that replaces it.
+bootstrap_null:
+  replicates: 200
+  pool_samples: 3000
+  threshold_quantile: 0.95
+  seed: 0
+  # Severity-ladder curves: how many paired resamples per point, and how large a
+  # test pool to draw those subsets from. The pool must exceed
+  # baseline.corruption_eval_samples for the subsets to differ at all.
+  curve_replicates: 50
+  curve_pool_samples: 2000
+  # scwd and scwd_area_weighted share their expensive transport-cost computation.
+  scwd_dedup: true

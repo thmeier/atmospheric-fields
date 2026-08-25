@@ -245,6 +245,20 @@ def without_suptitle(figure):
             supertitle.set_text(supertitle_text)
 
 
+def rasterize_field_artists(figure):
+    """Rasterize dense field artists in PDF while retaining vector annotations."""
+    from matplotlib.collections import Collection
+    from matplotlib.image import AxesImage
+
+    count = 0
+    for axis in figure.get_axes():
+        for artist in list(axis.collections) + list(axis.images):
+            if isinstance(artist, (Collection, AxesImage)) and not artist.get_rasterized():
+                artist.set_rasterized(True)
+                count += 1
+    return count
+
+
 def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, dpi,
                             bbox_inches, capture_artists=True, save_pdf=False):
     png_path, pdf_path, npz_path = plot_bundle_paths(png_path)
@@ -254,6 +268,7 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
         save_kwargs["bbox_inches"] = bbox_inches
     figure.savefig(png_path, **save_kwargs)
     if save_pdf:
+        rasterize_field_artists(figure)
         figure.savefig(pdf_path, dpi=int(dpi), bbox_inches=bbox_inches)
 
     arrays, axes = _artist_arrays(figure) if capture_artists else ({}, [])

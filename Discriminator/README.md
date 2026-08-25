@@ -240,7 +240,15 @@ means are accumulated without retaining all fields. Pairwise field energy and
 MMD use 256 evenly spaced samples, sliced metrics retain 4,096 total spatial
 coordinates and 64 projections, and multi-field SCWD uses 256 samples. CSV
 outputs record both `n_samples` and `pairwise_n_samples`. Bootstrap uncertainty
-is disabled; reported values are point estimates.
+is disabled on the standard curves; reported values are point estimates. The
+optional bootstrap-null workflow instead resamples disjoint ERA5 partitions to estimate a
+null distribution and its configured upper-quantile detection threshold. Run it
+separately with:
+
+```bash
+cd /home/yelberkennou/atmospheric-fields/Discriminator
+sbatch scripts/submit_bootstrap_null.sh
+```
 
 Use the tracked pipeline rather than the legacy standalone evaluation wrapper:
 
