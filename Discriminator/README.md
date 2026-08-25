@@ -199,123 +199,74 @@ srun -A pmlr -t 00:10 python scripts/plot_logits_vs_corruption_kfold.py
 
 ### Standard Metric Baselines
 
-The standard baseline compares unpaired forecast or corrupted-field distributions
-against an ERA5 reference distribution. Its canonical protocol is the surface
-temporal-holdout experiment: the ERA5 path, real-data train/test ranges, lead times, and corruption
-severity scale come from `conf/config.yaml`.
-Baseline-only numerical settings live under `baseline` in
-`conf/baseline_config.yaml`. The initial baseline evaluates `2m_temperature`.
+The tracked baseline pipeline compares unpaired forecast or corrupted-field
+distributions with ERA5. Its canonical recurring split uses days 1–15 of every
+month for training, days 20–26 for testing, and days 16–31 for the separate ERA5
+null comparison. Forecast membership is determined by valid time, and every
+forecast must have an exact ERA5 match; there is no nearest-time fallback.
+Forecast evaluation is restricted to the shared configured 2020 coverage.
+Corruption evaluation uses ERA5 from 2004–2022 and an evenly spaced cap of 1,000
+test samples by default.
 
-Evaluate it once with:
+The active baseline configuration is `conf/baseline_config.yaml`. It runs the
+joint four-field T2M/U10/V10/MSL case by default; scalar experiments remain
+available by overriding `baseline.variables` and
+`target_discriminator.variables`. The
+forecast catalog contains GraphCast, Pangu-Weather, FuXi, IFS HRES, ERA5
+Forecast, and one deterministic UCast member; ensemble averaging is not used.
+
+The default corruption suite contains Gaussian blur, high-frequency noise, GRF,
+`pixel_replace`, wind patch shuffling and rotation when U/V are available, a
+2x2-pixel checkerboard, zonal scanlines, `hemisphere_splice`, and
+`field_splice`. The latter independently replaces each complete variable field
+with probability `severity / maximum_severity`, using a distinct deranged ERA5
+donor permutation for every variable. Pixel replacement spans `[0, 0.01]`,
+Gaussian blur spans its native `[0, 1]` scale, and most other corruptions span
+`[0, 0.2]`. Data-dependent splice critics train only against complete
+replacement, while evaluation retains the complete probability curve.
+
+The available metrics include pointwise mean and standard-deviation
+discrepancies, field energy distance, linear and log zonal-spectrum L2, sliced
+Wasserstein/Cramer–Wold variants, RBF MMD, global-mean Wasserstein, and SCWD.
+Mean and standard-deviation discrepancies use ordinary grid-cell moments. The
+joint MMD uses one ERA5-fitted median-heuristic bandwidth per field block within
+a single product RBF kernel. Multi-field global-mean Wasserstein follows a joint
+Vissio-style Ulam discretization, and multi-field SCWD performs exact empirical
+quadratic OT in the field-response space at each anchor. The latter uses an
+evenly spaced 256-sample budget by default; scalar SCWD uses 200 quantiles.
+
+Metric extraction is streamed. Full-sample mean, variance, spectra, and global
+means are accumulated without retaining all fields. Pairwise field energy and
+MMD use 256 evenly spaced samples, sliced metrics retain 4,096 total spatial
+coordinates and 64 projections, and multi-field SCWD uses 256 samples. CSV
+outputs record both `n_samples` and `pairwise_n_samples`. Bootstrap uncertainty
+is disabled; reported values are point estimates.
+
+Use the tracked pipeline rather than the legacy standalone evaluation wrapper:
 
 ```bash
-DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
-srun -A pmlr -t 2-00:00 python scripts/evaluate_standard_metric_baselines.py
+cd /home/yelberkennou/atmospheric-fields/Discriminator
+sbatch scripts/submit_nosfno_paper_pipeline.sh
 ```
 
-Then render or rerender every figure from the saved artifacts with:
-
-```bash
-python scripts/plot_standard_metric_baselines.py
-```
-
-The plotting command does not open ERA5 or forecast files, recompute metrics,
-load discriminator checkpoints, or run inference. This makes cosmetic plot
-iterations cheap. Run evaluation again only when the data, split, model,
-corruption, sampling, or metric settings change.
-
-The canonical split is calendar-recurring. Within every configured month, days
-1–15 form training, days 20–26 form testing, and days 16–31 form the separate
-null comparison. Forecast membership is based on valid time (initialization plus
-lead), and a forecast is used only when ERA5 exists at exactly that timestamp.
-No nearest-time fallback is allowed.
-
-Corruptions use complete years 2004–2022. Their severity-zero row compares the
-clean monthly test set with itself, so it is exactly zero up to numerical error;
-the separate diamond compares ERA5 days 16–31 against days 1–15. Forecasts use
-each model's maximum configured 2018/2020 coverage and are compared with the
-exact matched ERA5 test timestamps at every lead. Metric parameters for ordinary
-forecast and corruption curves are fitted on those matched clean test samples.
-The default surface catalog contains GraphCast, Pangu-Weather, FuXi, IFS HRES,
-and ERA5 Forecast. Only configured `lead_times` are scored.
-
-Similarly, `baseline.corruptions` contains every supported corruption family.
-Corruptions that require a paired U/V wind state are skipped when the baseline
-is configured for the scalar `2m_temperature` field. Corruption probes draw
-an evenly spaced 1,000-sample subset of the full ERA5 record rather than the
-shared 2020 forecast period and compare each corrupted sample against the
-identical clean sample set. Set `baseline.corruption_eval_samples: 0` to use the
-complete record.
-The standard corruption plots also include equatorial checker texture,
-meridional and zonal scanlines, a 2x2-pixel checkerboard, and a hemisphere
-splice. For the four additive patterns, severity is their normalized RMS. For
-the splice, severity 0.2 is a complete southern-hemisphere replacement and
-intermediate severities are the probability that an entire sample's southern
-hemisphere is replaced from a fixed deranged donor. The same seeded uniform and
-pairing are used at every point on the curve, so replacement decisions are
-nested by severity.
-The quadratic field-energy and RBF-MMD calculations use 256 evenly spaced
-timestamps per distribution; CSV outputs report this separately as
-`pairwise_n_samples`, alongside the full `n_samples` count.
-Bootstrap uncertainty is intentionally disabled; outputs contain point estimates
-only.
-
-Feature extraction is streamed. SCWD responses are stored temporarily in
-disk-backed arrays and removed when the run finishes. Set
-`baseline.scratch_dir=/path/to/local/scratch` when the system temporary directory
-does not have several gigabytes of free space.
-
-Results are namespaced by the complete baseline field list:
+Every invocation writes to an immutable directory:
 
 ```text
-results/baselines/common_2020/surface/<variable-tag>/
+results/baselines/monthly_valid_time_2020/surface/pipeline_runs/<pipeline-id>/
 ├── resolved_config.yaml
-├── data/
-│   ├── lead_time.csv
-│   ├── corruption_strength.csv
-│   ├── discriminator_reverse_kl.csv
-│   ├── corruption_disturbances.nc
-│   └── scwd_anchor_contributions.nc
-└── plots/
-    ├── lead_time.png
-    ├── lead_time_by_model_normalized.png
-    ├── corruption_strength.png
-    ├── corruption_by_type_normalized.png
-    ├── corruption/<metric>.png
-    ├── scwd/<model>.png
-    ├── scwd/<model>_mean_response_difference.png
-    └── scwd/top_w1_distributions/<model>_<lead>h.png
+├── manifest.json
+└── <variable-tag>/
+    ├── data/
+    ├── models/target_discriminators/
+    └── plots/
+        └── paper/
 ```
 
-The two normalized converse plots use one subplot per forecast model or
-corruption and one line per metric. Each metric is divided by its largest
-positive value across the complete corresponding figure, including the ERA5
-test-vs-train null points, so its maximum is one. Signed metrics retain their
-negative values; if a metric has no positive value, its largest absolute value
-is used instead.
-
-When `scwd` is enabled, the baseline also saves one shared-colour-scale map
-panel per forecast model. It shows the local spherical-anchor contribution at
-each lead time; `anchor_transport_cost` in the accompanying NetCDF is additive,
-so `mean(cost) ** (1 / scwd_order)` reconstructs the scalar SCWD.
-The NetCDF also contains `anchor_w1`. For each model and lead time, the
-corresponding top-W1 figure overlays the forecast and test-ERA5 distributions
-of the six SCWD-filter responses with the largest local 1-Wasserstein distance.
-These are filtered local response distributions, not raw-gridpoint field values.
-The signed response-difference map uses the same filters and channel projections:
-positive values mean that the forecast's average filtered response exceeds the
-test-ERA5 response at that anchor.
-
-The available metrics are mean bias, standard-deviation ratio error, CRPS-like
-field energy, linear- and log-spectrum L2, sliced Wasserstein with and without
-spherical area correction, the 20-bin quadratic Wasserstein distance of
-[Vissio et al. (2020)](https://doi.org/10.1029/2020GL089385)
-between cosine-area-weighted global-mean time distributions, RBF MMD, and SCWD.
-The Vissio bins are fitted on test ERA5 and reused for every candidate; with
-multiple configured fields, the reported value is the mean marginal distance.
-Expensive numerical controls such
-as projection counts, field-energy chunk size, and SCWD resolution are available
-through the nested `baseline` section.
+Every figure is accompanied by an NPZ data bundle and a title-less variant.
+Dashboard mode saves PNG/NPZ by default; paper mode additionally saves PDF,
+uses manuscript-scale typography, and places outputs under `plots/paper/`.
+Evaluation CSV/NetCDF artifacts and PNG/PDF/NPZ plot bundles are uploaded to W&B
+when the corresponding pipeline upload switches are enabled.
 
 ### Learned-Metric Blind-Spot Search
 
@@ -706,146 +657,89 @@ Poster plotting and cache details:
 
 ### Tracked baseline pipeline
 
-`scripts/run_baseline_pipeline.py` is the canonical entry point for the complete
-baseline workflow. It runs the requested stages in dependency order within one
-allocation:
+`scripts/run_baseline_pipeline.py` is the canonical entry point. It executes
+selected stages in dependency order within one isolated pipeline-run directory:
 
-1. target-specific discriminator training;
-2. standard metric evaluation;
-3. discriminator metric evaluation; and
-4. artifact-only plotting.
+1. optional dataset-level histogram-map fitting;
+2. target-specific discriminator training and held-out testing;
+3. standard metric evaluation;
+4. discriminator metric evaluation; and
+5. artifact-only plotting.
 
-Each invocation receives a pipeline ID and a W&B group. Training uses one run
-per raw architecture/target and one run per SFNO target (with separate linear
-and residual-MLP metric namespaces). Standard evaluation, discriminator
-evaluation, plotting, and the final manifest each receive their own run. The
-runs upload resolved configuration, checkpoints, evaluation CSV/NetCDF files,
-plots, and a stage/status manifest as versioned artifacts. The pipeline does not
-silently fetch checkpoints or evaluation data from W&B: when a producing stage
-is omitted, the corresponding local paths must already exist.
+Each stage gets a clearly named W&B run under the shared pipeline ID. Training
+uses one run per architecture and target; evaluation tables, checkpoints,
+resolved configuration, plot bundles, and the final stage manifest are uploaded
+as versioned artifacts according to `pipeline.wandb`. Omitting a producing stage
+does not implicitly fetch its inputs: provide `pipeline.input_checkpoint_dir`
+and, when applicable, `pipeline.input_histogram_matching_dir` explicitly.
 
-From `Discriminator/`, run the complete suite with:
+The normal complete pipeline, including optional SFNO probes, can be submitted
+with `scripts/submit_baseline_pipeline.sh`. The tested paper-oriented run without
+SFNO is:
+
+```bash
+cd /home/yelberkennou/atmospheric-fields/Discriminator
+sbatch scripts/submit_nosfno_paper_pipeline.sh
+```
+
+This wrapper assigns `nosfno-paper-<job-id>` to both the local run directory and
+W&B group, disables both SFNO configuration paths, runs training, both metric
+evaluations, and plotting, and opts into manuscript-sized PNG/PDF/NPZ bundles.
+The cluster account supplies one GPU, two CPUs, and 24 GB without explicit TRES
+requests. Hydra overrides may be appended after the script name.
+
+A small end-to-end check is available as:
+
+```bash
+sbatch scripts/submit_nosfno_pipeline_smoke_test.sh
+```
+
+It uses one epoch, 32 train/evaluation samples, Gaussian blur and field splice,
+and the two inexpensive moment metrics, while still traversing every pipeline
+stage and exercising online W&B uploads and paper bundle generation.
+
+For interactive or selective execution:
 
 ```bash
 conda activate pmlr
 export DATA_DIR=/cluster/courses/pmlr/teams/team07/data
-export SFNO_REPO=/path/to/SFNO-Embedding  # or /path/to/sfno_8c_31x60_code_and_weights
-wandb login
-srun -A pmlr -t 2-00:00 \
-  python scripts/run_baseline_pipeline.py \
-    pipeline.wandb.project=weather-discriminator-baselines
-```
 
-For a non-interactive Slurm job, submit the included wrapper instead. It uses
-one GPU, two CPUs, 24 GB memory, and a two-day walltime; pass Hydra overrides
-directly after its filename:
-
-```bash
-sbatch scripts/submit_baseline_pipeline.sh
-
-# For example, evaluate and plot from existing local checkpoints/results:
-sbatch scripts/submit_baseline_pipeline.sh \
-  'pipeline.stages=[evaluate_standard_metrics,evaluate_discriminator_metrics,plot]'
-```
-
-Set `pipeline.wandb.entity=...`, `pipeline.wandb.tags='[paper,full]'`, or a
-stable `pipeline.id=...` when useful. For a local dry run, use
-`pipeline.wandb.mode=offline`; to suppress W&B entirely, use
-`pipeline.wandb.enabled=false`.
-
-Stages are selectable with a Hydra list override. They are always executed in
-the canonical order shown above, regardless of the order in the override. For
-example, reuse existing checkpoints and evaluate/plot without retraining:
-
-```bash
-srun -A pmlr -t 1-00:00 \
-  python scripts/run_baseline_pipeline.py \
-    'pipeline.stages=[evaluate_standard_metrics,evaluate_discriminator_metrics,plot]'
-```
-
-Evaluate once, then iterate only on plot cosmetics using the persisted local
-tables:
-
-```bash
-python scripts/run_baseline_pipeline.py 'pipeline.stages=[plot]'
-```
-
-To train and evaluate only raw SqueezeNet critics, disable both optional
-architectures. To run only the SFNO linear and MLP probes, disable both raw
-architectures:
-
-```bash
-# Raw SqueezeNet only
 python scripts/run_baseline_pipeline.py \
-  target_discriminator.train_attention_squeezenet=false \
-  target_discriminator.sfno.enabled=false
+  "pipeline.stages=[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]" \
+  target_discriminator.sfno.enabled=false \
+  baseline.discriminator.sfno.enabled=false
 
-# SFNO linear + residual-MLP probes only
+# Reuse an explicitly selected checkpoint directory for evaluation.
 python scripts/run_baseline_pipeline.py \
-  target_discriminator.train_squeezenet=false \
-  target_discriminator.train_attention_squeezenet=false
+  "pipeline.stages=[evaluate_discriminator_metrics,plot]" \
+  pipeline.input_checkpoint_dir=/absolute/path/to/models/target_discriminators
 ```
 
-The pipeline manifest and its exact resolved config are retained beneath
-`results/baselines/common_2020/surface/2m_temperature/pipeline_runs/<pipeline-id>/`
-by default. A failed stage is recorded there and in the W&B summary before the
-original error is re-raised.
+Histogram matching is disabled by default. When enabled, it fits a training-only,
+dataset-level scalar quantile map for each variable and target, pooling values
+across times and grid points, then applies that frozen pointwise mapping before
+standardization throughout training and evaluation. Run the fitting stage in the
+same invocation, or provide a previously fitted map directory explicitly.
 
-`scripts/train_target_discriminator_baselines.py` trains one discriminator for
-each surface forecast source with a matched temporal train/test file (currently
-GraphCast, Pangu-Weather, and IFS HRES) and each compatible corruption, instead
-of sharing a fake pool. Forecast targets use the temporal forecast train/test ranges;
-corruption targets use the temporal ERA5 train/test ranges. Corruption training
-samples severities from the configured per-corruption maximum times `U**2`,
-except that hemisphere-splice fakes always use complete southern-hemisphere
-replacement; uncorrupted ERA5 is supplied exclusively by the real class.
-Evaluation curves still use deterministic grids: `[0, 0.2]` by default
-with native overrides of `[0, 1]` for `gaussian_blur` (up to its full
-1.125-pixel sigma) and `[0, 0.05]` for `pixel_replace`.
-This includes separate targets for the four structured near-null patterns and
-the hemisphere splice. Hemisphere-splice training uses a fixed derangement of
-ERA5 train samples as southern donors; the same deterministic construction is
-used on the ERA5 test range during baseline evaluation.
+Target discriminator training writes train/test loss and accuracy, normalized
+held-out logit histograms for every lead or severity, integrated-gradient
+interpretability galleries, and checkpoints. SqueezeNet is the default raw-field
+critic. The optional attention variant adds a globally mixed token. The optional
+SFNO path feeds all four raw surface fields through the pretrained encoder and
+trains either a linear or residual-MLP probe; it can instead insert ERA5 context
+for non-target channels using
+`target_discriminator.sfno.use_era5_context_for_non_target_fields=true`.
 
-The same run also trains two probes over a frozen pretrained four-field SFNO
-encoder: a linear probe and a two-layer residual MLP probe. SFNO receives raw
-T2M, U10, V10, and MSL fields, applies its checkpoint normalization internally,
-and uses the 8-channel 31x60 embedding adaptively pooled to 7x8 (448 features).
-The residual head uses `BatchNorm1d`, a 448 -> 896 -> 448 GELU/dropout block,
-and a scalar readout. Both heads share each frozen SFNO embedding pass during
-training. Corruptions are applied to all applicable channels in SFNO-standardized
-space; wind-specific corruptions therefore participate in the SFNO experiment
-even though they are skipped by the temperature-only SqueezeNet baseline.
+Corruption critics draw uniformly from the same discrete nonzero severity grid
+used at test time by default. `hemisphere_splice` and `field_splice` train only at
+complete replacement so unchanged samples are not labeled fake. Donor
+permutations are refreshed each training epoch and are independently deranged by
+field for `field_splice`.
 
-The released four-field encoder was pretrained on ERA5 from 1975–2019. It has
-therefore seen part of this experiment's temporal test partition, so its curves
-are labeled as four-field representation-transfer results rather than a
-leakage-free temporal-holdout comparison. Set `SFNO_REPO` either to an external `SFNO-Embedding` checkout containing
-`src/` and `weights_4fields/`, or directly to the standalone
-`sfno_8c_31x60_code_and_weights` bundle containing `models/` and `weights/`:
-
-The training command writes only target checkpoints. The standard baseline
-runner loads them, evaluates the poster reverse-KL critic score (with fixed
-`E_P[T]` estimated from clean ERA5 *train* data), and adds black ERA5-test null
-diamonds to the baseline-owned discriminator figures.
-
-```bash
-export SFNO_REPO=/path/to/SFNO-Embedding  # or /path/to/sfno_8c_31x60_code_and_weights
-DATA_DIR=/cluster/courses/pmlr/teams/team07/data \
-  srun -A pmlr -t 2-00:00 python scripts/train_target_discriminator_baselines.py
-```
-
-To retain existing SqueezeNet target checkpoints and train only the two SFNO
-heads, add `target_discriminator.train_squeezenet=false` to that command.
-
-Then run the baseline evaluation command followed by the artifact-only plotting
-command. Evaluation writes `data/discriminator_reverse_kl.csv` under the same
-baseline namespace, and plotting writes architecture-specific plots under
-`plots/discriminator/{squeezenet,sfno_linear,sfno_mlp}/`. The shared CSV records
-the architecture, ordered input variables, and encoder-pretraining provenance.
-SFNO probe checkpoints contain only the probe weights and encoder metadata; the
-external frozen encoder weights are required during evaluation, but not during
-artifact-only plotting.
+The pipeline manifest and resolved configuration live directly under the
+pipeline-run directory. Evaluation-only and plotting-only invocations create
+new output directories, preserving prior runs, while reading checkpoints only
+from the explicitly supplied input directory.
 
 An optional `squeezenet_attention` target discriminator adds global mixing to
 the temperature-only SqueezeNet baseline. Its final 512x7x14 (or padded

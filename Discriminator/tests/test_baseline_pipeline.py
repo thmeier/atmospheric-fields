@@ -11,7 +11,7 @@ from Discriminator.scripts.baseline_pipeline_tracking import (
     parsed_csv_value,
     safe_name,
 )
-from Discriminator.scripts.run_baseline_pipeline import execute_pipeline, selected_stages
+from Discriminator.scripts.run_baseline_pipeline import execute_pipeline, plot_input_paths, selected_stages
 
 
 def pipeline_config(root, stages):
@@ -42,6 +42,13 @@ def pipeline_config(root, stages):
 
 
 class BaselinePipelineTests(unittest.TestCase):
+    def test_plot_does_not_require_optional_discriminator_results(self):
+        cfg = pipeline_config(Path("/tmp"), ["plot"])
+        cfg.baseline.discriminator = {"enabled": True}
+        cfg.baseline.metrics = ["mean_bias"]
+        paths = plot_input_paths(cfg, Path("/tmp/fixture"))
+        self.assertNotIn(Path("/tmp/fixture/data/discriminator_reverse_kl.csv"), paths)
+
     def test_stages_are_validated_and_run_in_canonical_order(self):
         cfg = pipeline_config(Path("/tmp"), ["plot", "train_discriminators"])
         self.assertEqual(selected_stages(cfg), ["train_discriminators", "plot"])

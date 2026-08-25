@@ -8,8 +8,8 @@ standardized with ERA5 moments and evaluated jointly; configure a single
 variable when field-wise metrics are desired.
 
 Metrics:
-- `mean_bias`: surface-area-weighted candidate mean minus ERA5 mean.
-- `std_ratio_error`: surface-area-weighted candidate standard deviation divided by
+- `mean_bias`: unweighted candidate grid-cell mean minus ERA5 mean.
+- `std_ratio_error`: unweighted candidate grid-cell standard deviation divided by
   ERA5 standard deviation, minus one.
 - `crps_like_field_energy`: half-energy distance between complete multi-field
   states, using cosine-latitude-weighted mean absolute differences.
@@ -18,19 +18,20 @@ Metrics:
   spatial field distributions.
 - `sliced_wasserstein_lon_corrected`: same metric after applying the spherical
   surface-Jacobian correction for lat-lon cell areas.
-- `global_mean_wasserstein`: Vissio et al. quadratic Wasserstein distance
-  between distributions of cosine-area-weighted global means.
+- `global_mean_wasserstein`: Vissio et al. joint quadratic Wasserstein distance
+  between distributions of cosine-area-weighted global-mean vectors.
 - `mmd_rbf`: maximum mean discrepancy between flattened spatial-field
   distributions, using a Gaussian RBF kernel with a median-distance bandwidth.
 - `scwd`: spherical convolutional Wasserstein distance approximation. Scalar
   fields use the compact-Wendland quantile approximation from Garrett et al.
-  (2024); multi-field states use random channel weights inside each spherical
-  filter so every filter still maps a sample to one scalar response.
+  (2024); multi-field states use exact empirical joint W2 at every anchor.
 - `scwd_area_weighted`: same SCWD responses, with cosine-area weighting when
   combining regular latitude-longitude anchor costs.
 """
 
 import csv
+import math
+from fractions import Fraction
 import tempfile
 import zlib
 from pathlib import Path
@@ -40,7 +41,9 @@ import cartopy.feature as cfeature
 import hydra
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.optimize
 import scipy.sparse
+import scipy.spatial.distance
 import torch
 import xarray as xr
 from omegaconf import DictConfig, OmegaConf
@@ -55,7 +58,9 @@ def series_marker(index):
     return SERIES_MARKERS[int(index) % len(SERIES_MARKERS)]
 
 try:
-    from .plot_bundles import save_figure_bundle
+    from .plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
+    from .histogram_matching_apply import match_standardized
+    from .histogram_checkpoint import validate_binding
     from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
         WeatherDiscriminator,
@@ -72,7 +77,9 @@ try:
         select_era5_split,
     )
 except ImportError:
-    from plot_bundles import save_figure_bundle
+    from plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
+    from histogram_matching_apply import match_standardized
+    from histogram_checkpoint import validate_binding
     from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
         WeatherDiscriminator,
@@ -100,7 +107,6 @@ DEFAULT_METRICS = [
     "sliced_wasserstein_lon_corrected",
     "global_mean_wasserstein",
     "mmd_rbf",
-    "scwd_area_weighted",
     "scwd",
 ]
 
@@ -113,8 +119,23 @@ PLOTTING_DISABLED_METRICS = {
 }
 
 
+# These diagnostics remain evaluated and get their own figures, but combining
+# their lower-moment scales with distributional distances obscures the latter.
+MULTIPLOT_EXCLUDED_METRICS = {
+    "mean_bias",
+    "std_ratio_error",
+}
+
 def plotted_metric_names(metric_names):
-    """Exclude evaluation-only metrics from all standard figures."""
+    """Return metrics suitable for figures containing several metrics."""
+    return [
+        name for name in metric_names
+        if name not in PLOTTING_DISABLED_METRICS | MULTIPLOT_EXCLUDED_METRICS
+    ]
+
+
+def standalone_metric_names(metric_names):
+    """Return metrics that retain their dedicated, single-metric figures."""
     return [name for name in metric_names if name not in PLOTTING_DISABLED_METRICS]
 
 
@@ -146,7 +167,7 @@ STRUCTURED_NEAR_NULL_CORRUPTIONS = {
     "checkerboard_2px",
     "zonal_scanlines",
 }
-DATA_DEPENDENT_CORRUPTIONS = {"hemisphere_splice"}
+DATA_DEPENDENT_CORRUPTIONS = {"hemisphere_splice", "field_splice"}
 
 
 def cfg_get(cfg, key, default):
@@ -285,6 +306,18 @@ def latitude_weighted_moment_totals(values, latitudes):
 
 
 
+def pointwise_moment_totals(values):
+    """Return unweighted sum, squared sum, and count of finite grid cells."""
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    safe_values = np.where(finite, values, 0.0)
+    return (
+        float(np.sum(safe_values, dtype=np.float64)),
+        float(np.sum(safe_values * safe_values, dtype=np.float64)),
+        float(np.sum(finite, dtype=np.float64)),
+    )
+
+
 def area_weighted_global_means(fields, latitudes):
     """Return one cosine-area-weighted global mean per sample and field."""
     values = np.asarray(fields, dtype=np.float64)
@@ -298,7 +331,7 @@ def area_weighted_global_means(fields, latitudes):
 
 
 def structured_near_null_pattern(corruption_type, latitudes, n_longitudes):
-    """Return a zero-mean, unit-area-RMS spatial carrier for baseline probes."""
+    """Return a mean-centred, unit-area-RMS spatial carrier for baseline probes."""
     n_latitudes = len(latitudes)
     rows, columns = np.indices((n_latitudes, int(n_longitudes)))
     if corruption_type == "equatorial_checker_texture":
@@ -316,7 +349,12 @@ def structured_near_null_pattern(corruption_type, latitudes, n_longitudes):
         raise ValueError(f"Unknown structured near-null corruption: {corruption_type}.")
     weights = np.maximum(np.cos(np.deg2rad(np.asarray(latitudes))), 0.0)[:, None]
     denominator = float(np.sum(weights) * int(n_longitudes))
-    pattern -= np.sum(pattern * weights) / denominator
+    if corruption_type == "zonal_scanlines":
+        # Zonal scanlines are intended to be symmetric in the ordinary
+        # grid-cell mean used by mean_bias, rather than in spherical area.
+        pattern -= np.mean(pattern)
+    else:
+        pattern -= np.sum(pattern * weights) / denominator
     rms = float(np.sqrt(np.sum(pattern**2 * weights) / denominator))
     if rms <= 1e-12:
         raise ValueError(f"Structured corruption {corruption_type} has zero energy.")
@@ -327,9 +365,17 @@ def deranged_sample_positions(size, seed):
     """Return a reproducible cyclic donor permutation without self-pairs."""
     size = int(size)
     if size < 2:
-        raise ValueError("Hemisphere splice requires at least two samples.")
+        raise ValueError("Data-dependent splice requires at least two samples.")
     rng = np.random.default_rng(int(seed))
     return np.roll(np.arange(size, dtype=int), int(rng.integers(1, size)))
+
+
+def fieldwise_deranged_sample_positions(size, n_fields, seed):
+    """Return one reproducible no-self-pair donor permutation per field."""
+    return np.stack([
+        deranged_sample_positions(size, int(np.random.SeedSequence([int(seed), field]).generate_state(1)[0]))
+        for field in range(int(n_fields))
+    ])
 
 
 def apply_special_baseline_corruption(
@@ -352,22 +398,27 @@ def apply_special_baseline_corruption(
             corruption_type, latitudes, standardized.shape[-1]
         )
         return standardized + severity * pattern[None, :, :]
-    if corruption_type == "hemisphere_splice":
+    if corruption_type in {"hemisphere_splice", "field_splice"}:
         if donor is None:
-            raise ValueError("Hemisphere splice requires a donor ERA5 sample.")
+            raise ValueError(f"{corruption_type} requires a donor ERA5 sample.")
         maximum = float(
-            corruption_max_severity("hemisphere_splice", cfg)
+            corruption_max_severity(corruption_type, cfg)
             if maximum_severity is None else maximum_severity
         )
         replace_probability = np.clip(severity / max(maximum, 1e-12), 0.0, 1.0)
-        boundary = float(baseline_get(cfg, "hemisphere_splice_latitude", 0.0))
-        south = np.asarray(latitudes, dtype=np.float64) < boundary
         result = standardized.copy()
         rng = np.random.default_rng(random_seed) if random_seed is not None else np.random
-        # The severity controls whether a *sample's whole southern hemisphere*
-        # is replaced.  It is deliberately not a per-pixel blend probability.
-        if rng.random() < replace_probability:
-            result[:, south, :] = np.asarray(donor)[:, south, :]
+        if corruption_type == "hemisphere_splice":
+            boundary = float(baseline_get(cfg, "hemisphere_splice_latitude", 0.0))
+            south = np.asarray(latitudes, dtype=np.float64) < boundary
+            # One Bernoulli draw replaces the whole southern hemisphere.
+            if rng.random() < replace_probability:
+                result[:, south, :] = np.asarray(donor)[:, south, :]
+        else:
+            # Each field has an independently permuted donor and one Bernoulli
+            # draw: no within-field pixel blending occurs.
+            replace_fields = rng.random(standardized.shape[0]) < replace_probability
+            result[replace_fields] = np.asarray(donor)[replace_fields]
         return result.astype(np.float32)
     raise ValueError(f"Unknown special baseline corruption: {corruption_type}.")
 
@@ -396,49 +447,125 @@ def weighted_quadratic_wasserstein_1d(support_a, mass_a, support_b, mass_b):
     return float(np.sqrt(np.sum(widths * (support_a[idx_a] - support_b[idx_b]) ** 2)))
 
 
-def vissio_global_mean_wasserstein(candidate_means, reference_means, n_bins=20):
-    """Return Ulam-binned W2 of global-mean time distributions.
+def _finite_joint_samples(values, n_fields=None):
+    """Return finite rows from a scalar or joint sample array."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[:, None]
+    if values.ndim != 2:
+        return np.empty((0, 0), dtype=np.float64)
+    if n_fields is not None:
+        values = values[:, :int(n_fields)]
+    return values[np.all(np.isfinite(values), axis=1)]
 
-    Test ERA5 fixes the equal-width phase-space bins. Candidate values beyond
-    that fitted support are assigned to the nearest edge bin. For multiple
-    fields, return the mean of their marginal one-dimensional distances.
-    """
-    candidate = np.asarray(candidate_means, dtype=np.float64)
-    reference = np.asarray(reference_means, dtype=np.float64)
-    if candidate.ndim == 1:
-        candidate = candidate[:, None]
-    if reference.ndim == 1:
-        reference = reference[:, None]
-    if candidate.ndim != 2 or reference.ndim != 2:
-        return np.nan
-    n_fields = min(candidate.shape[1], reference.shape[1])
-    n_bins = int(n_bins)
-    if n_fields == 0 or n_bins < 2:
-        return np.nan
 
-    distances = []
-    support = (np.arange(n_bins, dtype=np.float64) + 0.5) / n_bins
-    for field_idx in range(n_fields):
-        cand = candidate[:, field_idx]
-        ref = reference[:, field_idx]
-        cand = cand[np.isfinite(cand)]
-        ref = ref[np.isfinite(ref)]
-        if cand.size == 0 or ref.size == 0:
-            continue
-        lower = float(np.min(ref))
-        upper = float(np.max(ref))
-        scale = upper - lower
-        if scale <= 1e-12:
-            distances.append(0.0 if np.allclose(cand, lower) else 1.0)
-            continue
-        padding = max(scale * 1e-9, np.finfo(np.float64).eps)
-        edges = np.linspace(lower - padding, upper + padding, n_bins + 1)
-        cand_hist = np.histogram(np.clip(cand, edges[0], edges[-1]), bins=edges)[0]
-        ref_hist = np.histogram(ref, bins=edges)[0]
-        distances.append(
-            weighted_quadratic_wasserstein_1d(support, cand_hist, support, ref_hist)
+def fit_vissio_ulam_grid(distributions, n_bins=20):
+    """Fit one experiment-wide, per-field Ulam grid to pooled distributions."""
+    arrays = [_finite_joint_samples(values) for values in distributions]
+    arrays = [values for values in arrays if values.size]
+    if not arrays:
+        raise ValueError("Cannot fit a Vissio Ulam grid without finite samples.")
+    n_fields = arrays[0].shape[1]
+    if any(values.shape[1] != n_fields for values in arrays):
+        raise ValueError("All Ulam-grid distributions must have the same field count.")
+    if int(n_bins) < 2:
+        raise ValueError("The Vissio Ulam grid requires at least two bins per field.")
+    pooled = np.concatenate(arrays, axis=0)
+    return {
+        "lower": np.min(pooled, axis=0),
+        "upper": np.max(pooled, axis=0),
+        "n_bins": int(n_bins),
+    }
+
+
+def vissio_ulam_measure(values, grid):
+    """Discretize joint samples into occupied normalized Ulam cells."""
+    lower = np.asarray(grid["lower"], dtype=np.float64)
+    upper = np.asarray(grid["upper"], dtype=np.float64)
+    n_bins = int(grid["n_bins"])
+    values = _finite_joint_samples(values, lower.size)
+    if not values.size:
+        return np.empty((0, lower.size)), np.empty(0), np.empty((0, lower.size), dtype=np.int64)
+    scale = upper - lower
+    varying = scale > 1e-12
+    normalized = np.zeros_like(values)
+    normalized[:, varying] = (values[:, varying] - lower[varying]) / scale[varying]
+    normalized = np.clip(normalized, 0.0, np.nextafter(1.0, 0.0))
+    cells = np.floor(normalized * n_bins).astype(np.int64)
+    cells[:, ~varying] = 0
+    occupied, counts = np.unique(cells, axis=0, return_counts=True)
+    support = (occupied.astype(np.float64) + 0.5) / n_bins
+    support[:, ~varying] = 0.5
+    return support, counts.astype(np.float64) / counts.sum(), occupied
+
+
+def weighted_quadratic_wasserstein_nd(support_a, mass_a, support_b, mass_b):
+    """Compute exact discrete multivariate W2 with Euclidean ground geometry."""
+    support_a = np.asarray(support_a, dtype=np.float64)
+    support_b = np.asarray(support_b, dtype=np.float64)
+    mass_a = np.asarray(mass_a, dtype=np.float64)
+    mass_b = np.asarray(mass_b, dtype=np.float64)
+    keep_a, keep_b = mass_a > 0.0, mass_b > 0.0
+    support_a, mass_a = support_a[keep_a], mass_a[keep_a]
+    support_b, mass_b = support_b[keep_b], mass_b[keep_b]
+    if not support_a.size or not support_b.size:
+        return np.nan
+    mass_a, mass_b = mass_a / mass_a.sum(), mass_b / mass_b.sum()
+    cost = scipy.spatial.distance.cdist(support_a, support_b, metric="sqeuclidean")
+
+    def integer_masses(masses):
+        fractions = [Fraction(float(value)).limit_denominator(100000) for value in masses]
+        denominator = math.lcm(*(value.denominator for value in fractions))
+        counts = np.asarray([value.numerator * (denominator // value.denominator) for value in fractions])
+        divisor = np.gcd.reduce(counts)
+        return counts // max(int(divisor), 1)
+
+    counts_a, counts_b = integer_masses(mass_a), integer_masses(mass_b)
+    common_total = math.lcm(int(counts_a.sum()), int(counts_b.sum()))
+    expanded_count = common_total
+    if expanded_count <= 4096:
+        counts_a = counts_a * (common_total // int(counts_a.sum()))
+        counts_b = counts_b * (common_total // int(counts_b.sum()))
+        expanded_a = np.repeat(support_a, counts_a, axis=0)
+        expanded_b = np.repeat(support_b, counts_b, axis=0)
+        expanded_cost = scipy.spatial.distance.cdist(expanded_a, expanded_b, metric="sqeuclidean")
+        rows, cols = scipy.optimize.linear_sum_assignment(expanded_cost)
+        return float(np.sqrt(np.mean(expanded_cost[rows, cols])))
+
+    n_a, n_b = len(mass_a), len(mass_b)
+    row_indices = np.repeat(np.arange(n_a), n_b)
+    col_indices = np.tile(np.arange(n_b), n_a)
+    variable_indices = np.arange(n_a * n_b)
+    constraints = scipy.sparse.coo_matrix(
+        (np.ones(2 * n_a * n_b),
+         (np.concatenate([row_indices, n_a + col_indices]),
+          np.concatenate([variable_indices, variable_indices]))),
+        shape=(n_a + n_b, n_a * n_b),
+    ).tocsr()
+    result = scipy.optimize.linprog(
+        cost.ravel(), A_eq=constraints, b_eq=np.concatenate([mass_a, mass_b]),
+        bounds=(0.0, None), method="highs",
+    )
+    if not result.success:
+        raise RuntimeError(f"Joint Ulam transport failed: {result.message}")
+    return float(np.sqrt(max(float(result.fun), 0.0)))
+
+
+def vissio_global_mean_wasserstein(candidate_means, reference_means, n_bins=20, grid=None):
+    """Return Vissio-style joint Ulam-binned W2 of global-mean vectors."""
+    candidate = _finite_joint_samples(candidate_means)
+    reference = _finite_joint_samples(reference_means)
+    if not candidate.size or not reference.size or candidate.shape[1] != reference.shape[1]:
+        return np.nan
+    if grid is None:
+        grid = fit_vissio_ulam_grid([candidate, reference], n_bins=n_bins)
+    support_a, mass_a, _ = vissio_ulam_measure(candidate, grid)
+    support_b, mass_b, _ = vissio_ulam_measure(reference, grid)
+    if candidate.shape[1] == 1:
+        return weighted_quadratic_wasserstein_1d(
+            support_a[:, 0], mass_a, support_b[:, 0], mass_b
         )
-    return float(np.mean(distances)) if distances else np.nan
+    return weighted_quadratic_wasserstein_nd(support_a, mass_a, support_b, mass_b)
 
 
 def zonal_energy_spectrum(values, latitudes):
@@ -673,6 +800,48 @@ def mmd_rbf_bandwidth(reference, configured_bandwidth):
     return float(np.sqrt(np.median(positive)))
 
 
+def normalized_mmd_field_slices(n_dimensions, field_slices):
+    """Validate contiguous field blocks covering one concatenated MMD vector."""
+    if field_slices is None:
+        return [(0, int(n_dimensions))]
+    slices = [(int(start), int(stop)) for start, stop in field_slices]
+    expected_start = 0
+    for start, stop in slices:
+        if start != expected_start or stop <= start or stop > n_dimensions:
+            raise ValueError(
+                "MMD field slices must be positive, contiguous blocks covering the vector; "
+                f"got {slices} for dimension {n_dimensions}."
+            )
+        expected_start = stop
+    if not slices or expected_start != n_dimensions:
+        raise ValueError(
+            f"MMD field slices cover {expected_start} of {n_dimensions} vector coordinates."
+        )
+    return slices
+
+
+def mmd_rbf_bandwidths(reference, field_slices, configured_bandwidth=None):
+    """Fit one ERA5-reference median-heuristic bandwidth per field block."""
+    slices = normalized_mmd_field_slices(reference.shape[1], field_slices)
+    if configured_bandwidth is None:
+        configured = [None] * len(slices)
+    elif np.isscalar(configured_bandwidth):
+        configured = [float(configured_bandwidth)] * len(slices)
+    else:
+        configured = list(configured_bandwidth)
+        if len(configured) != len(slices):
+            raise ValueError(
+                f"Expected {len(slices)} configured MMD bandwidths, got {len(configured)}."
+            )
+    return np.asarray(
+        [
+            mmd_rbf_bandwidth(reference[:, start:stop], bandwidth)
+            for (start, stop), bandwidth in zip(slices, configured)
+        ],
+        dtype=np.float64,
+    )
+
+
 def rbf_kernel_mean(left, right, bandwidth):
     """Mean Gaussian RBF kernel value between two vector samples."""
     distances = squared_euclidean_distances(left, right)
@@ -680,18 +849,47 @@ def rbf_kernel_mean(left, right, bandwidth):
     return float(np.mean(np.exp(-distances / scale)))
 
 
-def mmd_rbf_distance(candidate_vectors, reference_vectors, cfg):
-    """Biased RBF-MMD distance between candidate and reference field vectors."""
+def rbf_kernel_mean_per_field(left, right, bandwidths, field_slices):
+    """Mean joint product-RBF value with a separate scale for each field."""
+    slices = normalized_mmd_field_slices(left.shape[1], field_slices)
+    if len(bandwidths) != len(slices):
+        raise ValueError(f"Expected {len(slices)} MMD bandwidths, got {len(bandwidths)}.")
+    scaled_distance = np.zeros((left.shape[0], right.shape[0]), dtype=np.float64)
+    for (start, stop), bandwidth in zip(slices, bandwidths):
+        scale = max(float(bandwidth), 1e-12) ** 2
+        scaled_distance += squared_euclidean_distances(
+            left[:, start:stop], right[:, start:stop]
+        ) / scale
+    scaled_distance /= len(slices)
+    return float(np.mean(np.exp(-0.5 * scaled_distance)))
+
+
+def mmd_rbf_distance(candidate_vectors, reference_vectors, cfg, field_slices=None):
+    """Biased joint RBF-MMD, optionally using one bandwidth per field block."""
     candidate, reference = standardize_for_mmd(candidate_vectors, reference_vectors, cfg)
     if candidate is None:
         return np.nan
+    mode = str(baseline_get(cfg, "mmd_bandwidth_mode", "per_field")).lower()
+    if mode not in {"per_field", "joint_median"}:
+        raise ValueError(
+            f"Unknown mmd_bandwidth_mode={mode!r}; expected per_field or joint_median."
+        )
+    slices = normalized_mmd_field_slices(reference.shape[1], field_slices)
     device = torch_metric_device(cfg)
     if device is not None:
-        return mmd_rbf_distance_torch(candidate, reference, cfg, device)
-    bandwidth = mmd_rbf_bandwidth(reference, baseline_get(cfg, "mmd_bandwidth", None))
-    k_xx = rbf_kernel_mean(candidate, candidate, bandwidth)
-    k_yy = rbf_kernel_mean(reference, reference, bandwidth)
-    k_xy = rbf_kernel_mean(candidate, reference, bandwidth)
+        return mmd_rbf_distance_torch(candidate, reference, cfg, device, slices)
+    configured = baseline_get(cfg, "mmd_bandwidth", None)
+    if mode == "joint_median":
+        bandwidth = mmd_rbf_bandwidth(reference, configured)
+        kernel = lambda left, right: rbf_kernel_mean(left, right, bandwidth)
+    else:
+        bandwidths = mmd_rbf_bandwidths(reference, slices, configured)
+        kernel = lambda left, right: rbf_kernel_mean_per_field(
+            left, right, bandwidths, slices
+        )
+    k_xx = kernel(candidate, candidate)
+    k_yy = kernel(reference, reference)
+    k_xy = kernel(candidate, reference)
     return float(np.sqrt(max(k_xx + k_yy - 2.0 * k_xy, 0.0)))
 
 
@@ -709,8 +907,28 @@ def mmd_rbf_bandwidth_torch(reference, configured_bandwidth):
     distances = squared_euclidean_distances_torch(reference, reference)
     positive = distances[distances > 1e-12]
     if positive.numel() == 0:
-        return torch.as_tensor(1.0, dtype=candidate.dtype, device=candidate.device)
+        return torch.as_tensor(1.0, dtype=reference.dtype, device=reference.device)
     return torch.sqrt(torch.quantile(positive, 0.5))
+
+
+def mmd_rbf_bandwidths_torch(reference, field_slices, configured_bandwidth=None):
+    """Torch equivalent of the ERA5-reference per-field bandwidth fit."""
+    if configured_bandwidth is None:
+        configured = [None] * len(field_slices)
+    elif np.isscalar(configured_bandwidth):
+        configured = [float(configured_bandwidth)] * len(field_slices)
+    else:
+        configured = list(configured_bandwidth)
+        if len(configured) != len(field_slices):
+            raise ValueError(
+                f"Expected {len(field_slices)} configured MMD bandwidths, got {len(configured)}."
+            )
+    return torch.stack(
+        [
+            mmd_rbf_bandwidth_torch(reference[:, start:stop], bandwidth)
+            for (start, stop), bandwidth in zip(field_slices, configured)
+        ]
+    )
 
 
 def rbf_kernel_mean_torch(left, right, bandwidth):
@@ -720,15 +938,39 @@ def rbf_kernel_mean_torch(left, right, bandwidth):
     return torch.mean(torch.exp(-distances / scale))
 
 
-def mmd_rbf_distance_torch(candidate, reference, cfg, device):
-    """Biased RBF-MMD distance with Torch pairwise distances."""
+def rbf_kernel_mean_per_field_torch(left, right, bandwidths, field_slices):
+    """Torch joint product-RBF with one ERA5-fitted scale per field."""
+    scaled_distance = torch.zeros(
+        (left.shape[0], right.shape[0]), dtype=left.dtype, device=left.device
+    )
+    for field_index, (start, stop) in enumerate(field_slices):
+        scale = torch.clamp(bandwidths[field_index], min=1e-12) ** 2
+        scaled_distance += squared_euclidean_distances_torch(
+            left[:, start:stop], right[:, start:stop]
+        ) / scale
+    scaled_distance /= len(field_slices)
+    return torch.mean(torch.exp(-0.5 * scaled_distance))
+
+
+def mmd_rbf_distance_torch(candidate, reference, cfg, device, field_slices=None):
+    """Biased joint RBF-MMD with Torch pairwise distances."""
     dtype = torch_metric_dtype(cfg)
     candidate_t = torch_tensor(candidate, device, dtype)
     reference_t = torch_tensor(reference, device, dtype)
-    bandwidth = mmd_rbf_bandwidth_torch(reference_t, baseline_get(cfg, "mmd_bandwidth", None))
-    k_xx = rbf_kernel_mean_torch(candidate_t, candidate_t, bandwidth)
-    k_yy = rbf_kernel_mean_torch(reference_t, reference_t, bandwidth)
-    k_xy = rbf_kernel_mean_torch(candidate_t, reference_t, bandwidth)
+    slices = normalized_mmd_field_slices(reference_t.shape[1], field_slices)
+    configured = baseline_get(cfg, "mmd_bandwidth", None)
+    mode = str(baseline_get(cfg, "mmd_bandwidth_mode", "per_field")).lower()
+    if mode == "joint_median":
+        bandwidth = mmd_rbf_bandwidth_torch(reference_t, configured)
+        kernel = lambda left, right: rbf_kernel_mean_torch(left, right, bandwidth)
+    else:
+        bandwidths = mmd_rbf_bandwidths_torch(reference_t, slices, configured)
+        kernel = lambda left, right: rbf_kernel_mean_per_field_torch(
+            left, right, bandwidths, slices
+        )
+    k_xx = kernel(candidate_t, candidate_t)
+    k_yy = kernel(reference_t, reference_t)
+    k_xy = kernel(candidate_t, reference_t)
     value = torch.sqrt(torch.clamp(k_xx + k_yy - 2.0 * k_xy, min=0.0))
     return float(value.detach().cpu())
 
@@ -767,6 +1009,7 @@ def joint_features_from_variables(features_by_variable, reference_by_variable, v
             "channel_fields": np.empty((0, 0, 0, 0), dtype=np.float64),
             "vectors": np.empty((0, 0), dtype=np.float64),
             "unweighted_vectors": np.empty((0, 0), dtype=np.float64),
+            "mmd_field_slices": [],
             "sample_keys": [],
             "n_valid_samples": 0,
             "latitudes": None,
@@ -828,6 +1071,11 @@ def joint_features_from_variables(features_by_variable, reference_by_variable, v
     channel_fields = np.stack(channel_fields) if channel_fields else np.empty((0, 0, 0, 0), dtype=np.float64)
     vectors = np.stack(vectors) if vectors else np.empty((0, 0), dtype=np.float64)
     unweighted_vectors = np.stack(unweighted_vectors) if unweighted_vectors else np.empty((0, 0), dtype=np.float64)
+    vector_block_size = vectors.shape[1] // len(variables) if vectors.size else 0
+    mmd_field_slices = [
+        (field_index * vector_block_size, (field_index + 1) * vector_block_size)
+        for field_index in range(len(variables))
+    ] if vector_block_size else []
 
     return {
         "values": all_values,
@@ -838,6 +1086,7 @@ def joint_features_from_variables(features_by_variable, reference_by_variable, v
         "channel_fields": channel_fields,
         "vectors": vectors,
         "unweighted_vectors": unweighted_vectors,
+        "mmd_field_slices": mmd_field_slices,
         "sample_keys": common_keys,
         "n_valid_samples": int(fields.shape[0]) if fields.ndim == 3 else 0,
         "latitudes": latitudes,
@@ -1032,22 +1281,39 @@ def scwd_response_batch(fields, numpy_weights, torch_weights, cfg, device):
     return torch.stack(by_channel, dim=1).detach().cpu().numpy().astype(np.float32)
 
 
-def scwd_channel_weights(cfg, n_channels):
-    """Return the deterministic channel projections used by multi-field SCWD."""
-    if n_channels == 1:
-        return np.ones((1, 1), dtype=np.float64)
-    rng = np.random.default_rng(int(baseline_get(cfg, "swd_seed", 0)))
-    weights = rng.normal(
-        size=(max(1, int(baseline_get(cfg, "scwd_channel_projections", 16))), n_channels)
-    )
-    norms = np.linalg.norm(weights, axis=1)
-    weights = weights[norms > 1e-12]
-    norms = norms[norms > 1e-12]
-    return weights / norms[:, None] if weights.size else np.empty((0, n_channels), dtype=np.float64)
+def empirical_joint_w2_cost(candidate, reference):
+    """Return the squared exact empirical W2 cost for equally weighted vectors."""
+    candidate = np.asarray(candidate, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    if candidate.ndim != 2 or reference.ndim != 2 or candidate.shape != reference.shape:
+        raise ValueError(
+            "Exact empirical joint W2 requires equally sized sample-by-field arrays; "
+            f"got {candidate.shape} and {reference.shape}."
+        )
+    if not candidate.size:
+        return np.nan
+    cost = scipy.spatial.distance.cdist(candidate, reference, metric="sqeuclidean")
+    rows, cols = scipy.optimize.linear_sum_assignment(cost)
+    return float(np.mean(cost[rows, cols]))
+
+
+def _selected_scwd_responses(candidate_response, reference_response, cfg):
+    """Return equally sized, evenly distributed deterministic subsets for joint OT."""
+    maximum = int(baseline_get(
+        cfg, "scwd_ot_samples", baseline_get(cfg, "pairwise_eval_samples", 256)
+    ))
+    n_samples = min(candidate_response.shape[0], reference_response.shape[0])
+    if maximum > 0:
+        n_samples = min(n_samples, maximum)
+    if n_samples == 0:
+        return candidate_response[:0], reference_response[:0]
+    candidate_indices = pairwise_sample_positions(candidate_response.shape[0], n_samples)
+    reference_indices = pairwise_sample_positions(reference_response.shape[0], n_samples)
+    return candidate_response[candidate_indices], reference_response[reference_indices]
 
 
 def scwd_anchor_transport_costs(candidate, reference, cfg):
-    """Return the exact per-anchor r-powered contributions to disk-backed SCWD."""
+    """Return per-anchor transport costs for scalar or joint multi-field SCWD."""
     candidate_response = np.asarray(candidate.get("scwd_responses"))
     reference_response = np.asarray(reference.get("scwd_responses"))
     if candidate_response.size == 0 or reference_response.size == 0:
@@ -1059,116 +1325,86 @@ def scwd_anchor_transport_costs(candidate, reference, cfg):
     if n_channels == 0 or n_anchors == 0:
         return np.array([], dtype=np.float64)
 
-    r = float(baseline_get(cfg, "scwd_order", 2.0))
-    n_quantiles = int(baseline_get(cfg, "scwd_quantiles", 200))
-    quantiles = np.linspace(0.0, 1.0, n_quantiles)
-    anchor_chunk = max(1, int(baseline_get(cfg, "scwd_anchor_chunk_size", 128)))
-    channel_weights = scwd_channel_weights(cfg, n_channels)
-    if channel_weights.size == 0:
-        return np.array([], dtype=np.float64)
-
-    costs = np.zeros(n_anchors, dtype=np.float64)
-    for channel_weight in channel_weights:
+    order = float(baseline_get(cfg, "scwd_order", 2.0))
+    if n_channels == 1:
+        n_quantiles = int(baseline_get(cfg, "scwd_quantiles", 200))
+        quantiles = np.linspace(0.0, 1.0, n_quantiles)
+        anchor_chunk = max(1, int(baseline_get(cfg, "scwd_anchor_chunk_size", 128)))
+        costs = np.zeros(n_anchors, dtype=np.float64)
         for start in range(0, n_anchors, anchor_chunk):
             stop = min(start + anchor_chunk, n_anchors)
-            candidate_chunk = np.einsum(
-                "nca,c->na", candidate_response[:, :n_channels, start:stop], channel_weight, optimize=True
-            )
-            reference_chunk = np.einsum(
-                "nca,c->na", reference_response[:, :n_channels, start:stop], channel_weight, optimize=True
-            )
-            candidate_q = np.quantile(candidate_chunk, quantiles, axis=0)
-            reference_q = np.quantile(reference_chunk, quantiles, axis=0)
-            costs[start:stop] += np.mean(np.abs(candidate_q - reference_q) ** r, axis=0)
-    return costs / len(channel_weights)
+            candidate_q = np.quantile(candidate_response[:, 0, start:stop], quantiles, axis=0)
+            reference_q = np.quantile(reference_response[:, 0, start:stop], quantiles, axis=0)
+            costs[start:stop] = np.mean(np.abs(candidate_q - reference_q) ** order, axis=0)
+        return costs
+    candidate_response, reference_response = _selected_scwd_responses(
+        candidate_response[:, :n_channels, :n_anchors],
+        reference_response[:, :n_channels, :n_anchors], cfg,
+    )
+    if not candidate_response.size or not reference_response.size:
+        return np.array([], dtype=np.float64)
+
+    if not np.isclose(order, 2.0):
+        raise ValueError("Joint multi-field SCWD currently implements quadratic W2 only (scwd_order=2).")
+    costs = np.empty(n_anchors, dtype=np.float64)
+    anchors = range(n_anchors)
+    if bool(baseline_get(cfg, "scwd_ot_progress", True)):
+        anchors = tqdm(anchors, desc="Joint SCWD anchor OT", leave=False)
+    for anchor_idx in anchors:
+        costs[anchor_idx] = empirical_joint_w2_cost(
+            candidate_response[:, :, anchor_idx], reference_response[:, :, anchor_idx]
+        )
+    return costs
+
+
+def scwd_anchor_joint_distributions(candidate, reference, cfg, n_top):
+    """Rank anchors by local joint W2 and retain their per-field responses."""
+    costs = scwd_anchor_transport_costs(candidate, reference, cfg)
+    candidate_response = np.asarray(candidate.get("scwd_responses"))
+    reference_response = np.asarray(reference.get("scwd_responses"))
+    if costs.size == 0 or candidate_response.ndim != 3 or reference_response.ndim != 3:
+        return np.array([], dtype=np.float64), []
+    n_channels = min(candidate_response.shape[1], reference_response.shape[1])
+    candidate_response, reference_response = _selected_scwd_responses(
+        candidate_response[:, :n_channels, :costs.size],
+        reference_response[:, :n_channels, :costs.size], cfg,
+    )
+    local_wasserstein = np.sqrt(np.maximum(costs, 0.0))
+    n_top = min(max(int(n_top), 0), costs.size)
+    distributions = []
+    for anchor_idx in np.argsort(local_wasserstein)[::-1][:n_top]:
+        distributions.append({
+            "anchor_index": int(anchor_idx),
+            "wasserstein": float(local_wasserstein[anchor_idx]),
+            "candidate": np.asarray(candidate_response[:, :, anchor_idx], dtype=np.float32),
+            "reference": np.asarray(reference_response[:, :, anchor_idx], dtype=np.float32),
+        })
+    return local_wasserstein, distributions
 
 
 def scwd_anchor_w1_distributions(candidate, reference, cfg, n_top):
-    """Rank anchors by local W1 and retain response samples for the strongest ones."""
+    """Compatibility alias for joint-W2 anchor diagnostics."""
+    local_wasserstein, distributions = scwd_anchor_joint_distributions(
+        candidate, reference, cfg, n_top
+    )
+    for item in distributions:
+        item["w1"] = item["wasserstein"]
+    return local_wasserstein, distributions
+
+
+def scwd_anchor_mean_response_difference(candidate, reference, cfg):
+    """Return per-field candidate-minus-reference mean response at each anchor."""
     candidate_response = np.asarray(candidate.get("scwd_responses"))
     reference_response = np.asarray(reference.get("scwd_responses"))
-    if candidate_response.size == 0 or reference_response.size == 0:
-        return np.array([], dtype=np.float64), []
     if candidate_response.ndim != 3 or reference_response.ndim != 3:
-        return np.array([], dtype=np.float64), []
+        return np.empty((0, 0), dtype=np.float64)
     n_channels = min(candidate_response.shape[1], reference_response.shape[1])
     n_anchors = min(candidate_response.shape[2], reference_response.shape[2])
     if n_channels == 0 or n_anchors == 0:
-        return np.array([], dtype=np.float64), []
-
-    n_quantiles = int(baseline_get(cfg, "scwd_quantiles", 200))
-    quantiles = np.linspace(0.0, 1.0, n_quantiles)
-    anchor_chunk = max(1, int(baseline_get(cfg, "scwd_anchor_chunk_size", 128)))
-    channel_weights = scwd_channel_weights(cfg, n_channels)
-    if channel_weights.size == 0:
-        return np.array([], dtype=np.float64), []
-
-    local_w1 = np.zeros(n_anchors, dtype=np.float64)
-    for channel_weight in channel_weights:
-        for start in range(0, n_anchors, anchor_chunk):
-            stop = min(start + anchor_chunk, n_anchors)
-            candidate_chunk = np.einsum(
-                "nca,c->na", candidate_response[:, :n_channels, start:stop], channel_weight, optimize=True
-            )
-            reference_chunk = np.einsum(
-                "nca,c->na", reference_response[:, :n_channels, start:stop], channel_weight, optimize=True
-            )
-            candidate_q = np.quantile(candidate_chunk, quantiles, axis=0)
-            reference_q = np.quantile(reference_chunk, quantiles, axis=0)
-            local_w1[start:stop] += np.mean(np.abs(candidate_q - reference_q), axis=0)
-    local_w1 /= len(channel_weights)
-
-    n_top = min(max(int(n_top), 0), n_anchors)
-    top_indices = np.argsort(local_w1)[::-1][:n_top]
-    distributions = []
-    for anchor_idx in top_indices:
-        candidate_parts = [
-            np.einsum(
-                "nc,c->n",
-                candidate_response[:, :n_channels, anchor_idx],
-                channel_weight,
-                optimize=True,
-            )
-            for channel_weight in channel_weights
-        ]
-        reference_parts = [
-            np.einsum(
-                "nc,c->n",
-                reference_response[:, :n_channels, anchor_idx],
-                channel_weight,
-                optimize=True,
-            )
-            for channel_weight in channel_weights
-        ]
-        distributions.append(
-            {
-                "anchor_index": int(anchor_idx),
-                "w1": float(local_w1[anchor_idx]),
-                "candidate": np.concatenate(candidate_parts).astype(np.float32),
-                "reference": np.concatenate(reference_parts).astype(np.float32),
-            }
-        )
-    return local_w1, distributions
-
-def scwd_anchor_mean_response_difference(candidate, reference, cfg):
-    """Return candidate-minus-reference mean SCWD filter responses per anchor."""
-    candidate_response = np.asarray(candidate.get("scwd_responses"))
-    reference_response = np.asarray(reference.get("scwd_responses"))
-    if candidate_response.size == 0 or reference_response.size == 0:
-        return np.array([], dtype=np.float64)
-    if candidate_response.ndim != 3 or reference_response.ndim != 3:
-        return np.array([], dtype=np.float64)
-    n_channels = min(candidate_response.shape[1], reference_response.shape[1])
-    n_anchors = min(candidate_response.shape[2], reference_response.shape[2])
-    channel_weights = scwd_channel_weights(cfg, n_channels)
-    if n_channels == 0 or n_anchors == 0 or channel_weights.size == 0:
-        return np.array([], dtype=np.float64)
+        return np.empty((0, 0), dtype=np.float64)
     candidate_mean = np.mean(candidate_response[:, :n_channels, :n_anchors], axis=0)
     reference_mean = np.mean(reference_response[:, :n_channels, :n_anchors], axis=0)
-    projected_difference = np.einsum(
-        "pc,ca->pa", channel_weights, candidate_mean - reference_mean, optimize=True
-    )
-    return np.mean(projected_difference, axis=0)
+    return np.asarray(candidate_mean - reference_mean, dtype=np.float64)
 
 
 def scwd_anchor_area_weights(cfg):
@@ -1240,58 +1476,26 @@ def spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device)
 
 
 def joint_spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device):
-    """Torch SCWD implementation for projected multi-channel fields."""
-    candidate_fields = np.asarray(candidate["channel_fields"], dtype=np.float64)
-    reference_fields = np.asarray(reference["channel_fields"], dtype=np.float64)
+    """Compute joint SCWD responses on-device, followed by exact CPU anchor OT."""
+    candidate_fields = np.asarray(candidate["channel_fields"], dtype=np.float32)
+    reference_fields = np.asarray(reference["channel_fields"], dtype=np.float32)
     if candidate_fields.size == 0 or reference_fields.size == 0:
         return np.nan
     if candidate_fields.ndim != 4 or reference_fields.ndim != 4:
         return np.nan
     if candidate_fields.shape[1:] != reference_fields.shape[1:]:
         return np.nan
-
     weights = scwd_weight_vectors(reference, cfg)
     n_pixels = candidate_fields.shape[2] * candidate_fields.shape[3]
     weight_matrix = scwd_sparse_weight_matrix_torch(weights, n_pixels, cfg, device)
     if weight_matrix is None or weight_matrix.shape[0] == 0:
         return np.nan
-
-    dtype = torch_metric_dtype(cfg)
-    n_samples, n_channels = candidate_fields.shape[:2]
-    candidate_flat = torch_tensor(candidate_fields, device, dtype).reshape(n_samples, n_channels, n_pixels)
-    reference_flat = torch_tensor(reference_fields, device, dtype).reshape(reference_fields.shape[0], n_channels, n_pixels)
-
-    candidate_by_channel = torch.stack(
-        [torch.sparse.mm(weight_matrix, candidate_flat[:, channel_idx, :].T).T for channel_idx in range(n_channels)],
-        dim=1,
+    candidate_response = scwd_response_batch(candidate_fields, None, weight_matrix, cfg, device)
+    reference_response = scwd_response_batch(reference_fields, None, weight_matrix, cfg, device)
+    return scwd_from_responses(
+        {"scwd_responses": candidate_response},
+        {"scwd_responses": reference_response}, cfg,
     )
-    reference_by_channel = torch.stack(
-        [torch.sparse.mm(weight_matrix, reference_flat[:, channel_idx, :].T).T for channel_idx in range(n_channels)],
-        dim=1,
-    )
-
-    n_channel_projections = int(baseline_get(cfg, "scwd_channel_projections", 16))
-    seed = int(baseline_get(cfg, "swd_seed", 0))
-    rng = np.random.default_rng(seed)
-    channel_weights = rng.normal(size=(max(1, n_channel_projections), n_channels))
-    norms = np.linalg.norm(channel_weights, axis=1)
-    keep = norms > 1e-12
-    if not np.any(keep):
-        return np.nan
-    channel_weights = channel_weights[keep] / norms[keep, None]
-    channel_weights_t = torch_tensor(channel_weights, device, dtype)
-
-    candidate_slices = torch.einsum("sca,pc->psa", candidate_by_channel, channel_weights_t)
-    reference_slices = torch.einsum("sca,pc->psa", reference_by_channel, channel_weights_t)
-
-    r = float(baseline_get(cfg, "scwd_order", 2.0))
-    n_quantiles = int(baseline_get(cfg, "scwd_quantiles", 200))
-    quantiles = torch.linspace(0.0, 1.0, n_quantiles, dtype=dtype, device=device)
-    candidate_quantiles = torch.quantile(candidate_slices, quantiles, dim=1)
-    reference_quantiles = torch.quantile(reference_slices, quantiles, dim=1)
-    total = torch.sum(torch.abs(candidate_quantiles - reference_quantiles) ** r)
-    denom = float(channel_weights_t.shape[0] * weight_matrix.shape[0] * n_quantiles)
-    return float(((total / denom) ** (1.0 / r)).detach().cpu())
 
 
 def spherical_convolutional_wasserstein(candidate, reference, cfg):
@@ -1350,59 +1554,31 @@ def spherical_convolutional_wasserstein(candidate, reference, cfg):
 
 
 def joint_spherical_convolutional_wasserstein(candidate, reference, cfg):
-    """Multi-channel SCWD with random channel weights inside each filter."""
-    candidate_fields = np.asarray(candidate["channel_fields"], dtype=np.float64)
-    reference_fields = np.asarray(reference["channel_fields"], dtype=np.float64)
+    """Joint empirical multi-field W2 of spherical convolution responses."""
+    candidate_fields = np.asarray(candidate["channel_fields"], dtype=np.float32)
+    reference_fields = np.asarray(reference["channel_fields"], dtype=np.float32)
     if candidate_fields.size == 0 or reference_fields.size == 0:
         return np.nan
     if candidate_fields.ndim != 4 or reference_fields.ndim != 4:
         return np.nan
     if candidate_fields.shape[1:] != reference_fields.shape[1:]:
         return np.nan
-
     weights = scwd_weight_vectors(reference, cfg)
     if not weights:
         return np.nan
-
     device = torch_metric_device(cfg)
     if device is not None:
         return joint_spherical_convolutional_wasserstein_torch(candidate, reference, cfg, device)
-
-    n_channel_projections = int(baseline_get(cfg, "scwd_channel_projections", 16))
-    seed = int(baseline_get(cfg, "swd_seed", 0))
-    rng = np.random.default_rng(seed)
-    candidate_flat = candidate_fields.reshape(candidate_fields.shape[0], candidate_fields.shape[1], -1)
-    reference_flat = reference_fields.reshape(reference_fields.shape[0], reference_fields.shape[1], -1)
-    r = float(baseline_get(cfg, "scwd_order", 2.0))
-    n_quantiles = int(baseline_get(cfg, "scwd_quantiles", 200))
-    quantiles = np.linspace(0.0, 1.0, n_quantiles)
-
-    total = 0.0
-    n_used = 0
-    for support, support_weights in weights:
-        if support.size == 0:
-            continue
-        candidate_by_channel = np.stack(
-            [candidate_flat[:, channel_idx, support] @ support_weights for channel_idx in range(candidate_flat.shape[1])],
-            axis=1,
-        )
-        reference_by_channel = np.stack(
-            [reference_flat[:, channel_idx, support] @ support_weights for channel_idx in range(reference_flat.shape[1])],
-            axis=1,
-        )
-        for _ in range(max(1, n_channel_projections)):
-            channel_weights = rng.normal(size=candidate_by_channel.shape[1])
-            norm = np.linalg.norm(channel_weights)
-            if norm <= 1e-12:
-                continue
-            channel_weights /= norm
-            candidate_slice = candidate_by_channel @ channel_weights
-            reference_slice = reference_by_channel @ channel_weights
-            candidate_quantiles = np.quantile(candidate_slice, quantiles)
-            reference_quantiles = np.quantile(reference_slice, quantiles)
-            total += float(np.sum(np.abs(candidate_quantiles - reference_quantiles) ** r))
-            n_used += 1
-    return float((total / (n_used * n_quantiles)) ** (1.0 / r)) if n_used else np.nan
+    n_pixels = candidate_fields.shape[2] * candidate_fields.shape[3]
+    weight_matrix = scwd_sparse_weight_matrix_numpy(weights, n_pixels)
+    if weight_matrix is None or weight_matrix.shape[0] == 0:
+        return np.nan
+    candidate_response = scwd_response_batch(candidate_fields, weight_matrix, None, cfg, None)
+    reference_response = scwd_response_batch(reference_fields, weight_matrix, None, cfg, None)
+    return scwd_from_responses(
+        {"scwd_responses": candidate_response},
+        {"scwd_responses": reference_response}, cfg,
+    )
 
 
 def gaussian_density_inner_mean_1d(left, right, bandwidth):
@@ -1842,8 +2018,12 @@ def evaluate_mmd_global_moment_matching(cfg):
                     lead_idx=lead_idx, global_moment_correction=correction,
                     description=f"{label} +{lead_hour}h moment-matched forecast MMD",
                 )
-                raw_mmd = mmd_rbf_distance(raw["vectors"], reference["vectors"], cfg)
-                matched_mmd = mmd_rbf_distance(matched["vectors"], reference["vectors"], cfg)
+                raw_mmd = mmd_rbf_distance(
+                    raw["vectors"], reference["vectors"], cfg, reference["mmd_field_slices"]
+                )
+                matched_mmd = mmd_rbf_distance(
+                    matched["vectors"], reference["vectors"], cfg, reference["mmd_field_slices"]
+                )
                 row = {
                     "label": label, "variables": ",".join(variables), "lead_hour": lead_hour,
                     "n_train_pairs": len(train_pairs), "n_test_pairs": len(test_pairs),
@@ -1899,6 +2079,8 @@ def streaming_joint_features(
     corruption_type=None,
     severity=0.0,
     global_moment_correction=None,
+    histogram_target=None,
+    histogram_coordinate=None,
     description="distribution features",
 ):
     """Build compact all-time metric summaries in bounded memory."""
@@ -1962,6 +2144,10 @@ def streaming_joint_features(
     donor_positions = None
     if corruption_type == "hemisphere_splice":
         donor_positions = deranged_sample_positions(len(time_indices), base_seed)
+    elif corruption_type == "field_splice":
+        donor_positions = fieldwise_deranged_sample_positions(
+            len(time_indices), len(variables), base_seed
+        )
     for start in tqdm(range(0, len(time_indices), chunk_size), desc=description):
         chunk_indices = time_indices[start:start + chunk_size]
         chunk_ds = ds.isel(time=chunk_indices)
@@ -1974,18 +2160,18 @@ def streaming_joint_features(
         }
         donor_raw_by_variable = None
         if donor_positions is not None:
-            donor_time_indices = [
-                time_indices[int(donor_positions[position])]
-                for position in range(start, start + len(chunk_indices))
-            ]
-            donor_chunk = ds.isel(time=donor_time_indices)
-            donor_raw_by_variable = {
-                variable: np.asarray(
+            donor_raw_by_variable = {}
+            for channel, variable in enumerate(variables):
+                positions = donor_positions if donor_positions.ndim == 1 else donor_positions[channel]
+                donor_time_indices = [
+                    time_indices[int(positions[position])]
+                    for position in range(start, start + len(chunk_indices))
+                ]
+                donor_chunk = ds.isel(time=donor_time_indices)
+                donor_raw_by_variable[variable] = np.asarray(
                     donor_chunk[variable].transpose("time", "latitude", "longitude").values,
                     dtype=np.float32,
                 )
-                for variable in variables
-            }
         valid_fields = []
         valid_positions = []
         for local_idx, time_idx in enumerate(chunk_indices):
@@ -2035,6 +2221,14 @@ def streaming_joint_features(
                         standardized = apply_configured_corruption(
                             torch.from_numpy(standardized), corruption_type, float(severity)
                         ).detach().cpu().numpy().astype(np.float32)
+            if histogram_target is not None:
+                kind = "corruption" if corruption_type is not None else "forecast"
+                standardized = match_standardized(
+                    cfg, standardized, variables,
+                    {v: reference_stats[v]["mean"] for v in variables},
+                    {v: reference_stats[v]["std"] for v in variables},
+                    "standard", kind, histogram_target, histogram_coordinate,
+                )
             valid_fields.append(standardized)
             valid_positions.append(start + local_idx)
 
@@ -2046,7 +2240,9 @@ def streaming_joint_features(
         if need_global_mean_wd:
             global_means.append(area_weighted_global_means(field_batch, latitudes))
 
-        total, total_sq, weight_mass = latitude_weighted_moment_totals(field_batch, latitudes)
+        # Mean-bias and standard-ratio baselines are pointwise grid-cell moments;
+        # area weighting remains specific to metrics that explicitly require it.
+        total, total_sq, weight_mass = pointwise_moment_totals(field_batch)
         value_total += total
         value_total_sq += total_sq
         value_weight_mass += weight_mass
@@ -2112,6 +2308,7 @@ def streaming_joint_features(
         scwd_responses.flush()
 
     return {
+        "field_names": tuple(str(variable) for variable in variables),
         "mean": float(mean),
         "std": float(np.sqrt(variance)),
         "spectrum": spectrum_total / n_valid,
@@ -2139,6 +2336,11 @@ def streaming_joint_features(
             else np.empty((0, 0), dtype=np.float32)
         ),
         "unweighted_vectors": np.empty((0, 0), dtype=np.float32),
+        "mmd_field_slices": [
+            (field_index * min(len(latitudes) * len(longitudes), per_variable_pixels),
+             (field_index + 1) * min(len(latitudes) * len(longitudes), per_variable_pixels))
+            for field_index in range(len(variables))
+        ],
         "global_means": (
             np.concatenate(global_means, axis=0).astype(np.float32)
             if global_means
@@ -2223,7 +2425,10 @@ def distribution_metric_values(candidate, reference, cfg, metric_names=None):
             candidate["vectors"], reference["vectors"], n_projections, seed, cramer_wold_bandwidth
         )
     if "mmd_rbf" in requested:
-        metrics["mmd_rbf"] = mmd_rbf_distance(candidate["vectors"], reference["vectors"], cfg)
+        metrics["mmd_rbf"] = mmd_rbf_distance(
+            candidate["vectors"], reference["vectors"], cfg,
+            reference.get("mmd_field_slices", candidate.get("mmd_field_slices")),
+        )
     if "scwd_area_weighted" in requested:
         metrics["scwd_area_weighted"] = scwd_area_weighted_from_responses(candidate, reference, cfg)
     if "scwd" in requested:
@@ -2302,60 +2507,116 @@ def evaluate_era5_train_shift_metrics(evaluation_features, train_features, varia
 
 
 
-def global_mean_wasserstein_diagnostic(candidate, reference, cfg, label, lead_hour, scalar_distance):
-    """Retain global-mean samples needed to replot one forecast lead."""
+def global_mean_wasserstein_diagnostic(
+    candidate, reference, cfg, label, lead_hour, scalar_distance=np.nan, *,
+    comparison_kind="forecast", severity=None, row=None,
+):
+    """Retain joint global-mean samples and the row receiving the final score."""
     return {
         "label": str(label),
+        "comparison_kind": str(comparison_kind),
+        "severity": np.nan if severity is None else float(severity),
         "lead_hour": int(lead_hour),
         "candidate": np.asarray(candidate["global_means"], dtype=np.float32),
         "reference": np.asarray(reference["global_means"], dtype=np.float32),
         "distance": float(scalar_distance),
         "n_bins": int(baseline_get(cfg, "global_mean_wd_bins", 20)),
+        "row": row,
     }
 
 
+def finalize_global_mean_wasserstein(diagnostics, cfg):
+    """Fit one pooled experiment grid and recompute every joint GWD comparison."""
+    if not diagnostics:
+        return None
+    n_bins = int(baseline_get(cfg, "global_mean_wd_bins", 20))
+    distributions = []
+    for item in diagnostics:
+        distributions.extend([item["candidate"], item["reference"]])
+    grid = fit_vissio_ulam_grid(distributions, n_bins=n_bins)
+    for item in tqdm(diagnostics, desc="Joint global-mean Ulam W2"):
+        item["distance"] = vissio_global_mean_wasserstein(
+            item["candidate"], item["reference"], n_bins=n_bins, grid=grid,
+        )
+        item["grid"] = grid
+        if item.get("row") is not None:
+            item["row"]["global_mean_wasserstein"] = item["distance"]
+    return grid
+
+
 def write_global_mean_wasserstein_diagnostics(diagnostics, variables, output_root):
-    """Persist global-mean samples so plot-only runs do not reopen data."""
+    """Persist joint GWD samples, pooled grid, sparse Ulam measures, and scores."""
     output_path = output_root / "data" / "global_mean_wasserstein_distributions.nc"
     if not diagnostics:
         output_path.unlink(missing_ok=True)
         return
     n_fields = len(variables)
+    grid = diagnostics[0].get("grid")
+    if grid is None:
+        raise ValueError("Joint GWD diagnostics were not finalized with an experiment-wide grid.")
     candidate_size = max(item["candidate"].shape[0] for item in diagnostics)
     reference_size = max(item["reference"].shape[0] for item in diagnostics)
     candidate = np.full((len(diagnostics), n_fields, candidate_size), np.nan, dtype=np.float32)
     reference = np.full((len(diagnostics), n_fields, reference_size), np.nan, dtype=np.float32)
     candidate_count = np.zeros(len(diagnostics), dtype=np.int64)
     reference_count = np.zeros(len(diagnostics), dtype=np.int64)
-    for comparison, item in enumerate(diagnostics):
-        candidate_values = item["candidate"]
-        reference_values = item["reference"]
+    measures = []
+    for item in diagnostics:
+        cand_support, cand_mass, cand_cells = vissio_ulam_measure(item["candidate"], grid)
+        ref_support, ref_mass, ref_cells = vissio_ulam_measure(item["reference"], grid)
+        measures.append((cand_support, cand_mass, cand_cells, ref_support, ref_mass, ref_cells))
+    candidate_support_size = max(len(item[0]) for item in measures)
+    reference_support_size = max(len(item[3]) for item in measures)
+    candidate_support = np.full((len(diagnostics), candidate_support_size, n_fields), np.nan)
+    reference_support = np.full((len(diagnostics), reference_support_size, n_fields), np.nan)
+    candidate_cells = np.full((len(diagnostics), candidate_support_size, n_fields), -1, dtype=np.int32)
+    reference_cells = np.full((len(diagnostics), reference_support_size, n_fields), -1, dtype=np.int32)
+    candidate_mass = np.zeros((len(diagnostics), candidate_support_size), dtype=np.float64)
+    reference_mass = np.zeros((len(diagnostics), reference_support_size), dtype=np.float64)
+    for comparison, (item, measure) in enumerate(zip(diagnostics, measures)):
+        candidate_values, reference_values = item["candidate"], item["reference"]
         if candidate_values.shape[1] != n_fields or reference_values.shape[1] != n_fields:
             raise ValueError("Global-mean diagnostic field count does not match configured variables.")
-        candidate_count[comparison] = candidate_values.shape[0]
-        reference_count[comparison] = reference_values.shape[0]
-        candidate[comparison, :, :candidate_values.shape[0]] = candidate_values.T
-        reference[comparison, :, :reference_values.shape[0]] = reference_values.T
+        candidate_count[comparison], reference_count[comparison] = len(candidate_values), len(reference_values)
+        candidate[comparison, :, :len(candidate_values)] = candidate_values.T
+        reference[comparison, :, :len(reference_values)] = reference_values.T
+        cand_support, cand_mass, cand_cells, ref_support, ref_mass, ref_cells = measure
+        candidate_support[comparison, :len(cand_support)] = cand_support
+        reference_support[comparison, :len(ref_support)] = ref_support
+        candidate_cells[comparison, :len(cand_cells)] = cand_cells
+        reference_cells[comparison, :len(ref_cells)] = ref_cells
+        candidate_mass[comparison, :len(cand_mass)] = cand_mass
+        reference_mass[comparison, :len(ref_mass)] = ref_mass
     dataset = xr.Dataset(
         data_vars={
             "candidate_global_mean": (("comparison", "field", "candidate_sample"), candidate),
             "reference_global_mean": (("comparison", "field", "reference_sample"), reference),
             "candidate_sample_count": ("comparison", candidate_count),
             "reference_sample_count": ("comparison", reference_count),
-            "global_mean_wasserstein": (
-                "comparison", np.asarray([item["distance"] for item in diagnostics], dtype=np.float64)
-            ),
+            "global_mean_wasserstein": ("comparison", np.asarray([item["distance"] for item in diagnostics])),
+            "ulam_lower": ("field", np.asarray(grid["lower"], dtype=np.float64)),
+            "ulam_upper": ("field", np.asarray(grid["upper"], dtype=np.float64)),
+            "candidate_ulam_support": (("comparison", "candidate_support", "field"), candidate_support),
+            "reference_ulam_support": (("comparison", "reference_support", "field"), reference_support),
+            "candidate_ulam_cell": (("comparison", "candidate_support", "field"), candidate_cells),
+            "reference_ulam_cell": (("comparison", "reference_support", "field"), reference_cells),
+            "candidate_ulam_mass": (("comparison", "candidate_support"), candidate_mass),
+            "reference_ulam_mass": (("comparison", "reference_support"), reference_mass),
         },
         coords={
             "comparison": np.arange(len(diagnostics), dtype=np.int64),
             "label": ("comparison", [item["label"] for item in diagnostics]),
+            "comparison_kind": ("comparison", [item.get("comparison_kind", "forecast") for item in diagnostics]),
+            "severity": ("comparison", [item.get("severity", np.nan) for item in diagnostics]),
             "lead_hour": ("comparison", [item["lead_hour"] for item in diagnostics]),
             "field": list(variables),
         },
         attrs={
-            "description": "Forecast and matched ERA5-test global-mean samples for Vissio global-mean W2 plots.",
-            "n_bins": diagnostics[0]["n_bins"],
-            "binning": "Equal-width bins fitted to each matched ERA5-test distribution; candidate values are clipped to its support.",
+            "description": "Joint Vissio-style global-mean W2 diagnostics.",
+            "schema_version": 2,
+            "estimator": "joint_ulam_w2",
+            "n_bins": int(grid["n_bins"]),
+            "binning": "One experiment-wide pooled min/max grid; normalized cell-center Euclidean ground cost.",
         },
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2371,6 +2632,8 @@ def read_global_mean_wasserstein_diagnostics(output_root):
         return []
     diagnostics = []
     with xr.open_dataset(path) as dataset:
+        if int(dataset.attrs.get("schema_version", 0)) < 2:
+            raise ValueError(f"{path} uses marginal or pairwise-grid GWD; rerun standard metric evaluation.")
         required = {"candidate_global_mean", "reference_global_mean", "candidate_sample_count", "reference_sample_count"}
         if not required.issubset(dataset.variables):
             raise ValueError(f"{path} predates artifact-only plotting; rerun baseline evaluation once.")
@@ -2380,12 +2643,19 @@ def read_global_mean_wasserstein_diagnostics(output_root):
             n_reference = int(dataset.reference_sample_count.values[comparison])
             diagnostics.append({
                 "label": str(dataset.label.values[comparison]),
+                "comparison_kind": str(dataset.comparison_kind.values[comparison]),
+                "severity": float(dataset.severity.values[comparison]),
                 "lead_hour": int(dataset.lead_hour.values[comparison]),
                 "candidate": np.asarray(dataset.candidate_global_mean.values[comparison, :, :n_candidate]).T,
                 "reference": np.asarray(dataset.reference_global_mean.values[comparison, :, :n_reference]).T,
                 "distance": float(dataset.global_mean_wasserstein.values[comparison]),
                 "n_bins": int(dataset.attrs.get("n_bins", 20)),
                 "fields": fields,
+                "grid": {
+                    "lower": np.asarray(dataset.ulam_lower.values),
+                    "upper": np.asarray(dataset.ulam_upper.values),
+                    "n_bins": int(dataset.attrs["n_bins"]),
+                },
             })
     return diagnostics
 
@@ -2413,15 +2683,15 @@ def plot_global_mean_wasserstein_distributions(diagnostics, output_root):
                 candidate = candidate[np.isfinite(candidate)]
                 reference = reference[np.isfinite(reference)]
                 if candidate.size and reference.size:
-                    lower, upper = np.min(reference), np.max(reference)
+                    lower = float(item["grid"]["lower"][field_index])
+                    upper = float(item["grid"]["upper"][field_index])
                     if upper > lower:
-                        padding = max((upper - lower) * 1e-9, np.finfo(np.float64).eps)
-                        edges = np.linspace(lower - padding, upper + padding, item["n_bins"] + 1)
+                        edges = np.linspace(lower, upper, item["n_bins"] + 1)
                     else:
-                        edges = np.histogram_bin_edges(np.concatenate([candidate, reference]), bins=max(2, item["n_bins"]))
+                        edges = np.linspace(lower - 0.5, upper + 0.5, item["n_bins"] + 1)
                     axis.hist(reference, bins=edges, density=True, histtype="step", linewidth=1.8, color="black", label="ERA5 test")
                     axis.hist(np.clip(candidate, edges[0], edges[-1]), bins=edges, density=True, histtype="step", linewidth=1.8, color="tab:red", label=label)
-                axis.set_title(f"+{item['lead_hour']} h | {field}\nGlobal-mean W2={item['distance']:.4g}", fontsize=10)
+                axis.set_title(f"+{item['lead_hour']} h | {field}\nJoint global-mean W2={item['distance']:.4g}", fontsize=10)
                 axis.set_xlabel("Cosine-area-weighted global mean (standardized)")
                 axis.set_ylabel("Density")
                 axis.grid(True, alpha=0.25)
@@ -2449,70 +2719,69 @@ def scwd_anchor_diagnostic(
     candidate, reference, cfg, label, lead_hour, scalar_scwd,
     comparison_kind="forecast", severity=None,
 ):
-    """Build one labelled SCWD anchor-contribution diagnostic."""
+    """Build one labelled joint-SCWD anchor diagnostic."""
     costs = scwd_anchor_transport_costs(candidate, reference, cfg)
     n_lat = int(baseline_get(cfg, "scwd_anchor_lat_points", 60))
     n_lon = int(baseline_get(cfg, "scwd_anchor_lon_points", 120))
     if costs.size != n_lat * n_lon:
-        raise ValueError(
-            f"SCWD anchor count mismatch: got {costs.size}, expected {n_lat} x {n_lon}."
-        )
-    r = float(baseline_get(cfg, "scwd_order", 2.0))
+        raise ValueError(f"SCWD anchor count mismatch: got {costs.size}, expected {n_lat} x {n_lon}.")
+    order = float(baseline_get(cfg, "scwd_order", 2.0))
     anchor_lats, anchor_lons = regular_sphere_centers(n_lat, n_lon)
-    reconstructed = float(np.mean(costs) ** (1.0 / r))
+    reconstructed = float(np.mean(costs) ** (1.0 / order))
     if not np.isclose(reconstructed, scalar_scwd, rtol=1e-6, atol=1e-8):
         raise RuntimeError(
             f"SCWD anchor contributions do not reconstruct scalar value: {reconstructed} != {scalar_scwd}."
         )
-    anchor_w1, top_w1_distributions = scwd_anchor_w1_distributions(
-        candidate,
-        reference,
-        cfg,
-        baseline_get(cfg, "scwd_top_w1_anchors", 6),
+    local_wasserstein, top_distributions = scwd_anchor_joint_distributions(
+        candidate, reference, cfg, baseline_get(cfg, "scwd_top_wasserstein_anchors",
+                                                baseline_get(cfg, "scwd_top_w1_anchors", 6)),
     )
-    if anchor_w1.size != costs.size:
-        raise RuntimeError("SCWD local-W1 anchor count does not match transport contributions.")
-    mean_response_difference = scwd_anchor_mean_response_difference(candidate, reference, cfg)
-    if mean_response_difference.size != costs.size:
-        raise RuntimeError("SCWD mean-response anchor count does not match transport contributions.")
-    for item in top_w1_distributions:
-        anchor_lat_idx, anchor_lon_idx = divmod(item["anchor_index"], n_lon)
-        item["latitude"] = float(anchor_lats[anchor_lat_idx])
-        item["longitude"] = float(anchor_lons[anchor_lon_idx])
+    mean_difference = scwd_anchor_mean_response_difference(candidate, reference, cfg)
+    if local_wasserstein.size != costs.size or mean_difference.shape[-1] != costs.size:
+        raise RuntimeError("SCWD diagnostic anchor counts do not match transport contributions.")
+    field_names = list(candidate.get("field_names", ()))
+    if len(field_names) != mean_difference.shape[0]:
+        field_names = [f"field_{index}" for index in range(mean_difference.shape[0])]
+    for item in top_distributions:
+        lat_idx, lon_idx = divmod(item["anchor_index"], n_lon)
+        item["latitude"] = float(anchor_lats[lat_idx])
+        item["longitude"] = float(anchor_lons[lon_idx])
     return {
         "label": str(label),
         "comparison_kind": str(comparison_kind),
         "severity": np.nan if severity is None else float(severity),
         "lead_hour": int(lead_hour),
+        "field_names": field_names,
         "anchor_latitudes": anchor_lats,
         "anchor_longitudes": anchor_lons,
         "anchor_transport_cost": costs.reshape(n_lat, n_lon),
-        "anchor_local_wasserstein": costs.reshape(n_lat, n_lon) ** (1.0 / r),
-        "anchor_w1": anchor_w1.reshape(n_lat, n_lon),
-        "anchor_mean_response_difference": mean_response_difference.reshape(n_lat, n_lon),
-        "top_w1_distributions": top_w1_distributions,
+        "anchor_local_wasserstein": local_wasserstein.reshape(n_lat, n_lon),
+        "anchor_mean_response_difference": mean_difference.reshape(len(field_names), n_lat, n_lon),
+        "top_wasserstein_distributions": top_distributions,
         "scwd": float(scalar_scwd),
-        "scwd_order": r,
+        "scwd_order": order,
     }
 
 
 def write_scwd_anchor_diagnostics(diagnostics, output_root):
-    """Write every value needed to recreate the SCWD diagnostic figures."""
+    """Write versioned joint-SCWD diagnostics needed for artifact-only plotting."""
     output_path = output_root / "data" / "scwd_anchor_contributions.nc"
     if not diagnostics:
         output_path.unlink(missing_ok=True)
         return
     first = diagnostics[0]
-    top_count = max((len(item["top_w1_distributions"]) for item in diagnostics), default=0)
+    field_names = list(first["field_names"])
+    if any(list(item["field_names"]) != field_names for item in diagnostics):
+        raise ValueError("All SCWD diagnostics must use the same ordered fields.")
+    top_count = max((len(item["top_wasserstein_distributions"]) for item in diagnostics), default=0)
     response_count = max(
-        (max(len(top["candidate"]), len(top["reference"]))
-         for item in diagnostics for top in item["top_w1_distributions"]),
-        default=0,
+        (max(top["candidate"].shape[0], top["reference"].shape[0])
+         for item in diagnostics for top in item["top_wasserstein_distributions"]), default=0,
     )
     top_shape = (len(diagnostics), top_count)
-    response_shape = (len(diagnostics), top_count, response_count)
+    response_shape = (len(diagnostics), top_count, len(field_names), response_count)
     top_anchor_index = np.full(top_shape, -1, dtype=np.int64)
-    top_w1 = np.full(top_shape, np.nan, dtype=np.float64)
+    top_wasserstein = np.full(top_shape, np.nan, dtype=np.float64)
     top_latitude = np.full(top_shape, np.nan, dtype=np.float64)
     top_longitude = np.full(top_shape, np.nan, dtype=np.float64)
     candidate_count = np.zeros(top_shape, dtype=np.int64)
@@ -2520,45 +2789,37 @@ def write_scwd_anchor_diagnostics(diagnostics, output_root):
     candidate_response = np.full(response_shape, np.nan, dtype=np.float32)
     reference_response = np.full(response_shape, np.nan, dtype=np.float32)
     for comparison, item in enumerate(diagnostics):
-        for rank, top in enumerate(item["top_w1_distributions"]):
+        for rank, top in enumerate(item["top_wasserstein_distributions"]):
             candidate = np.asarray(top["candidate"], dtype=np.float32)
             reference = np.asarray(top["reference"], dtype=np.float32)
             top_anchor_index[comparison, rank] = int(top["anchor_index"])
-            top_w1[comparison, rank] = float(top["w1"])
+            top_wasserstein[comparison, rank] = float(top["wasserstein"])
             top_latitude[comparison, rank] = float(top["latitude"])
             top_longitude[comparison, rank] = float(top["longitude"])
-            candidate_count[comparison, rank] = len(candidate)
-            reference_count[comparison, rank] = len(reference)
-            candidate_response[comparison, rank, :len(candidate)] = candidate
-            reference_response[comparison, rank, :len(reference)] = reference
+            candidate_count[comparison, rank] = candidate.shape[0]
+            reference_count[comparison, rank] = reference.shape[0]
+            candidate_response[comparison, rank, :, :candidate.shape[0]] = candidate.T
+            reference_response[comparison, rank, :, :reference.shape[0]] = reference.T
 
     dataset = xr.Dataset(
         data_vars={
-            "anchor_transport_cost": (
-                ("comparison", "anchor_latitude", "anchor_longitude"),
-                np.stack([item["anchor_transport_cost"] for item in diagnostics]).astype(np.float64),
-            ),
-            "anchor_local_wasserstein": (
-                ("comparison", "anchor_latitude", "anchor_longitude"),
-                np.stack([item["anchor_local_wasserstein"] for item in diagnostics]).astype(np.float64),
-            ),
-            "anchor_w1": (
-                ("comparison", "anchor_latitude", "anchor_longitude"),
-                np.stack([item["anchor_w1"] for item in diagnostics]).astype(np.float64),
-            ),
+            "anchor_transport_cost": (("comparison", "anchor_latitude", "anchor_longitude"),
+                                      np.stack([item["anchor_transport_cost"] for item in diagnostics])),
+            "anchor_local_wasserstein": (("comparison", "anchor_latitude", "anchor_longitude"),
+                                         np.stack([item["anchor_local_wasserstein"] for item in diagnostics])),
             "anchor_mean_response_difference": (
-                ("comparison", "anchor_latitude", "anchor_longitude"),
-                np.stack([item["anchor_mean_response_difference"] for item in diagnostics]).astype(np.float64),
+                ("comparison", "field", "anchor_latitude", "anchor_longitude"),
+                np.stack([item["anchor_mean_response_difference"] for item in diagnostics]),
             ),
             "scwd": ("comparison", np.asarray([item["scwd"] for item in diagnostics], dtype=np.float64)),
             "top_anchor_index": (("comparison", "top_rank"), top_anchor_index),
-            "top_w1": (("comparison", "top_rank"), top_w1),
+            "top_local_wasserstein": (("comparison", "top_rank"), top_wasserstein),
             "top_latitude": (("comparison", "top_rank"), top_latitude),
             "top_longitude": (("comparison", "top_rank"), top_longitude),
             "candidate_response_count": (("comparison", "top_rank"), candidate_count),
             "reference_response_count": (("comparison", "top_rank"), reference_count),
-            "candidate_response": (("comparison", "top_rank", "response_sample"), candidate_response),
-            "reference_response": (("comparison", "top_rank", "response_sample"), reference_response),
+            "candidate_response": (("comparison", "top_rank", "field", "response_sample"), candidate_response),
+            "reference_response": (("comparison", "top_rank", "field", "response_sample"), reference_response),
         },
         coords={
             "comparison": np.arange(len(diagnostics), dtype=np.int64),
@@ -2566,11 +2827,14 @@ def write_scwd_anchor_diagnostics(diagnostics, output_root):
             "comparison_kind": ("comparison", [item.get("comparison_kind", "forecast") for item in diagnostics]),
             "severity": ("comparison", [item.get("severity", np.nan) for item in diagnostics]),
             "lead_hour": ("comparison", [item["lead_hour"] for item in diagnostics]),
+            "field": field_names,
             "anchor_latitude": first["anchor_latitudes"],
             "anchor_longitude": first["anchor_longitudes"],
         },
         attrs={
-            "description": "SCWD per-anchor transport diagnostics for forecast leads and full-strength corruptions.",
+            "description": "Joint-SCWD per-anchor transport diagnostics.",
+            "schema_version": 2,
+            "estimator": "joint_empirical_w2",
             "scwd_order": first["scwd_order"],
             "reconstruction": "scwd = mean(anchor_transport_cost) ** (1 / scwd_order)",
         },
@@ -2582,15 +2846,20 @@ def write_scwd_anchor_diagnostics(diagnostics, output_root):
 
 
 def read_scwd_anchor_diagnostics(output_root):
-    """Load SCWD diagnostics without reopening forecast or ERA5 datasets."""
+    """Load versioned joint-SCWD diagnostics without reopening source data."""
     path = output_root / "data" / "scwd_anchor_contributions.nc"
     if not path.exists():
         return []
     diagnostics = []
     with xr.open_dataset(path) as dataset:
-        required = {"candidate_response", "reference_response", "top_anchor_index"}
+        if int(dataset.attrs.get("schema_version", 0)) < 2:
+            raise ValueError(
+                f"{path} uses the legacy projected-channel SCWD schema; rerun standard metric evaluation."
+            )
+        required = {"candidate_response", "reference_response", "top_local_wasserstein"}
         if not required.issubset(dataset.variables):
-            raise ValueError(f"{path} predates artifact-only plotting; rerun baseline evaluation once.")
+            raise ValueError(f"{path} is missing joint-SCWD diagnostics; rerun baseline evaluation.")
+        field_names = [str(value) for value in dataset.field.values]
         for comparison in range(dataset.sizes["comparison"]):
             distributions = []
             for rank in range(dataset.sizes.get("top_rank", 0)):
@@ -2601,11 +2870,11 @@ def read_scwd_anchor_diagnostics(output_root):
                 n_reference = int(dataset.reference_response_count.values[comparison, rank])
                 distributions.append({
                     "anchor_index": anchor_index,
-                    "w1": float(dataset.top_w1.values[comparison, rank]),
+                    "wasserstein": float(dataset.top_local_wasserstein.values[comparison, rank]),
                     "latitude": float(dataset.top_latitude.values[comparison, rank]),
                     "longitude": float(dataset.top_longitude.values[comparison, rank]),
-                    "candidate": np.asarray(dataset.candidate_response.values[comparison, rank, :n_candidate]),
-                    "reference": np.asarray(dataset.reference_response.values[comparison, rank, :n_reference]),
+                    "candidate": np.asarray(dataset.candidate_response.values[comparison, rank, :, :n_candidate]).T,
+                    "reference": np.asarray(dataset.reference_response.values[comparison, rank, :, :n_reference]).T,
                 })
             diagnostics.append({
                 "label": str(dataset.label.values[comparison]),
@@ -2614,13 +2883,13 @@ def read_scwd_anchor_diagnostics(output_root):
                 "severity": (float(dataset.severity.values[comparison])
                              if "severity" in dataset.coords else np.nan),
                 "lead_hour": int(dataset.lead_hour.values[comparison]),
+                "field_names": field_names,
                 "anchor_latitudes": np.asarray(dataset.anchor_latitude.values),
                 "anchor_longitudes": np.asarray(dataset.anchor_longitude.values),
                 "anchor_transport_cost": np.asarray(dataset.anchor_transport_cost.values[comparison]),
                 "anchor_local_wasserstein": np.asarray(dataset.anchor_local_wasserstein.values[comparison]),
-                "anchor_w1": np.asarray(dataset.anchor_w1.values[comparison]),
                 "anchor_mean_response_difference": np.asarray(dataset.anchor_mean_response_difference.values[comparison]),
-                "top_w1_distributions": distributions,
+                "top_wasserstein_distributions": distributions,
                 "scwd": float(dataset.scwd.values[comparison]),
                 "scwd_order": float(dataset.attrs["scwd_order"]),
             })
@@ -2647,7 +2916,7 @@ def scwd_plot_root(output_root, comparison_kind, top_w1=False):
     elif comparison_kind == "null":
         root = root / "null"
     if top_w1:
-        root = root / "top_w1_distributions"
+        root = root / "top_wasserstein_distributions"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -2694,6 +2963,7 @@ def plot_scwd_anchor_diagnostics(diagnostics, output_root):
                 cmap="magma",
                 vmin=0.0,
                 vmax=vmax,
+                rasterized=True,
             )
             axis.set_global()
             axis.coastlines(linewidth=0.55)
@@ -2714,130 +2984,121 @@ def plot_scwd_anchor_diagnostics(diagnostics, output_root):
         print(f"Saved SCWD anchor map to: {output_path}")
 
 
-def plot_scwd_top_w1_distributions(diagnostics, cfg, output_root):
-    """Overlay candidate and test-ERA5 response distributions at the top local-W1 anchors."""
+def plot_scwd_top_wasserstein_distributions(diagnostics, cfg, output_root):
+    """Plot per-field marginals at anchors with the largest local joint W2."""
     if not diagnostics:
         return
     n_bins = max(2, int(baseline_get(cfg, "scwd_distribution_bins", 40)))
-
     for diagnostic in diagnostics:
-        distributions = diagnostic["top_w1_distributions"]
+        distributions = diagnostic["top_wasserstein_distributions"]
+        fields = diagnostic["field_names"]
         if not distributions:
             continue
-        n_cols = min(2, len(distributions))
-        n_rows = int(np.ceil(len(distributions) / n_cols))
-        figure, axes = plt.subplots(n_rows, n_cols, figsize=(5.0 * n_cols, 3.5 * n_rows), squeeze=False)
-        flat_axes = axes.ravel()
-        for axis, item in zip(flat_axes, distributions):
-            values = np.concatenate([item["candidate"], item["reference"]])
-            edges = np.histogram_bin_edges(values, bins=n_bins)
-            axis.hist(
-                item["reference"],
-                bins=edges,
-                density=True,
-                histtype="step",
-                linewidth=1.8,
-                color="black",
-                label=("ERA5 days 1–15" if scwd_comparison_kind(diagnostic) == "null" else "ERA5 test"),
-            )
-            axis.hist(
-                item["candidate"],
-                bins=edges,
-                density=True,
-                histtype="step",
-                linewidth=1.8,
-                color="tab:red",
-                label=diagnostic["label"],
-            )
-            axis.set_title(
-                f"{item['latitude']:.1f}°, {item['longitude']:.1f}°\nlocal W1={item['w1']:.4g}",
-                fontsize=10,
-            )
-            axis.set_xlabel("SCWD filter response")
-            axis.set_ylabel("Density")
-            axis.grid(True, alpha=0.25)
-        for axis in flat_axes[len(distributions):]:
-            axis.set_visible(False)
-        flat_axes[0].legend(fontsize=9)
-        detail = scwd_comparison_detail(diagnostic)
-        figure.suptitle(
-            f"Highest local-W1 SCWD responses: {diagnostic['label']} ({detail})",
-            fontsize=14,
+        n_rows, n_cols = len(distributions), len(fields)
+        figure, axes = plt.subplots(
+            n_rows, n_cols, figsize=(3.8 * n_cols, 2.8 * n_rows), squeeze=False,
         )
-        figure.tight_layout(rect=[0, 0, 1, 0.94])
+        payload = {"fields": np.asarray(fields, dtype=str)}
+        for rank, item in enumerate(distributions):
+            for field_index, field in enumerate(fields):
+                axis = axes[rank, field_index]
+                candidate = item["candidate"][:, field_index]
+                reference = item["reference"][:, field_index]
+                edges = np.histogram_bin_edges(np.concatenate([candidate, reference]), bins=n_bins)
+                axis.hist(reference, bins=edges, density=True, histtype="step", linewidth=1.5,
+                          color="black", label=("ERA5 days 1–15" if scwd_comparison_kind(diagnostic) == "null" else "ERA5 test"))
+                axis.hist(candidate, bins=edges, density=True, histtype="step", linewidth=1.5,
+                          color="tab:red", label=diagnostic["label"])
+                latitude = item["latitude"]
+                longitude = item["longitude"]
+                local_wasserstein = item["wasserstein"]
+                axis.set_title(
+                    f"{field}\n{latitude:.1f}°, {longitude:.1f}°; joint W2={local_wasserstein:.4g}",
+                    fontsize=9,
+                )
+                axis.set_xlabel("SCWD filter response")
+                axis.set_ylabel("Density")
+                axis.grid(True, alpha=0.25)
+                payload[f"candidate_responses_{rank}_{field_index}"] = candidate
+                payload[f"reference_responses_{rank}_{field_index}"] = reference
+                payload[f"bin_edges_{rank}_{field_index}"] = edges
+            payload[f"anchor_latitude_{rank}"] = np.asarray(item["latitude"])
+            payload[f"anchor_longitude_{rank}"] = np.asarray(item["longitude"])
+            payload[f"local_wasserstein_{rank}"] = np.asarray(item["wasserstein"])
+        axes[0, 0].legend(fontsize=8)
+        detail = scwd_comparison_detail(diagnostic)
+        figure.suptitle(f"Highest local joint-W2 SCWD anchors: {diagnostic.get('label')} ({detail})", fontsize=13)
+        figure.tight_layout(rect=[0, 0, 1, 0.97])
         kind_root = scwd_plot_root(output_root, scwd_comparison_kind(diagnostic), top_w1=True)
-        suffix = f"_{int(diagnostic['lead_hour']):03d}h" if scwd_comparison_kind(diagnostic) == "forecast" else ""
+        suffix = f"_{int(diagnostic.get("lead_hour")):03d}h" if scwd_comparison_kind(diagnostic) == "forecast" else ""
         output_path = kind_root / f"{scwd_output_stem(diagnostic)}{suffix}.png"
-        payload = {}
-        for index, item in enumerate(distributions):
-            payload[f"candidate_responses_{index}"] = item["candidate"]
-            payload[f"reference_responses_{index}"] = item["reference"]
-            payload[f"bin_edges_{index}"] = np.histogram_bin_edges(
-                np.concatenate([item["candidate"], item["reference"]]), bins=n_bins,
-            )
-            payload[f"anchor_latitude_{index}"] = np.asarray(item["latitude"])
-            payload[f"anchor_longitude_{index}"] = np.asarray(item["longitude"])
         save_figure_bundle(
-            figure, output_path, plot_type="scwd_top_w1_distributions",
-            payload=payload, dpi=220, bbox_inches="tight",
+            figure, output_path, plot_type="scwd_top_joint_w2_distributions",
+            payload=payload, dpi=180, bbox_inches="tight",
         )
         plt.close(figure)
-        print(f"Saved top-W1 SCWD response distributions to: {output_path}")
+        print(f"Saved top joint-W2 SCWD response distributions to: {output_path}")
 
 
 def plot_scwd_mean_response_differences(diagnostics, output_root):
-    """Plot candidate-minus-reference mean SCWD filter responses by anchor."""
+    """Plot per-field candidate-minus-reference mean SCWD responses."""
     if not diagnostics:
         return
     values = np.stack([item["anchor_mean_response_difference"] for item in diagnostics])
     vmax = max(float(np.nanpercentile(np.abs(values), 99)), 1e-12)
     labels = sorted({(scwd_comparison_kind(item), item["label"]) for item in diagnostics})
-
     for comparison_kind, label in labels:
         series = sorted(
             [item for item in diagnostics
              if scwd_comparison_kind(item) == comparison_kind and item["label"] == label],
             key=lambda item: item["lead_hour"],
         )
-        n_cols = min(2, len(series))
-        n_rows = int(np.ceil(len(series) / n_cols))
+        fields = series[0]["field_names"]
+        n_panels = len(series) * len(fields)
+        n_cols = min(2, n_panels)
+        n_rows = int(np.ceil(n_panels / n_cols))
         figure, axes = plt.subplots(
-            n_rows,
-            n_cols,
-            figsize=(5.2 * n_cols, 3.6 * n_rows),
-            squeeze=False,
+            n_rows, n_cols, figsize=(5.2 * n_cols, 3.6 * n_rows), squeeze=False,
             subplot_kw={"projection": ccrs.PlateCarree()},
         )
         flat_axes = axes.ravel()
         image = None
-        for axis, item in zip(flat_axes, series):
-            image = axis.pcolormesh(
-                item["anchor_longitudes"],
-                item["anchor_latitudes"],
-                item["anchor_mean_response_difference"],
-                shading="auto",
-                transform=ccrs.PlateCarree(),
-                cmap="RdBu_r",
-                vmin=-vmax,
-                vmax=vmax,
-            )
-            axis.set_global()
-            axis.coastlines(linewidth=0.55)
-            axis.add_feature(cfeature.BORDERS, linewidth=0.35, alpha=0.45)
-            axis.set_title(scwd_comparison_detail(item), fontsize=10)
-        for axis in flat_axes[len(series):]:
+        panel = 0
+        for item in series:
+            for field_index, field in enumerate(fields):
+                axis = flat_axes[panel]
+                image = axis.pcolormesh(
+                    item["anchor_longitudes"], item["anchor_latitudes"],
+                    item["anchor_mean_response_difference"][field_index],
+                    shading="auto", transform=ccrs.PlateCarree(), cmap="RdBu_r",
+                    vmin=-vmax, vmax=vmax, rasterized=True,
+                )
+                axis.set_global()
+                axis.coastlines(linewidth=0.55)
+                axis.add_feature(cfeature.BORDERS, linewidth=0.35, alpha=0.45)
+                axis.set_title(f"{scwd_comparison_detail(item)} | {field}", fontsize=9)
+                panel += 1
+        for axis in flat_axes[panel:]:
             axis.set_visible(False)
-        figure.suptitle(f"Mean SCWD filter-response difference: {label} ({comparison_kind})", fontsize=14)
-        figure.subplots_adjust(left=0.03, right=0.87, bottom=0.03, top=0.88, wspace=0.08, hspace=0.24)
+        figure.suptitle(f"Mean SCWD filter-response difference: {label} ({comparison_kind})", fontsize=13)
+        figure.subplots_adjust(left=0.03, right=0.87, bottom=0.03, top=0.9, wspace=0.08, hspace=0.24)
         figure.colorbar(
-            image, ax=flat_axes[:len(series)].tolist(), fraction=0.035, pad=0.035,
-            label="Mean SCWD response difference (candidate − reference)",
+            image, ax=flat_axes[:panel].tolist(), fraction=0.035, pad=0.035,
+            label="Mean response difference (candidate − reference)",
         )
         kind_root = scwd_plot_root(output_root, comparison_kind)
         output_path = kind_root / f"{scwd_output_stem(series[0])}_mean_response_difference.png"
-        save_figure_bundle(figure, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
+        save_figure_bundle(
+            figure, output_path, plot_type="scwd_mean_response_difference",
+            payload={
+                "fields": np.asarray(fields, dtype=str),
+                "mean_response_difference": np.stack([item["anchor_mean_response_difference"] for item in series]),
+                "anchor_latitudes": np.asarray(series[0]["anchor_latitudes"]),
+                "anchor_longitudes": np.asarray(series[0]["anchor_longitudes"]),
+            }, dpi=180, bbox_inches="tight",
+        )
         plt.close(figure)
-        print(f"Saved mean SCWD response-difference map to: {output_path}")
+        print(f"Saved per-field mean SCWD response-difference map to: {output_path}")
 
 
 def evaluate_lead_metrics(cfg, truth_ds, variables, metric_names, temporary_dir):
@@ -2910,6 +3171,7 @@ def evaluate_lead_metrics(cfg, truth_ds, variables, metric_names, temporary_dir)
                 metric_names,
                 Path(temporary_dir) / "forecast-candidate-scwd.dat",
                 lead_idx=lead_idx,
+                histogram_target=label, histogram_coordinate=lead_hour,
                 description=f"{label} +{lead_hour}h features",
             )
             metrics = selected_distribution_metric_values(
@@ -2940,9 +3202,8 @@ def evaluate_lead_metrics(cfg, truth_ds, variables, metric_names, temporary_dir)
                 global_mean_diagnostics.append(
                     global_mean_wasserstein_diagnostic(
                         candidate_features, reference_features, cfg, label, lead_hour,
-                        metrics["global_mean_wasserstein"],
-                    )
-                )
+                        metrics["global_mean_wasserstein"], row=row,
+                    ))
             if row["n_samples"] == 0:
                 print(f"Warning: no valid joint samples for {label} lead={lead_hour} variables={variables}")
             results.append(row)
@@ -3057,6 +3318,7 @@ def evaluate_corruption_metrics(
     """Compare corrupted test fields to matched clean test ERA5."""
     results = []
     scwd_diagnostics = []
+    global_mean_diagnostics = []
     max_samples = int(
         baseline_get(
             cfg,
@@ -3121,6 +3383,12 @@ def evaluate_corruption_metrics(
         }
         zero_row.update({metric_name: zero_metrics[metric_name] for metric_name in metric_names})
         results.append(zero_row)
+        if "global_mean_wasserstein" in metric_names:
+            global_mean_diagnostics.append(global_mean_wasserstein_diagnostic(
+                test_features, test_features, cfg, corruption_type, 0,
+                zero_metrics["global_mean_wasserstein"], comparison_kind="corruption",
+                severity=0.0, row=zero_row,
+            ))
         null_metrics = selected_distribution_metric_values(
             null_features, train_features, metric_names, cfg
         )
@@ -3135,6 +3403,12 @@ def evaluate_corruption_metrics(
         }
         null_row.update({metric_name: null_metrics[metric_name] for metric_name in metric_names})
         results.append(null_row)
+        if "global_mean_wasserstein" in metric_names:
+            global_mean_diagnostics.append(global_mean_wasserstein_diagnostic(
+                null_features, train_features, cfg, ERA5_NULL_LABEL, 0,
+                null_metrics["global_mean_wasserstein"], comparison_kind="null",
+                severity=0.0, row=null_row,
+            ))
         for severity in tqdm(levels, desc=f"{corruption_type} distribution metrics"):
             if float(severity) == 0.0:
                 continue
@@ -3148,6 +3422,7 @@ def evaluate_corruption_metrics(
                 Path(temporary_dir) / "corruption-candidate-scwd.dat",
                 corruption_type=corruption_type,
                 severity=severity,
+                histogram_target=corruption_type, histogram_coordinate=severity,
                 description=f"{corruption_type} severity={severity:.3g}",
             )
             base_row = {
@@ -3164,6 +3439,12 @@ def evaluate_corruption_metrics(
             row.update({metric_name: metrics[metric_name] for metric_name in metric_names})
             row["n_samples"] = metrics["n_samples"]
             row["pairwise_n_samples"] = metrics["pairwise_n_samples"]
+            if "global_mean_wasserstein" in metric_names:
+                global_mean_diagnostics.append(global_mean_wasserstein_diagnostic(
+                    candidate_features, test_features, cfg, corruption_type, 0,
+                    metrics["global_mean_wasserstein"], comparison_kind="corruption",
+                    severity=float(severity), row=row,
+                ))
             if "scwd" in metric_names and np.isclose(float(severity), full_severity):
                 scwd_diagnostics.append(scwd_anchor_diagnostic(
                     candidate_features, test_features, cfg, corruption_type, 0, metrics["scwd"],
@@ -3180,7 +3461,7 @@ def evaluate_corruption_metrics(
     close_feature_memmaps(test_features)
     close_feature_memmaps(train_features)
     close_feature_memmaps(null_features)
-    return (results, scwd_diagnostics) if return_scwd_diagnostics else results
+    return (results, scwd_diagnostics, global_mean_diagnostics) if return_scwd_diagnostics else results
 
 
 def baseline_output_dir(cfg, variables):
@@ -3387,6 +3668,8 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
     metric_names = plotted_metric_names(metric_names)
     """Plot point-estimate metrics versus configured forecast lead time."""
     variable = joint_variable_name(variables)
+    if not metric_names:
+        return
     variable_rows = [row for row in rows if row["variable"] == variable]
     if not variable_rows:
         return
@@ -3437,8 +3720,9 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
 
 def plot_corruption_metrics(rows, metric_names, variables, output_root):
     """Plot point-estimate metrics versus corruption strength."""
+    standalone_names = standalone_metric_names(metric_names)
     metric_names = plotted_metric_names(metric_names)
-    if not metric_names:
+    if not standalone_names:
         return
     variable = joint_variable_name(variables)
     variable_rows = [row for row in rows if row["variable"] == variable]
@@ -3449,7 +3733,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
     metric_output_dir = output_root / "plots" / "corruption"
     metric_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for metric_name in metric_names:
+    for metric_name in standalone_names:
         metric_label = displayed_metric_name(metric_name)
         n_cols = 2
         n_rows = int(np.ceil(len(corruptions) / n_cols))
@@ -3491,6 +3775,9 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
         plt.close(fig)
         print(f"Saved corruption metric plot to: {output_path}")
 
+
+    if not metric_names:
+        return
     colors = plt.cm.tab10(np.linspace(0, 1, max(len(corruptions), 1)))
     n_cols = 2
     n_rows = int(np.ceil(len(metric_names) / n_cols))
@@ -3581,24 +3868,25 @@ def evaluate_corruption_disturbances(cfg, truth_ds, normalization_stats, variabl
             corruption_type in STRUCTURED_NEAR_NULL_CORRUPTIONS | DATA_DEPENDENT_CORRUPTIONS
         )
         donor_standardized = None
-        if corruption_type == "hemisphere_splice":
+        if corruption_type in DATA_DEPENDENT_CORRUPTIONS:
             sample_position = time_indices.index(sample_index)
-            donor_positions = deranged_sample_positions(len(time_indices), base_seed)
-            donor_index = time_indices[int(donor_positions[sample_position])]
-            donor_sample = eval_ds.isel(time=donor_index)
-            donor_clean = np.stack(
-                [
-                    canonical_latlon(donor_sample[variable].values, latitudes).astype(np.float32)
-                    for variable in variables
-                ]
+            donor_positions = (
+                deranged_sample_positions(len(time_indices), base_seed)
+                if corruption_type == "hemisphere_splice"
+                else fieldwise_deranged_sample_positions(len(time_indices), len(variables), base_seed)
             )
-            donor_standardized = np.stack(
-                [
-                    (donor_clean[channel] - means[variable])
-                    / stds[variable]
-                    for channel, variable in enumerate(variables)
-                ]
-            ).astype(np.float32)
+            donor_clean = []
+            for channel, variable in enumerate(variables):
+                positions = donor_positions if donor_positions.ndim == 1 else donor_positions[channel]
+                donor_index = time_indices[int(positions[sample_position])]
+                donor_sample = eval_ds.isel(time=donor_index)
+                donor_clean.append(
+                    canonical_latlon(donor_sample[variable].values, latitudes).astype(np.float32)
+                )
+            donor_standardized = np.stack([
+                (donor_clean[channel] - means[variable]) / stds[variable]
+                for channel, variable in enumerate(variables)
+            ]).astype(np.float32)
         corrupted_fields = []
         disturbances = []
         for severity in levels:
@@ -3614,6 +3902,10 @@ def evaluate_corruption_disturbances(cfg, truth_ds, normalization_stats, variabl
                     corrupted = apply_configured_corruption(
                         torch.from_numpy(standardized), corruption_type, float(severity)
                     ).detach().cpu().numpy()
+            corrupted = match_standardized(
+                cfg, corrupted, variables, means, stds, "standard", "corruption",
+                corruption_type, severity,
+            )
             corrupted_physical = np.stack(
                 [
                     corrupted[channel] * stds[variable] + means[variable]
@@ -3700,7 +3992,7 @@ def plot_corruption_field_gallery(
             image = axis.pcolormesh(
                 longitudes, latitudes, fields[severity_index, variable_index], shading="auto",
                 cmap=cmap, vmin=float(lower[variable_index]), vmax=float(upper[variable_index]),
-                transform=ccrs.PlateCarree(),
+                transform=ccrs.PlateCarree(), rasterized=True,
             )
             axis.set_global()
             axis.coastlines(linewidth=0.5)
@@ -3750,12 +4042,12 @@ def plot_combined_corruption_gallery(output_dir, corruptions, levels, corrupted_
                 difference_axis = axes[2 * corruption_index + 1, severity_index]
                 raw_artist = raw_axis.pcolormesh(
                     longitudes, latitudes, raw[corruption_index, severity_index], shading="auto",
-                    cmap="viridis", vmin=raw_low, vmax=raw_high, transform=ccrs.PlateCarree(),
+                    cmap="viridis", vmin=raw_low, vmax=raw_high, transform=ccrs.PlateCarree(), rasterized=True,
                 )
                 difference_artist = difference_axis.pcolormesh(
                     longitudes, latitudes, difference[corruption_index, severity_index], shading="auto",
                     cmap="RdBu_r", vmin=-difference_limit, vmax=difference_limit,
-                    transform=ccrs.PlateCarree(),
+                    transform=ccrs.PlateCarree(), rasterized=True,
                 )
                 for axis in (raw_axis, difference_axis):
                     axis.set_global(); axis.coastlines(linewidth=0.42)
@@ -3898,6 +4190,7 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
             if not checkpoint.exists():
                 print(f"Skipping {architecture} {kind}/{label}: checkpoint not found at {checkpoint}")
                 continue
+            validate_binding(checkpoint, cfg)
             if architecture in {"squeezenet", "squeezenet_attention", "squeezenet_equator_mask"}:
                 model_name = (
                     settings.get("model_name", "squeezenet")
@@ -3913,11 +4206,13 @@ def discriminator_baseline_rows(cfg, real_ds, variables, output_root):
                     model.equator_mask_degrees = float(masked.get("half_width_degrees", 10.0))
                 metadata = {"encoder_pretraining": ""}
                 model.eval()
+                model.histogram_target = label
             else:
                 model, metadata = load_sfno_probe_checkpoint(
                     checkpoint, cfg, device, encoder=encoder,
                 )
                 model.sfno_use_era5_context, model.sfno_target_variables = sfno_context_settings(cfg)
+                model.histogram_target = label
             train_indices = None
             if corruption:
                 means = {v: float(corruption_train[v].mean()) for v in variables}
@@ -4113,6 +4408,12 @@ def evaluate_standard_metrics(cfg):
         )
         null_row.update(label=ERA5_NULL_LABEL, is_null=True)
         null_scwd_diagnostics = []
+        null_global_mean_diagnostics = []
+        if "global_mean_wasserstein" in metric_names:
+            null_global_mean_diagnostics.append(global_mean_wasserstein_diagnostic(
+                null_features, train_features, cfg, ERA5_NULL_LABEL, 0,
+                null_row["global_mean_wasserstein"], comparison_kind="null", row=null_row,
+            ))
         if "scwd" in metric_names:
             null_scwd_diagnostics.append(
                 scwd_anchor_diagnostic(
@@ -4128,10 +4429,15 @@ def evaluate_standard_metrics(cfg):
         corruption_reference_stats = normalization_stats_for_corruptions(
             cfg, real_ds, variables
         )
-        corruption_rows, corruption_scwd_diagnostics = evaluate_corruption_metrics(
+        corruption_rows, corruption_scwd_diagnostics, corruption_global_mean_diagnostics = evaluate_corruption_metrics(
             cfg, real_ds, corruption_reference_stats, variables, metric_names, temporary_dir,
             return_scwd_diagnostics=True,
         )
+        global_mean_diagnostics = (
+            null_global_mean_diagnostics + global_mean_diagnostics + corruption_global_mean_diagnostics
+        )
+        if "global_mean_wasserstein" in metric_names:
+            finalize_global_mean_wasserstein(global_mean_diagnostics, cfg)
         close_feature_memmaps(train_features)
         close_feature_memmaps(null_features)
 
@@ -4187,6 +4493,7 @@ def evaluate_standard_metric_baselines(cfg):
 
 def plot_saved_standard_metric_baselines(cfg):
     """Render baseline figures exclusively from persisted evaluation artifacts."""
+    configure_plot_bundle_saving_from_cfg(cfg)
     variables = variables_from_config(cfg)
     metric_names = metric_names_from_config(cfg)
     output_root = baseline_output_dir(cfg, variables)
@@ -4207,7 +4514,7 @@ def plot_saved_standard_metric_baselines(cfg):
     plot_normalized_corruption_metrics_by_type(corruption_rows, metric_names, variables, output_root)
     plot_corruption_disturbances(output_root)
     plot_scwd_anchor_diagnostics(scwd_diagnostics, output_root)
-    plot_scwd_top_w1_distributions(scwd_diagnostics, cfg, output_root)
+    plot_scwd_top_wasserstein_distributions(scwd_diagnostics, cfg, output_root)
     plot_scwd_mean_response_differences(scwd_diagnostics, output_root)
     plot_global_mean_wasserstein_distributions(global_mean_diagnostics, output_root)
     plot_discriminator_baselines(discriminator_rows, cfg, output_root)

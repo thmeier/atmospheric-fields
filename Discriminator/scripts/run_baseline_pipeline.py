@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 
 try:
     from .baseline_pipeline_tracking import PipelineTracker, safe_name
-    from .plot_bundles import all_plot_bundle_paths
+    from .plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg
     from .plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -30,9 +30,10 @@ try:
     from .train_target_discriminator_baselines import (
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
+    from .fit_histogram_matching import fit_histogram_matching_maps
 except ImportError:
     from baseline_pipeline_tracking import PipelineTracker, safe_name
-    from plot_bundles import all_plot_bundle_paths
+    from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg
     from plot_standard_metric_baselines import (
         baseline_get,
         baseline_output_dir,
@@ -49,9 +50,11 @@ except ImportError:
     from train_target_discriminator_baselines import (
         plot_target_discriminator_interpretability, train_target_discriminator_baselines,
     )
+    from fit_histogram_matching import fit_histogram_matching_maps
 
 
 STAGES = (
+    "fit_histogram_matching",
     "train_discriminators",
     "evaluate_standard_metrics",
     "evaluate_discriminator_metrics",
@@ -134,12 +137,15 @@ def standard_input_paths(cfg):
 
 
 def plot_input_paths(cfg, output_root):
+    """Return only plot inputs produced by the selected standard-metric run.
+
+    Target-discriminator results are optional: the plotter renders them when
+    present, but standard-only evaluation must not require their CSV.
+    """
     paths = [
         output_root / "data" / "lead_time.csv",
         output_root / "data" / "corruption_strength.csv",
     ]
-    if bool((baseline_get(cfg, "discriminator", {}) or {}).get("enabled", False)):
-        paths.append(output_root / "data" / "discriminator_reverse_kl.csv")
     if "scwd" in metric_names_from_config(cfg):
         paths.append(output_root / "data" / "scwd_anchor_contributions.nc")
     return paths
@@ -164,6 +170,16 @@ def plot_bundle_members(paths):
 
 def run_stage(stage, cfg, tracker, output_root, resolved_path):
     upload_data = bool(cfg.pipeline.wandb.get("upload_evaluation_data", True))
+    if stage == "fit_histogram_matching":
+        with tracker.run("preprocessing/histogram-matching", "histogram-matching", cfg, tags=["preprocessing", "histogram-matching"]) as run:
+            paths = fit_histogram_matching_maps(cfg)
+            if paths:
+                summary = Path(str(cfg.baseline.output_dir)) / "data" / "histogram_matching" / "fit_summary.csv"
+                tracker.log_csv_table(run, "histogram_matching/maps", summary)
+                if upload_data:
+                    tracker.log_artifact(run, "histogram-matching", "preprocessing", [*paths, resolved_path], metadata={"pipeline_id": tracker.group})
+            run.summary["histogram_matching/enabled"] = bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False))
+            return [str(path) for path in paths], [{"run_url": getattr(run, "url", None)}]
     if stage == "train_discriminators":
         require_files([cfg.real_nc_file], stage)
         records = train_target_discriminator_baselines(cfg, tracker=tracker)
@@ -210,6 +226,8 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
             return [str(path) for path in plot_bundle_members(paths)], [{"run_url": getattr(run, "url", None)}]
 
     if stage == "evaluate_mmd_global_moment_matching":
+        if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
+            raise ValueError("Histogram matching cannot be composed with the separate MMD global-moment diagnostic.")
         require_files(standard_input_paths(cfg), stage)
         with tracker.run("evaluation/mmd-global-moment-matching", "mmd-global-moment-matching", cfg,
                          tags=["evaluation", "mmd", "global-moment-matching"]) as run:
@@ -301,10 +319,21 @@ def run_stage(stage, cfg, tracker, output_root, resolved_path):
 
 
 def execute_pipeline(cfg):
+    configure_plot_bundle_saving_from_cfg(cfg)
     pipeline_id = safe_pipeline_id = str(cfg.pipeline.id or generated_pipeline_id())
     # Keep local directory names portable and exactly aligned with W&B names.
     pipeline_id = safe_name(pipeline_id)
     stages = selected_stages(cfg)
+    histogram_enabled = bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False))
+    if histogram_enabled and "fit_histogram_matching" not in stages:
+        input_maps = cfg.pipeline.get("input_histogram_matching_dir")
+        if input_maps is None:
+            raise ValueError(
+                "Histogram matching is enabled without fit_histogram_matching; "
+                "set pipeline.input_histogram_matching_dir to an existing fitted artifact."
+            )
+        require_files([Path(str(input_maps)) / "maps.npz",
+                       Path(str(input_maps)) / "manifest.json"], "histogram_matching")
     runs_parent = pipeline_runs_dir(cfg)
     run_dir = runs_parent / pipeline_id
     resume = bool(cfg.pipeline.get("resume", False))
