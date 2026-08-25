@@ -43,6 +43,8 @@ baseline:
     # Evaluate one deterministic ensemble member; do not collapse the ensemble.
     "UCast member 0":
       - "${data_dir}/ucast2020_members/ucast-m0_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
+    "SWIFT":
+      - "${data_dir}/swift_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"
 
   # Complete canonical corruption catalog. Wind-vector corruptions are skipped
   # automatically when the selected baseline fields do not contain U/V wind.

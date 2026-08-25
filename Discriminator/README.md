@@ -211,9 +211,9 @@ test samples by default.
 The active baseline configuration is `conf/baseline_config.yaml`. It runs the
 joint four-field T2M/U10/V10/MSL case by default; scalar experiments remain
 available by overriding `baseline.variables` and
-`target_discriminator.variables`. The
-forecast catalog contains GraphCast, Pangu-Weather, FuXi, IFS HRES, ERA5
-Forecast, and one deterministic UCast member; ensemble averaging is not used.
+`target_discriminator.variables`. The forecast catalog contains GraphCast, Pangu-Weather, FuXi, IFS HRES, ERA5
+Forecast, SWIFT, and one deterministic UCast member; ensemble averaging is not
+used.
 
 The default corruption suite contains Gaussian blur, high-frequency noise, GRF,
 `pixel_replace`, wind patch shuffling and rotation when U/V are available, a
