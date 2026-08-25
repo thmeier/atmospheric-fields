@@ -32,8 +32,10 @@
 # --constraint=2080ti over the newer 5060ti: those nodes are sm_120 and need
 # torch >= 2.7 / cu128, while this env ships torch 2.5.1+cu121.
 #
-# Output goes to /work/scratch (home has ~4 GB free), which is auto-cleaned every
-# 1-7 days, so the small deliverables are copied back to $HOME at the end.
+# Working output goes to /work/scratch (100 GB). Durable copies go to the shared
+# team07 directory on /cluster/courses, NOT to $HOME -- home is a 20 GB quota that
+# is already ~17 GB full. team07 has terabytes free and inherits ACLs that let the
+# whole team read the results.
 #
 # Walltime is capped at 24h. The pipeline writes a per-stage manifest, so a run
 # that does not finish continues with the same PIPELINE_ID and RESUME=true:
@@ -115,22 +117,19 @@ if [[ -n "${DRAWS}" ]]; then
   "${PYTHON}" scripts/plot_bootstrap_blindspots.py "+bootstrap_null.data_dir=${BLINDSPOTS}"
 fi
 
-# Scratch is auto-cleaned every 1-7 days, so anything worth reusing has to leave
-# it. Trained critics are ~2.8 MB each (~250 MB for all 90) and are what makes a
-# rerun cheap: pass the copied tree back as temporal_resampling.input_run_dir to
-# evaluate or replot without retraining. The bulky NetCDF diagnostics and the
-# per-fold plot trees are left behind -- home has only a few GB free, and the
-# canonical fold's plots are already copied up to the parent.
-KEEP="$HOME/paper_temporal_results/${PIPELINE_ID}"
+# Keep everything worth reusing on the shared volume. Trained critics are ~2.8 MB
+# each (~250 MB for all 90) and are what makes a rerun cheap: pass the copied tree
+# back as temporal_resampling.input_run_dir to evaluate or replot without
+# retraining. Only the per-fold plot trees are left behind -- the canonical fold's
+# plots are already copied up to the parent.
+KEEP="${KEEP_ROOT:-/cluster/courses/pmlr/teams/team07/results}/${PIPELINE_ID}"
 mkdir -p "${KEEP}"
 rsync -a --prune-empty-dirs \
       --include='*/' --include='model.pth' --include='*.json' --exclude='*' \
       "${RUN_DIR}/resamples/" "${KEEP}/resamples/" 2>/dev/null || true
-rsync -a --exclude='*.nc' --exclude='resamples/' \
-      "${RUN_DIR}/" "${KEEP}/" 2>/dev/null || \
+rsync -a --exclude='resamples/' "${RUN_DIR}/" "${KEEP}/" 2>/dev/null || \
   cp -r "${RUN_DIR}"/* "${KEEP}/" 2>/dev/null || true
 echo "  critics kept: $(find "${KEEP}" -name model.pth 2>/dev/null | wc -l)"
 echo
 echo "Run directory : ${RUN_DIR}"
-echo "Copied home to: ${KEEP}  ($(du -sh "${KEEP}" 2>/dev/null | cut -f1))"
-echo "Home free     : $(df -h "$HOME" 2>/dev/null | tail -1 | awk '{print $4}')"
+echo "Kept in team07: ${KEEP}  ($(du -sh "${KEEP}" 2>/dev/null | cut -f1))"
