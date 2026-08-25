@@ -11,7 +11,7 @@ as the reference "real" distribution, and validated against machine-learning wea
 forecasts (Pangu-Weather, GraphCast, FuXi, and others) as well as a suite of
 physically-motivated synthetic corruptions.
 
-All work uses the same four 1.5-degree surface fields: `2m_temperature`,
+The canonical experiments, including the baseline pipeline, use the same four 1.5-degree surface fields by default; some diagnostic configurations deliberately select a single field: `2m_temperature`,
 `10m_u_component_of_wind`, `10m_v_component_of_wind`, and `mean_sea_level_pressure`.
 
 ## Two complementary directions

@@ -2,8 +2,16 @@ defaults:
   - target_discriminator_baselines
   - _self_
 
+histogram_matching:
+  enabled: false
+  quantile_knots: 2049
+  max_fit_values_per_variable: 1000000
+  max_fit_fields: 256
+  seed: 0
+
 pipeline:
   stages:
+    - fit_histogram_matching
     - train_discriminators
     - evaluate_standard_metrics
     - evaluate_discriminator_metrics
@@ -16,6 +24,8 @@ pipeline:
   # Exact existing models/target_discriminators directory to load when this
   # invocation evaluates or plots without training its own critics.
   input_checkpoint_dir: null
+  # Existing data/histogram_matching directory for evaluation-only runs.
+  input_histogram_matching_dir: null
   fail_fast: true
   wandb:
     enabled: true

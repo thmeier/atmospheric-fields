@@ -15,6 +15,19 @@ monthly_split:
     - ["2020-01-01", "2020-12-31"]
   require_exact_era5_match: true
 
+# Repeated within-month holdouts used for uncertainty estimates. Child runs
+# receive one active_schedule; leave it null in the parent invocation.
+temporal_resampling:
+  enabled: true
+  learned_replicates: 5
+  fixed_replicates: 50
+  learned_test_windows: [[5, 11], [9, 15], [13, 19], [17, 23], [20, 26]]
+  buffer_days: 4
+  random_test_start_range: [5, 20]
+  seed: 0
+  active_schedule: null
+  input_run_dir: null
+
 # ERA5/reference file used for training real samples.
 real_nc_file: "${data_dir}/era5_1.5deg_2004-01-01_2023-12-31.nc"
 

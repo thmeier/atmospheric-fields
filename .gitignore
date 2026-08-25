@@ -29,6 +29,7 @@ htmlcov/
 
 # SLURM / job logs
 *.out
+slurm_*.err
 wandb/
 outputs/
 results/

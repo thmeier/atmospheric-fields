@@ -9,6 +9,11 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 try:
+    from .plot_bundles import profiled_plot_path
+except ImportError:
+    from plot_bundles import profiled_plot_path
+
+try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional convenience only
     load_dotenv = None
@@ -141,6 +146,10 @@ class PipelineTracker:
         root = Path(root)
         for path in paths:
             path = Path(path)
+            if not path.is_file():
+                path = profiled_plot_path(path)
+            if not path.is_file():
+                continue
             key = "plots/" + str(path.relative_to(root).with_suffix(""))
             run.log({key: self._wandb.Image(str(path))})
 

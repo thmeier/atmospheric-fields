@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=bootstrap-null
+#SBATCH --job-name=nosfno-paper-pipeline
 #SBATCH --account=pmlr_jobs
 #SBATCH --time=1-00:00:00
-#SBATCH --output=slurm_bootstrap_null_%j.out
-#SBATCH --error=slurm_bootstrap_null_%j.err
+#SBATCH --output=slurm_nosfno_paper_pipeline_%j.out
+#SBATCH --error=slurm_nosfno_paper_pipeline_%j.err
 
-# Resample the ERA5 null distribution, evaluate corruption curves, and render bootstrap blind-spot plots.
+# Complete no-SFNO workflow. Manuscript-sized PNG/PDF/NPZ bundles go to plots/paper/.
 set -euo pipefail
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 if [[ -f "${SUBMIT_DIR}/scripts/run_baseline_pipeline.py" ]]; then
@@ -25,7 +25,12 @@ export PYTHONUNBUFFERED=1
 export DATA_DIR="${DATA_DIR:-/cluster/courses/pmlr/teams/team07/data}"
 cd "${REPO_DIR}"
 python scripts/run_baseline_pipeline.py \
-  "pipeline.id=bootstrap-null-${SLURM_JOB_ID:-local}" \
-  "pipeline.stages=[evaluate_bootstrap_null,plot_bootstrap_blindspots]" \
-  "pipeline.wandb.tags=[bootstrap-null,blindspots]" \
+  "pipeline.id=nosfno-paper-${SLURM_JOB_ID:-local}" \
+  "pipeline.stages=[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]" \
+  target_discriminator.sfno.enabled=false \
+  baseline.discriminator.sfno.enabled=false \
+  target_discriminator.train_attention_squeezenet=false \
+  plotting.profile=paper \
+  plotting.save_pdf=true \
+  "pipeline.wandb.tags=[paper,nosfno]" \
   "$@"

@@ -1,9 +1,54 @@
-"""Portable PNG/PDF/NPZ bundles for baseline-pipeline figures."""
+"""Portable figure bundles and centralized dashboard/paper rendering."""
 
+import fnmatch
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
+import matplotlib as mpl
+
 import numpy as np
+
+
+_DEFAULT_SAVE_PDF = False
+_PLOT_PROFILE = "dashboard"
+_PAPER_WIDTH_INCHES = 5.5
+_PAPER_WIDTH_KIND = "full"
+_PAPER_COLUMN_GAP_INCHES = 0.12
+_INCLUDE_PATTERNS = ()
+
+
+def configure_plot_bundle_saving(*, save_pdf=False, profile="dashboard",
+                                 paper_width_inches=5.5, paper_width_kind="full",
+                                 paper_column_gap_inches=0.12, include_patterns=None):
+    """Configure process-wide output behavior used by figure bundle writers."""
+    global _DEFAULT_SAVE_PDF, _PLOT_PROFILE, _PAPER_WIDTH_INCHES
+    global _PAPER_WIDTH_KIND, _PAPER_COLUMN_GAP_INCHES, _INCLUDE_PATTERNS
+    profile = str(profile).lower()
+    if profile not in {"dashboard", "paper"}:
+        raise ValueError(f"Unknown plotting profile: {profile!r}")
+    if paper_width_kind not in {"full", "half"}:
+        raise ValueError("paper_width_kind must be 'full' or 'half'.")
+    _PLOT_PROFILE = profile
+    _DEFAULT_SAVE_PDF = bool(save_pdf) or profile == "paper"
+    _PAPER_WIDTH_INCHES = float(paper_width_inches)
+    _PAPER_WIDTH_KIND = str(paper_width_kind)
+    _PAPER_COLUMN_GAP_INCHES = float(paper_column_gap_inches)
+    _INCLUDE_PATTERNS = tuple(str(value) for value in (include_patterns or ()))
+
+
+def configure_plot_bundle_saving_from_cfg(cfg):
+    """Configure bundle output from the shared plotting config section."""
+    settings = cfg.get("plotting", {}) or {}
+    paper = settings.get("paper", {}) or {}
+    configure_plot_bundle_saving(
+        save_pdf=bool(settings.get("save_pdf", False)),
+        profile=str(settings.get("profile", "dashboard")),
+        paper_width_inches=float(paper.get("text_width_inches", 5.5)),
+        paper_width_kind=str(paper.get("width", "full")),
+        paper_column_gap_inches=float(paper.get("column_gap_inches", 0.12)),
+        include_patterns=paper.get("include", []),
+    )
 
 
 def plot_bundle_paths(png_path):
@@ -12,6 +57,89 @@ def plot_bundle_paths(png_path):
     if png_path.suffix.lower() != ".png":
         raise ValueError(f"Plot bundle path must end in .png, got {png_path}")
     return png_path, png_path.with_suffix(".pdf"), png_path.with_suffix(".npz")
+
+
+def profiled_plot_path(png_path):
+    """Redirect paper output below the plot tree without touching dashboards."""
+    path = Path(png_path)
+    if _PLOT_PROFILE != "paper" or "paper" in path.parts:
+        return path
+    parts = list(path.parts)
+    try:
+        index = parts.index("plots")
+    except ValueError:
+        return path.with_name(f"{path.stem}_paper{path.suffix}")
+    parts.insert(index + 1, "paper")
+    return Path(*parts)
+
+
+def _selected(path):
+    if not _INCLUDE_PATTERNS:
+        return True
+    value = Path(path).as_posix()
+    return any(
+        fnmatch.fnmatch(value, pattern) or fnmatch.fnmatch(Path(value).name, pattern)
+        for pattern in _INCLUDE_PATTERNS
+    )
+
+
+def _paper_width():
+    if _PAPER_WIDTH_KIND == "half":
+        return (_PAPER_WIDTH_INCHES - _PAPER_COLUMN_GAP_INCHES) / 2.0
+    return _PAPER_WIDTH_INCHES
+
+
+def _paperize_figure(figure):
+    """Resize and restyle an existing figure at its final manuscript width."""
+    mpl.rcParams["pdf.fonttype"] = 42
+    mpl.rcParams["ps.fonttype"] = 42
+    mpl.rcParams["mathtext.fontset"] = "stix"
+    old_width, old_height = figure.get_size_inches()
+    width = _paper_width()
+    figure.set_size_inches(width, width * old_height / max(old_width, 1e-12), forward=True)
+    for text_artist in figure.findobj(match=lambda artist: hasattr(artist, "set_fontsize")):
+        try:
+            text_artist.set_fontsize(7.0)
+            text_artist.set_fontfamily("serif")
+        except (TypeError, ValueError):
+            pass
+    if getattr(figure, "_suptitle", None) is not None:
+        figure._suptitle.set_fontsize(8.0)
+    for axis in figure.axes:
+        axis.title.set_fontsize(8.0)
+        axis.xaxis.label.set_fontsize(8.0)
+        axis.yaxis.label.set_fontsize(8.0)
+        axis.tick_params(labelsize=7.0)
+        legend = axis.get_legend()
+        if legend is not None:
+            for text_artist in legend.get_texts():
+                text_artist.set_fontsize(7.0)
+        for line in axis.lines:
+            line.set_linewidth(min(float(line.get_linewidth()), 1.1))
+            if line.get_marker() not in {None, "None", ""}:
+                line.set_markersize(min(float(line.get_markersize()), 3.5))
+    for legend in figure.legends:
+        for text_artist in legend.get_texts():
+            text_artist.set_fontsize(7.0)
+        if hasattr(legend, "set_loc"):
+            legend.set_loc("center right")
+        legend.set_bbox_to_anchor((0.99, 0.5), transform=figure.transFigure)
+        for text_artist in legend.get_texts():
+            text_artist.set_fontsize(7.0)
+
+
+def titleless_plot_path(png_path):
+    """Return the title-less companion path for a rendered PNG."""
+    png_path = Path(png_path)
+    if png_path.suffix.lower() != ".png":
+        raise ValueError(f"Plot bundle path must end in .png, got {png_path}")
+    return png_path.with_name(f"{png_path.stem}_notitle.png")
+
+
+def all_plot_bundle_paths(png_path):
+    """Return the normal and title-less PNG/PDF/NPZ bundles for a figure."""
+    png_path = profiled_plot_path(png_path)
+    return (*plot_bundle_paths(png_path), *plot_bundle_paths(titleless_plot_path(png_path)))
 
 
 def _safe_array(value):
@@ -26,15 +154,38 @@ def _artist_arrays(figure):
     arrays = {}
     metadata_axes = []
     for axis_index, axis in enumerate(figure.axes):
-        metadata_axes.append({
+        axis_metadata = {
             "title": axis.get_title(), "xlabel": axis.get_xlabel(), "ylabel": axis.get_ylabel(),
-        })
+            "xscale": axis.get_xscale(), "yscale": axis.get_yscale(),
+            "xlim": list(map(float, axis.get_xlim())), "ylim": list(map(float, axis.get_ylim())),
+            "position": list(map(float, axis.get_position().bounds)),
+            "projection": type(axis).__name__, "lines": [], "collections": [],
+            "images": [], "patches": [],
+        }
+        metadata_axes.append(axis_metadata)
         for line_index, line in enumerate(axis.lines):
             prefix = f"axes_{axis_index}_line_{line_index}"
             arrays[f"{prefix}_x"] = _safe_array(line.get_xdata(orig=False))
             arrays[f"{prefix}_y"] = _safe_array(line.get_ydata(orig=False))
+            axis_metadata["lines"].append({
+                "prefix": prefix, "label": line.get_label(),
+                "color": mpl.colors.to_hex(line.get_color(), keep_alpha=True),
+                "linestyle": line.get_linestyle(), "marker": str(line.get_marker()),
+                "linewidth": float(line.get_linewidth()), "markersize": float(line.get_markersize()),
+            })
         for collection_index, collection in enumerate(axis.collections):
             prefix = f"axes_{axis_index}_collection_{collection_index}"
+            collection_metadata = {
+                "prefix": prefix, "label": collection.get_label(),
+                "type": type(collection).__name__,
+            }
+            if getattr(collection, "cmap", None) is not None:
+                collection_metadata["cmap"] = collection.cmap.name
+            norm = getattr(collection, "norm", None)
+            if norm is not None:
+                collection_metadata["vmin"] = None if norm.vmin is None else float(norm.vmin)
+                collection_metadata["vmax"] = None if norm.vmax is None else float(norm.vmax)
+            axis_metadata["collections"].append(collection_metadata)
             if hasattr(collection, "get_offsets"):
                 offsets = collection.get_offsets()
                 if offsets is not None and np.asarray(offsets).size:
@@ -48,28 +199,54 @@ def _artist_arrays(figure):
                 if coordinates is not None:
                     arrays[f"{prefix}_coordinates"] = _safe_array(coordinates)
         for image_index, image in enumerate(axis.images):
-            arrays[f"axes_{axis_index}_image_{image_index}"] = _safe_array(image.get_array())
-            arrays[f"axes_{axis_index}_image_{image_index}_extent"] = _safe_array(image.get_extent())
+            prefix = f"axes_{axis_index}_image_{image_index}"
+            arrays[prefix] = _safe_array(image.get_array())
+            arrays[f"{prefix}_extent"] = _safe_array(image.get_extent())
+            axis_metadata["images"].append({
+                "prefix": prefix, "cmap": image.get_cmap().name,
+                "vmin": None if image.norm.vmin is None else float(image.norm.vmin),
+                "vmax": None if image.norm.vmax is None else float(image.norm.vmax),
+                "origin": str(image.origin),
+            })
         for patch_index, patch in enumerate(axis.patches):
-            # Histogram bars and other rendered rectangles.
+            prefix = f"axes_{axis_index}_patch_{patch_index}"
             if all(hasattr(patch, method) for method in ("get_x", "get_y", "get_width", "get_height")):
-                arrays[f"axes_{axis_index}_patch_{patch_index}"] = _safe_array([
+                geometry = "rectangle"
+                arrays[prefix] = _safe_array([
                     patch.get_x(), patch.get_y(), patch.get_width(), patch.get_height(),
                 ])
+            elif hasattr(patch, "get_path") and hasattr(patch, "get_patch_transform"):
+                geometry = "path"
+                vertices = patch.get_patch_transform().transform(patch.get_path().vertices)
+                arrays[f"{prefix}_vertices"] = _safe_array(vertices)
+            else:
+                continue
+            axis_metadata["patches"].append({
+                "prefix": prefix, "geometry": geometry, "label": patch.get_label(),
+                "facecolor": mpl.colors.to_hex(patch.get_facecolor(), keep_alpha=True),
+                "edgecolor": mpl.colors.to_hex(patch.get_edgecolor(), keep_alpha=True),
+                "linewidth": float(patch.get_linewidth()),
+                "alpha": patch.get_alpha(),
+            })
     return arrays, metadata_axes
 
 
+@contextmanager
+def without_suptitle(figure):
+    """Temporarily remove only the figure-level main title."""
+    supertitle = getattr(figure, "_suptitle", None)
+    supertitle_text = None if supertitle is None else supertitle.get_text()
+    try:
+        if supertitle is not None:
+            supertitle.set_text("")
+        yield
+    finally:
+        if supertitle is not None:
+            supertitle.set_text(supertitle_text)
+
+
 def rasterize_field_artists(figure):
-    """Rasterize the artists that make field plots enormous as vectors.
-
-    A 121x240 pcolormesh is ~29k individually drawn patches, and a gallery stacks
-    several per figure. As vectors those reach 50-70 MB per PDF and dominate the
-    plot stage; embedding them as a bitmap instead is visually identical at print
-    resolution. Only meshes and images are rasterized -- axes, text, lines,
-    legends and colorbars stay vector, so the PDF remains crisp and searchable.
-
-    Returns the number of artists rasterized.
-    """
+    """Rasterize dense field artists in PDF while retaining vector annotations."""
     from matplotlib.collections import Collection
     from matplotlib.image import AxesImage
 
@@ -82,30 +259,27 @@ def rasterize_field_artists(figure):
     return count
 
 
-def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=None,
-                       dpi=220, bbox_inches=None):
-    """Save one figure as PNG, PDF, and a no-pickle NPZ replot sidecar."""
+def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, dpi,
+                            bbox_inches, capture_artists=True, save_pdf=False):
     png_path, pdf_path, npz_path = plot_bundle_paths(png_path)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs = {"dpi": int(dpi)}
     if bbox_inches is not None:
         save_kwargs["bbox_inches"] = bbox_inches
     figure.savefig(png_path, **save_kwargs)
-    # Rasterize after the PNG (which is a bitmap regardless) and before the PDF, so
-    # only the PDF path pays for it. dpi is passed explicitly here: it sets the
-    # resolution of the embedded raster, and without it savefig would fall back to
-    # the figure default and produce a soft image.
-    rasterize_field_artists(figure)
-    figure.savefig(pdf_path, dpi=int(dpi), bbox_inches=bbox_inches)
+    if save_pdf:
+        rasterize_field_artists(figure)
+        figure.savefig(pdf_path, dpi=int(dpi), bbox_inches=bbox_inches)
 
-    arrays, axes = _artist_arrays(figure)
+    arrays, axes = _artist_arrays(figure) if capture_artists else ({}, [])
     for key, value in (payload or {}).items():
         arrays[f"input_{key}"] = _safe_array(value)
     bundle_metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "figure_size_inches": list(map(float, figure.get_size_inches())),
         "plot_type": str(plot_type),
         "png": png_path.name,
-        "pdf": pdf_path.name,
+        "pdf": pdf_path.name if save_pdf else None,
         "npz": npz_path.name,
         "axes": axes,
         **(metadata or {}),
@@ -114,7 +288,7 @@ def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=No
     np.savez_compressed(npz_path, **arrays)
 
     manifest_path = png_path.parent / "plot_data_manifest.json"
-    manifest = {"schema_version": 1, "plots": {}}
+    manifest = {"schema_version": 2, "plots": {}}
     if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text())
@@ -122,7 +296,31 @@ def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=No
             pass
     manifest.setdefault("plots", {})[png_path.stem] = {
         "plot_type": str(plot_type), "png": png_path.name,
-        "pdf": pdf_path.name, "npz": npz_path.name,
+        "pdf": pdf_path.name if save_pdf else None, "npz": npz_path.name,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    return [png_path, pdf_path, npz_path]
+    return [png_path, *([pdf_path] if save_pdf else []), npz_path]
+
+
+def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=None,
+                       dpi=220, bbox_inches=None, capture_artists=True, save_pdf=None):
+    """Save titled and title-less PNG/NPZ bundles, optionally including PDFs."""
+    png_path = profiled_plot_path(png_path)
+    if not _selected(png_path):
+        return []
+    if _PLOT_PROFILE == "paper":
+        _paperize_figure(figure)
+        bbox_inches = None
+    if save_pdf is None:
+        save_pdf = _DEFAULT_SAVE_PDF
+    paths = _save_one_figure_bundle(
+        figure, png_path, plot_type=plot_type, payload=payload, metadata=metadata,
+        dpi=dpi, bbox_inches=bbox_inches, capture_artists=capture_artists, save_pdf=save_pdf,
+    )
+    with without_suptitle(figure):
+        paths.extend(_save_one_figure_bundle(
+            figure, titleless_plot_path(png_path), plot_type=plot_type,
+            payload=payload, metadata={**(metadata or {}), "titleless": True},
+            dpi=dpi, bbox_inches=bbox_inches, capture_artists=capture_artists, save_pdf=save_pdf,
+        ))
+    return paths
