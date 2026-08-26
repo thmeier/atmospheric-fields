@@ -19,6 +19,16 @@ plotting:
     width: full
     # Optional filename or path globs used by the standalone paper renderer.
     include: []
+  # Main 2x3 manuscript figure: five fixed-metric panels and one learned critic.
+  main_corruption_figure:
+    enabled: true
+    architecture: squeezenet
+    corruptions:
+      - gaussian_blur
+      - grf
+      - checkerboard_2px
+      - zonal_scanlines
+      - hemisphere_splice
 
 # Point-estimate distribution baselines aligned with the temporal-holdout
 # surface experiment. ERA5 paths, real-data time splits, lead times, and the
@@ -138,7 +148,8 @@ baseline:
   corruption_steps: 7
   corruption_severity_max: 0.2
   corruption_severity_max_overrides:
-    # Blur severity is its native fraction of the full sigma=1.125-pixel kernel.
+    # Blur keeps severity 0 as identity; positive severities linearly span
+    # effective blur 0.2--1.0 (sigma 0.225--1.125 grid pixels).
     gaussian_blur: 1.0
     pixel_replace: 0.01
   # Companion maps show Corrupted − ERA5 for one representative timestamp from
