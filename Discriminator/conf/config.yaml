@@ -123,13 +123,11 @@ corruption_severity_max: 1.0
 # Severity sampler exponent. Values > 1 bias samples toward weaker corruptions.
 corruption_severity_power: 2.0
 
-# Lower bounds apply only to synthetic fake corruptions during training.  Clean
-# samples remain in the real class; Gaussian sigma below about 0.2 pixels is
-# numerically indistinguishable from identity, so blur fakes begin at 0.2.
+# Optional training-only logical-severity bounds. Gaussian blur itself maps any
+# positive logical severity onto its useful physical range while preserving an
+# exact identity at zero, so it needs no separate sampling floor here.
 corruption_severity_min: 0.0
-corruption_severity_min_overrides:
-  blur: 0.2
-  gaussian_blur: 0.2
+corruption_severity_min_overrides: {}
 
 # Optional fixed corruption override for targeted disturbance training/evaluation.
 # Leave null/0.0 for the random corruption policy.

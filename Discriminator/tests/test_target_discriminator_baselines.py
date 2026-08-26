@@ -10,6 +10,7 @@ import xarray as xr
 from torch.utils.data import TensorDataset
 from omegaconf import OmegaConf
 
+from Discriminator.scripts.corruptions import gaussian_blur_effective_severity
 from Discriminator.scripts.train_discriminator import WeatherDiscriminator, sample_power_law_severity
 from Discriminator.scripts.train_target_discriminator_baselines import (
     BalancedTargetDataset,
@@ -185,6 +186,12 @@ class TargetDiscriminatorBaselineTest(unittest.TestCase):
         cfg.target_discriminator.corruption_severity_sampling = "power_law"
         value = sample_target_corruption_severity(cfg, "gaussian_blur", 1.0, 2.0, seed=3)
         self.assertGreaterEqual(value, 0.0)
+
+    def test_gaussian_blur_zero_preserving_lerp_promotes_first_grid_point(self):
+        self.assertEqual(gaussian_blur_effective_severity(0.0), 0.0)
+        self.assertAlmostEqual(gaussian_blur_effective_severity(1.0 / 6.0), 1.0 / 3.0)
+        self.assertAlmostEqual(gaussian_blur_effective_severity(0.5), 0.6)
+        self.assertEqual(gaussian_blur_effective_severity(1.0), 1.0)
 
     def test_gaussian_blur_training_floor_avoids_identity_samples(self):
         np.random.seed(7)
