@@ -335,6 +335,65 @@ def aggregate_standard(cfg, schedules):
     return outputs
 
 
+def critic_test_accuracy(cfg, schedule):
+    """Held-out accuracy per critic for one fold, keyed by architecture/kind/target.
+
+    Located by globbing rather than by building the path: the training stage
+    writes under `target_discriminator.output_dir`, whose variable tag need not
+    match the baseline's, and the same assumption already cost a figure once.
+    """
+    accuracy = {}
+    for path in sorted(_child_run_dir(cfg, schedule).glob("*/data/target_train_test_metrics.csv")):
+        if "wandb" in path.parts:
+            continue
+        for row in _read_csv(path):
+            value = row.get("test_accuracy", "")
+            if value == "":
+                continue
+            accuracy[(row.get("architecture"), row.get("kind"), row.get("target"))] = float(value)
+    return accuracy
+
+
+def drop_unconverged_critics(cfg, rows, schedules):
+    """Remove draws whose critic never learned to discriminate on held-out data.
+
+    A reverse-KL score is only a divergence estimate if its critic actually
+    separates the two distributions. One GraphCast critic reached 0.888 train
+    accuracy and 0.521 test accuracy -- chance -- and scored -241 where its four
+    siblings scored +7 to +14. Averaging that in moved the mean to -37, and
+    because the learned band is a min-max envelope over only five folds, no
+    choice of central statistic repairs it: median, p05-p95 and min-max all still
+    span to -231. The outlier has to leave the sample, not be averaged around.
+
+    This is a convergence criterion applied uniformly, not a filter on values:
+    it looks only at held-out accuracy and never at the score. Fractions of
+    critics retained are recorded so a run cannot quietly drop many of them.
+    """
+    threshold = settings(cfg).get("min_critic_test_accuracy", 0.6)
+    if threshold is None:
+        return rows, []
+    threshold = float(threshold)
+    accuracy = {s.resample_id: critic_test_accuracy(cfg, s) for s in schedules}
+    kept, dropped = [], []
+    for row in rows:
+        key = (row.get("architecture"), row.get("kind"), row.get("target"))
+        value = accuracy.get(row.get("resample_id"), {}).get(key)
+        if value is not None and value < threshold:
+            dropped.append({"resample_id": row.get("resample_id"), "architecture": key[0],
+                            "kind": key[1], "target": key[2], "test_accuracy": value,
+                            "threshold": threshold})
+            continue
+        kept.append(row)
+    if dropped:
+        unique = sorted({(d["resample_id"], d["architecture"], d["kind"], d["target"],
+                          d["test_accuracy"]) for d in dropped})
+        print(f"  Excluding {len(unique)} critic(s) below {threshold:g} held-out accuracy "
+              f"({len(dropped)} draws):")
+        for resample_id, architecture, kind, target, value in unique:
+            print(f"    {resample_id} {architecture}/{kind}/{target}: test accuracy {value:.3f}")
+    return kept, dropped
+
+
 def aggregate_discriminator(cfg, schedules):
     output_root = _parent_output_root(cfg)
     rows, terms = [], []
@@ -347,6 +406,10 @@ def aggregate_discriminator(cfg, schedules):
             with gzip.open(terms_path, "rt", newline="") as handle:
                 for row in csv.DictReader(handle):
                     row["resample_id"] = schedule.resample_id; terms.append(row)
+    rows, dropped_critics = drop_unconverged_critics(cfg, rows, schedules)
+    if not rows:
+        raise ValueError("Every discriminator draw was excluded as non-converged; "
+                         "lower temporal_resampling.min_critic_test_accuracy or retrain.")
     discriminator_spreads = _validate_counts(rows, DISCRIMINATOR_KEYS, ("n_samples", "ep_n_samples"))
     try:
         from .analyze_temporal_resamples import reconstruct_scores_from_terms
@@ -374,6 +437,8 @@ def aggregate_discriminator(cfg, schedules):
         row["checkpoint_paths"] = ",".join(item.get("checkpoint_path", "") for item in matching)
         row["checkpoint_sha256s"] = ",".join(item.get("checkpoint_sha256", "") for item in matching)
     score_path = _write_csv(output_root / "data" / "discriminator_reverse_kl.csv", aggregate)
+    if dropped_critics:
+        _write_csv(output_root / "data" / "excluded_critics.csv", dropped_critics)
     terms_path = temporary_terms
     draw_path = _write_csv(output_root / "data" / "discriminator_metric_draws.csv", rows)
     split_path = aggregate_split_manifests(cfg, schedules, "learned")

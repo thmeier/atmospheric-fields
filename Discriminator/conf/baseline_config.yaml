@@ -73,6 +73,10 @@ baseline:
     - "global_mean_wasserstein"
     - "mmd_rbf"
     - "scwd"
+    # The blind-spot table's SCWD column is this one, not plain scwd: it
+    # reproduces the published column 9/9 where scwd does not. Omitting it
+    # silently drops that column from blindspot_table.tex.
+    - "scwd_area_weighted"
 
   output_dir: "${output_dir}/baselines/monthly_valid_time_2020/surface"
   # Use every timestamp in each configured range. The two quadratic metrics

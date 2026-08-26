@@ -34,6 +34,10 @@ temporal_resampling:
   # Give each pooled child its own W&B run. Off by default: 50 concurrent runs
   # add no signal over the parent aggregate, which uploads every draw anyway.
   child_wandb: false
+  # Drop a learned critic whose held-out accuracy is at or near chance: its
+  # reverse-KL score is not a divergence estimate, and with only five folds a
+  # min-max envelope cannot absorb one. Set to null to keep every critic.
+  min_critic_test_accuracy: 0.6
   # Which learned folds compute integrated-gradients attribution during training.
   # "canonical" restricts it to the fold the parent actually copies galleries
   # from; it is the most expensive part of training and the other folds' output

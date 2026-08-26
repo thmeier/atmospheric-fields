@@ -332,6 +332,26 @@ resolution: p95 of 50 draws rests on its top few order statistics, and the two
 schemes estimate different quantities. Both write the same file schema, so
 either can drive the renderer.
 
+### Non-converged critics
+
+`temporal_resampling.min_critic_test_accuracy` (default 0.6) drops a learned
+critic whose held-out accuracy is at or near chance before the reverse-KL draws
+are aggregated. A reverse-KL score is a divergence estimate only if its critic
+separates the two distributions; one that does not contributes a number of the
+wrong order entirely. In the 2026-08-26 T2M run a single GraphCast critic reached
+0.888 train and 0.521 test accuracy and scored -230 where its four siblings
+scored +7 to +14, moving the aggregate mean from +11 to -37.
+
+No central statistic repairs that. The learned band is a min-max envelope over
+five folds, so the outlier survives it; with n=5 a p05-p95 interval interpolates
+between the first two order statistics and is barely narrower. The draw has to
+leave the sample.
+
+The rule reads held-out accuracy only, never the score, so it cannot be used to
+discard an inconvenient value, and every exclusion is written to
+`data/excluded_critics.csv` with the accuracy that triggered it. Set the key to
+null to keep every critic.
+
 ### Changing error bars and styling without re-running
 
 Every band is recoverable after the fact:

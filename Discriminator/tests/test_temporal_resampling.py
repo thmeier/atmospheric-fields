@@ -160,3 +160,73 @@ class CanonicalPlotCopyTests(unittest.TestCase):
             landed = parent / "plots" / "paper" / "target_logit_distributions" / \
                 "squeezenet" / "forecast" / "GraphCast" / "all_lead_times.png"
             self.assertTrue(landed.is_file(), f"missing {landed}")
+
+
+class UnconvergedCriticTests(unittest.TestCase):
+    """A critic at chance accuracy must leave the sample, not be averaged in."""
+
+    @staticmethod
+    def _fold(root, resample_id, accuracies):
+        data = root / resample_id / "some__variable__tag" / "data"
+        data.mkdir(parents=True)
+        with open(data / "target_train_test_metrics.csv", "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["architecture", "kind", "target",
+                                                        "train_accuracy", "test_accuracy"])
+            writer.writeheader()
+            for target, acc in accuracies.items():
+                writer.writerow({"architecture": "squeezenet", "kind": "forecast",
+                                 "target": target, "train_accuracy": "0.88",
+                                 "test_accuracy": str(acc)})
+
+    def _setup(self, directory, threshold=0.6):
+        from unittest import mock
+        from Discriminator.scripts import temporal_resampling_pipeline as trp
+        root = Path(directory)
+        # learned_01's GraphCast critic never converged; everything else did.
+        self._fold(root, "learned_00", {"GraphCast": 0.86, "FuXi": 0.90})
+        self._fold(root, "learned_01", {"GraphCast": 0.52, "FuXi": 0.89})
+        schedules = [TemporalSchedule("learned_00", "learned", 0, (5, 11)),
+                     TemporalSchedule("learned_01", "learned", 1, (9, 15))]
+        rows = [
+            {"resample_id": "learned_00", "architecture": "squeezenet", "kind": "forecast",
+             "target": "GraphCast", "score": "12.6"},
+            {"resample_id": "learned_01", "architecture": "squeezenet", "kind": "forecast",
+             "target": "GraphCast", "score": "-230.6"},
+            {"resample_id": "learned_01", "architecture": "squeezenet", "kind": "forecast",
+             "target": "FuXi", "score": "18.8"},
+        ]
+        cfg = OmegaConf.create({"temporal_resampling": {"min_critic_test_accuracy": threshold}})
+        patch = mock.patch.object(trp, "_child_run_dir",
+                                  side_effect=lambda c, s: root / s.resample_id)
+        return trp, cfg, rows, schedules, patch
+
+    def test_chance_level_critic_is_dropped_and_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trp, cfg, rows, schedules, patch = self._setup(directory)
+            with patch:
+                kept, dropped = trp.drop_unconverged_critics(cfg, rows, schedules)
+            self.assertEqual(len(kept), 2)
+            self.assertEqual(len(dropped), 1)
+            self.assertEqual(dropped[0]["target"], "GraphCast")
+            self.assertEqual(dropped[0]["resample_id"], "learned_01")
+            # Only that one critic goes; the same fold's converged critic stays.
+            self.assertIn(("learned_01", "FuXi"),
+                          {(r["resample_id"], r["target"]) for r in kept})
+
+    def test_threshold_of_none_keeps_every_draw(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trp, cfg, rows, schedules, patch = self._setup(directory, threshold=None)
+            with patch:
+                kept, dropped = trp.drop_unconverged_critics(cfg, rows, schedules)
+            self.assertEqual(len(kept), 3)
+            self.assertEqual(dropped, [])
+
+    def test_exclusion_never_inspects_the_score(self):
+        # A wildly negative score from a CONVERGED critic must be retained;
+        # the rule is about convergence, not about disliking an outcome.
+        with tempfile.TemporaryDirectory() as directory:
+            trp, cfg, rows, schedules, patch = self._setup(directory)
+            rows[0]["score"] = "-999.0"          # learned_00 GraphCast, accuracy 0.86
+            with patch:
+                kept, _ = trp.drop_unconverged_critics(cfg, rows, schedules)
+            self.assertIn("-999.0", {r["score"] for r in kept})
