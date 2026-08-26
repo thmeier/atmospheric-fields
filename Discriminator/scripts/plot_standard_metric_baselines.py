@@ -3630,7 +3630,7 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
     handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
     fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
     fig.suptitle(f"Normalized Distributional Metrics by Forecast Model: {variable}\nDiamonds: ERA5 test vs buffered training complement", fontsize=14)
-    fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
+    fig.tight_layout(rect=[0.03, 0, 0.82, 1.0 - 0.45 / max(n_rows, 1)], h_pad=1.8)
     output_path = output_root / "plots" / "lead_time_by_model_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
@@ -3650,7 +3650,8 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
         return
     scales, colors = metric_normalization_scales(variable_rows, metric_names), metric_colors(metric_names)
     n_cols = 2; n_rows = int(np.ceil(len(corruptions) / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.4 * n_cols, 3.8 * n_rows), squeeze=False)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.4 * n_cols, 4.1 * n_rows),
+                             squeeze=False, layout="constrained")
     for axis, corruption in zip(axes.ravel(), corruptions):
         series = sorted(
             [row for row in variable_rows if row["corruption"] == corruption and not row_is_null(row)],
@@ -3676,13 +3677,24 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
         axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
         axis.set(title=corruption, xlabel="Corruption severity")
         axis.grid(True, alpha=0.3)
-    for axis in axes.ravel()[len(corruptions):]:
+    spare = list(axes.ravel()[len(corruptions):])
+    for axis in spare:
         axis.axis("off")
     fig.supylabel("Normalized divergence (metric maximum = 1)")
     handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+    if spare:
+        # An odd corruption count leaves an empty cell; putting the legend there
+        # beats floating it over a populated panel or stealing figure width.
+        spare[0].legend(handles, legend_labels, loc="center", frameon=True)
+    else:
+        fig.legend(handles, legend_labels, loc="outside center right")
     fig.suptitle(f"Normalized Distributional Metrics by Corruption: {variable}\nDiamonds: ERA5 test-vs-train null", fontsize=14)
-    fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
+    # Constrained layout, not tight_layout: it accounts for the suptitle, the
+    # shared y-label and the figure legend when it allocates space, so panel
+    # titles stay clear of the row above at manuscript font sizes. tight_layout
+    # with a fixed rect could not, and every panel title landed on the xlabel
+    # above it.
+    fig.get_layout_engine().set(h_pad=0.12, hspace=0.06, w_pad=0.08)
     output_path = output_root / "plots" / "corruption_by_type_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220, bbox_inches="tight")
