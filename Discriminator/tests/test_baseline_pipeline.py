@@ -97,7 +97,7 @@ class BaselinePipelineTests(unittest.TestCase):
         cfg.pipeline.runs_dir = None
         cfg.data_dir = "/cluster/team/data"
         self.assertEqual(
-            pipeline_runs_dir(cfg), Path("/cluster/team/results/baseline_pipeline_runs"),
+            pipeline_runs_dir(cfg), Path("/cluster/team/baseline_pipeline_runs"),
         )
 
     def test_resume_skips_completed_stage_with_existing_outputs(self):

@@ -265,7 +265,7 @@ sbatch scripts/submit_nosfno_paper_pipeline.sh
 Every invocation writes to an immutable directory:
 
 ```text
-/cluster/courses/pmlr/teams/team07/results/baseline_pipeline_runs/<pipeline-id>/
+/cluster/courses/pmlr/teams/team07/baseline_pipeline_runs/<pipeline-id>/
 ├── resolved_config.yaml
 ├── manifest.json
 └── <variable-tag>/
@@ -809,7 +809,7 @@ permutations are refreshed each training epoch and are independently deranged by
 field for `field_splice`.
 
 By default, `pipeline.runs_dir=null` resolves first from
-`PIPELINE_RUNS_DIR`, then to `../results/baseline_pipeline_runs` beside
+`PIPELINE_RUNS_DIR`, then to `../baseline_pipeline_runs` beside
 `DATA_DIR`; this keeps large runs out of home storage. Each atomic manifest also
 records total bytes and bytes by file suffix. The pipeline warns at 5 GiB and
 stops at 10 GiB by default. The pipeline manifest and resolved configuration

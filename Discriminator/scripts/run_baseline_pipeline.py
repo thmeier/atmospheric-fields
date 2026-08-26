@@ -96,7 +96,7 @@ def pipeline_runs_dir(cfg):
         return Path(environment)
     data_dir = cfg.get("data_dir")
     if data_dir:
-        return Path(str(data_dir)).parent / "results" / "baseline_pipeline_runs"
+        return Path(str(data_dir)).parent / "baseline_pipeline_runs"
     legacy = cfg.pipeline.get("manifest_dir")
     if legacy:
         return Path(str(legacy))

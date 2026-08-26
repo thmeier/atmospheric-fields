@@ -35,7 +35,7 @@ pipeline:
   id: null
   # Every invocation writes beneath this parent in an isolated directory named
   # after its pipeline id. Reusing an id requires an explicit resume opt-in.
-  # Null resolves via PIPELINE_RUNS_DIR, then next to DATA_DIR under team results.
+  # Null resolves via PIPELINE_RUNS_DIR, then beside DATA_DIR at the team root.
   runs_dir: null
   resume: false
   # Exact existing models/target_discriminators directory to load when this
