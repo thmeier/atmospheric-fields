@@ -79,11 +79,10 @@ target_discriminator:
   corruption_severity_max_overrides:
     gaussian_blur: 1.0
     pixel_replace: 0.01
-  # Training-only lower bounds; clean samples are always supplied by the real
-  # class.  This keeps power-law blur samples away from the identity regime.
+  # Optional training-only logical-severity bounds. Gaussian blur performs its
+  # own zero-preserving remap onto the useful physical blur range.
   corruption_severity_min: 0.0
-  corruption_severity_min_overrides:
-    gaussian_blur: 0.2
+  corruption_severity_min_overrides: {}
   plot_yscale: linear
   plot_linthresh: 1e-2
   forecast_files: ${baseline.forecast_files}
