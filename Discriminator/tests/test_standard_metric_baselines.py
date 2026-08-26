@@ -28,6 +28,7 @@ from Discriminator.scripts.plot_standard_metric_baselines import (
     fit_vissio_ulam_grid,
     global_mean_wasserstein_diagnostic,
     representative_corruption_time_index,
+    repeated_diagnostic_labels,
     relative_corruption_coordinates,
     corruption_range_label,
     pairwise_sample_positions,
@@ -110,6 +111,26 @@ def synthetic_temperature_dataset():
             "longitude": np.arange(8) * 45.0,
         },
     )
+
+
+class RepeatedPlotSelectionTest(unittest.TestCase):
+    def test_representative_mode_keeps_one_label_per_comparison_kind(self):
+        diagnostics = [
+            {"comparison_kind": "forecast", "label": "Pangu-Weather"},
+            {"comparison_kind": "forecast", "label": "GraphCast"},
+            {"comparison_kind": "corruption", "label": "grf"},
+            {"comparison_kind": "corruption", "label": "gaussian_blur"},
+            {"comparison_kind": "null", "label": "ERA5 null"},
+        ]
+        self.assertEqual(
+            repeated_diagnostic_labels(diagnostics, representative_only=True),
+            [
+                ("corruption", "gaussian_blur"),
+                ("forecast", "GraphCast"),
+                ("null", "ERA5 null"),
+            ],
+        )
+        self.assertEqual(len(repeated_diagnostic_labels(diagnostics)), 5)
 
 
 class FullStatisticsBaselineTest(unittest.TestCase):

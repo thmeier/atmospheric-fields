@@ -85,19 +85,22 @@ def _selected(path):
     )
 
 
-def _paper_width():
-    if _PAPER_WIDTH_KIND == "half":
+def _paper_width(width_kind=None):
+    width_kind = _PAPER_WIDTH_KIND if width_kind is None else str(width_kind)
+    if width_kind == "half":
         return (_PAPER_WIDTH_INCHES - _PAPER_COLUMN_GAP_INCHES) / 2.0
-    return _PAPER_WIDTH_INCHES
+    if width_kind == "full":
+        return _PAPER_WIDTH_INCHES
+    raise ValueError("paper_width_kind must be 'full' or 'half'.")
 
 
-def _paperize_figure(figure):
+def _paperize_figure(figure, paper_width_kind=None):
     """Resize and restyle an existing figure at its final manuscript width."""
     mpl.rcParams["pdf.fonttype"] = 42
     mpl.rcParams["ps.fonttype"] = 42
     mpl.rcParams["mathtext.fontset"] = "stix"
     old_width, old_height = figure.get_size_inches()
-    width = _paper_width()
+    width = _paper_width(paper_width_kind)
     figure.set_size_inches(width, width * old_height / max(old_width, 1e-12), forward=True)
     for text_artist in figure.findobj(match=lambda artist: hasattr(artist, "set_fontsize")):
         try:
@@ -121,11 +124,8 @@ def _paperize_figure(figure):
             if line.get_marker() not in {None, "None", ""}:
                 line.set_markersize(min(float(line.get_markersize()), 3.5))
     for legend in figure.legends:
-        for text_artist in legend.get_texts():
-            text_artist.set_fontsize(7.0)
-        if hasattr(legend, "set_loc"):
-            legend.set_loc("center right")
-        legend.set_bbox_to_anchor((0.99, 0.5), transform=figure.transFigure)
+        # The creating plot owns legend placement and reserves its surrounding
+        # margin. Paperization changes typography, not layout semantics.
         for text_artist in legend.get_texts():
             text_artist.set_fontsize(7.0)
 
@@ -235,16 +235,37 @@ def _artist_arrays(figure):
 
 @contextmanager
 def without_suptitle(figure):
-    """Temporarily remove only the figure-level main title."""
+    """Temporarily remove the main title used by the title-less companion.
+
+    Most figures use ``suptitle``.  Single-panel figures often place their
+    effective figure title on the sole plotting axis instead; remove that too,
+    while leaving multiple panel titles intact as contextual labels.
+    """
     supertitle = getattr(figure, "_suptitle", None)
     supertitle_text = None if supertitle is None else supertitle.get_text()
+    titled_axes = []
+    for axis in figure.get_axes():
+        if not axis.get_visible():
+            continue
+        titles = [(location, axis.get_title(loc=location))
+                  for location in ("left", "center", "right")]
+        titles = [(location, value) for location, value in titles if value]
+        if titles:
+            titled_axes.append((axis, titles))
+    axis_titles = titled_axes if len(titled_axes) == 1 else []
     try:
         if supertitle is not None:
             supertitle.set_text("")
+        for axis, titles in axis_titles:
+            for location, _ in titles:
+                axis.set_title("", loc=location)
         yield
     finally:
         if supertitle is not None:
             supertitle.set_text(supertitle_text)
+        for axis, titles in axis_titles:
+            for location, value in titles:
+                axis.set_title(value, loc=location)
 
 
 def rasterize_field_artists(figure):
@@ -351,13 +372,14 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
 
 
 def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=None,
-                       dpi=220, bbox_inches=None, capture_artists=True, save_pdf=None):
+                       dpi=220, bbox_inches=None, capture_artists=True, save_pdf=None,
+                       paper_width_kind=None):
     """Save titled and title-less PNG/NPZ bundles, optionally including PDFs."""
     png_path = profiled_plot_path(png_path)
     if not _selected(png_path):
         return []
     if _PLOT_PROFILE == "paper":
-        _paperize_figure(figure)
+        _paperize_figure(figure, paper_width_kind=paper_width_kind)
         bbox_inches = None
     if save_pdf is None:
         save_pdf = _DEFAULT_SAVE_PDF

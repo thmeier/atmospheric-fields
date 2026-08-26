@@ -30,6 +30,7 @@ Metrics:
 """
 
 import csv
+import gzip
 import json
 import math
 from fractions import Fraction
@@ -2690,14 +2691,40 @@ def read_global_mean_wasserstein_diagnostics(output_root):
     return diagnostics
 
 
-def plot_global_mean_wasserstein_distributions(diagnostics, output_root):
+def repeated_diagnostic_labels(diagnostics, representative_only=False):
+    """Return all labels, or one representative label per comparison kind."""
+    labels = sorted({
+        (str(item.get("comparison_kind", "comparison")), str(item["label"]))
+        for item in diagnostics
+    })
+    if not representative_only:
+        return labels
+    representatives = []
+    seen_kinds = set()
+    for comparison_kind, label in labels:
+        if comparison_kind not in seen_kinds:
+            representatives.append((comparison_kind, label))
+            seen_kinds.add(comparison_kind)
+    return representatives
+
+
+def plot_global_mean_wasserstein_distributions(
+    diagnostics, output_root, representative_only=False,
+):
     """Overlay forecast and matched-ERA5 global-mean distributions by lead time."""
     if not diagnostics:
         return
     root = output_root / "plots" / "global_mean_wasserstein"
     root.mkdir(parents=True, exist_ok=True)
-    for label in sorted({item["label"] for item in diagnostics}):
-        series = sorted([item for item in diagnostics if item["label"] == label], key=lambda item: item["lead_hour"])
+    for comparison_kind, label in repeated_diagnostic_labels(
+        diagnostics, representative_only=representative_only,
+    ):
+        series = sorted(
+            [item for item in diagnostics
+             if str(item.get("comparison_kind", "comparison")) == comparison_kind
+             and str(item["label"]) == label],
+            key=lambda item: item["lead_hour"],
+        )
         fields = series[0]["fields"]
         n_panels = len(series) * len(fields)
         n_cols = min(2, n_panels)
@@ -2958,13 +2985,16 @@ def scwd_output_stem(item):
     return label
 
 
-def plot_scwd_anchor_diagnostics(diagnostics, output_root):
+def plot_scwd_anchor_diagnostics(diagnostics, output_root, representative_only=False):
     """Plot shared-scale SCWD local-Wasserstein maps in one figure per model."""
     if not diagnostics:
         return
     values = np.stack([item["anchor_local_wasserstein"] for item in diagnostics])
     vmax = max(float(np.nanpercentile(values, 99)), 1e-12)
-    labels = sorted({(scwd_comparison_kind(item), item["label"]) for item in diagnostics})
+    labels = repeated_diagnostic_labels(
+        [{**item, "comparison_kind": scwd_comparison_kind(item)} for item in diagnostics],
+        representative_only=representative_only,
+    )
 
     for comparison_kind, label in labels:
         series = sorted(
@@ -3014,12 +3044,29 @@ def plot_scwd_anchor_diagnostics(diagnostics, output_root):
         print(f"Saved SCWD anchor map to: {output_path}")
 
 
-def plot_scwd_top_wasserstein_distributions(diagnostics, cfg, output_root):
+def plot_scwd_top_wasserstein_distributions(
+    diagnostics, cfg, output_root, representative_only=False,
+):
     """Plot per-field marginals at anchors with the largest local joint W2."""
     if not diagnostics:
         return
     n_bins = max(2, int(baseline_get(cfg, "scwd_distribution_bins", 40)))
-    for diagnostic in diagnostics:
+    selected = diagnostics
+    if representative_only:
+        selected = []
+        seen_kinds = set()
+        for diagnostic in sorted(
+            diagnostics,
+            key=lambda item: (
+                scwd_comparison_kind(item), str(item["label"]),
+                int(item.get("lead_hour", 0)), float(item.get("severity", 0.0)),
+            ),
+        ):
+            comparison_kind = scwd_comparison_kind(diagnostic)
+            if comparison_kind not in seen_kinds:
+                selected.append(diagnostic)
+                seen_kinds.add(comparison_kind)
+    for diagnostic in selected:
         distributions = diagnostic["top_wasserstein_distributions"]
         fields = diagnostic["field_names"]
         if not distributions:
@@ -3070,13 +3117,16 @@ def plot_scwd_top_wasserstein_distributions(diagnostics, cfg, output_root):
         print(f"Saved top joint-W2 SCWD response distributions to: {output_path}")
 
 
-def plot_scwd_mean_response_differences(diagnostics, output_root):
+def plot_scwd_mean_response_differences(diagnostics, output_root, representative_only=False):
     """Plot per-field candidate-minus-reference mean SCWD responses."""
     if not diagnostics:
         return
     values = np.stack([item["anchor_mean_response_difference"] for item in diagnostics])
     vmax = max(float(np.nanpercentile(np.abs(values), 99)), 1e-12)
-    labels = sorted({(scwd_comparison_kind(item), item["label"]) for item in diagnostics})
+    labels = repeated_diagnostic_labels(
+        [{**item, "comparison_kind": scwd_comparison_kind(item)} for item in diagnostics],
+        representative_only=representative_only,
+    )
     for comparison_kind, label in labels:
         series = sorted(
             [item for item in diagnostics
@@ -3655,7 +3705,7 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
         axis.axis("off")
     fig.supylabel("Normalized divergence (metric maximum = 1)")
     handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(0.835, 0.5), fontsize=8)
     fig.suptitle(f"Normalized Distributional Metrics by Forecast Model: {variable}\nDiamonds: ERA5 test vs buffered training complement", fontsize=14)
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
     output_path = output_root / "plots" / "lead_time_by_model_normalized.png"
@@ -3707,7 +3757,7 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
         axis.axis("off")
     fig.supylabel("Normalized divergence (metric maximum = 1)")
     handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(0.835, 0.5), fontsize=8)
     fig.suptitle(f"Normalized Distributional Metrics by Corruption: {variable}\nDiamonds: ERA5 test-vs-train null", fontsize=14)
     fig.tight_layout(rect=[0.03, 0, 0.82, 0.91])
     output_path = output_root / "plots" / "corruption_by_type_normalized.png"
@@ -3881,7 +3931,7 @@ def plot_corruption_metrics(rows, metric_names, variables, output_root):
     for ax in axes[len(metric_names):]:
         ax.axis("off")
     handles, legend_labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+    fig.legend(handles, legend_labels, loc="center left", bbox_to_anchor=(0.835, 0.5), fontsize=8)
     fig.suptitle(
         f"Distributional Metrics vs Corruption Strength: {variable}\n"
         "Diamond at zero: ERA5 test-vs-train null",
@@ -4474,6 +4524,121 @@ def read_discriminator_baselines(output_root):
     return rows
 
 
+def read_discriminator_terms(output_root):
+    """Read the reconstructible per-sample discriminator terms."""
+    data_path = output_root / "data" / "discriminator_terms.csv.gz"
+    if not data_path.exists():
+        return []
+    with gzip.open(data_path, "rt", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    for row in rows:
+        for field in ("x", "lead_hour", "logit"):
+            if row.get(field, "") != "":
+                row[field] = float(row[field])
+    return rows
+
+
+def plot_forecast_logit_histogram_gallery(term_rows, cfg, output_root):
+    """Plot all lead-time logit densities for selected models in two columns."""
+    settings = (cfg.get("plotting", {}) or {}).get("logit_histogram_gallery", {}) or {}
+    if not bool(settings.get("enabled", True)) or not term_rows:
+        return
+    architecture = str(settings.get("architecture", "squeezenet"))
+    models = list(settings.get("models", [])) or list(
+        (baseline_get(cfg, "forecast_files", {}) or {}).keys()
+    )
+    rows = [
+        row for row in term_rows
+        if row.get("architecture") == architecture
+        and row.get("kind") == "forecast"
+        and row.get("role") == "candidate"
+    ]
+    available_resamples = sorted({row.get("resample_id", "") for row in rows})
+    preferred = str(settings.get("resample_id", "learned_04"))
+    if available_resamples and any(available_resamples):
+        selected_resample = preferred if preferred in available_resamples else available_resamples[0]
+        rows = [row for row in rows if row.get("resample_id", "") == selected_resample]
+    else:
+        selected_resample = ""
+
+    panels = []
+    for model in models:
+        model_rows = [row for row in rows if row.get("target") == model]
+        reference = np.asarray([
+            row["logit"] for row in model_rows
+            if row.get("source") == ERA5_NULL_LABEL
+        ], dtype=float)
+        leads = sorted({
+            int(row["lead_hour"]) for row in model_rows
+            if row.get("source") == model and row.get("lead_hour", "") != ""
+        })
+        groups = []
+        for lead in leads:
+            candidate = np.asarray([
+                row["logit"] for row in model_rows
+                if row.get("source") == model
+                and row.get("lead_hour", "") != ""
+                and int(row["lead_hour"]) == lead
+            ], dtype=float)
+            if candidate.size:
+                groups.append((lead, candidate))
+        if reference.size and groups:
+            panels.append((model, reference, groups))
+    if not panels:
+        print(f"Skipping {architecture} forecast-logit gallery: no matching per-sample terms.")
+        return
+
+    all_values = [reference for _, reference, _ in panels]
+    all_values += [candidate for _, _, groups in panels for _, candidate in groups]
+    finite = [value[np.isfinite(value)] for value in all_values]
+    edges = np.histogram_bin_edges(
+        np.concatenate([value for value in finite if value.size]), bins=40,
+    )
+    all_leads = sorted({lead for _, _, groups in panels for lead, _ in groups})
+    colors = dict(zip(all_leads, plt.cm.viridis(np.linspace(0.08, 0.92, len(all_leads)))))
+    nrows = int(math.ceil(len(panels) / 2))
+    figure, axes = plt.subplots(nrows, 2, figsize=(10.0, 3.4 * nrows), squeeze=False)
+    payload = {"bin_edges": edges, "resample_id": np.asarray(selected_resample)}
+    for panel_index, (axis, (model, reference, groups)) in enumerate(
+        zip(axes.flat, panels)
+    ):
+        axis.hist(
+            reference, bins=edges, density=True, histtype="stepfilled",
+            color="0.55", alpha=0.32, label="ERA5 test",
+        )
+        payload[f"model_{panel_index}"] = np.asarray(model)
+        payload[f"reference_logits_{panel_index}"] = reference
+        for lead, candidate in groups:
+            axis.hist(
+                candidate, bins=edges, density=True, histtype="step",
+                linewidth=1.5, color=colors[lead], label=f"+{lead}h",
+            )
+            payload[f"candidate_logits_{panel_index}_{lead}h"] = candidate
+        axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
+        axis.set(title=model, xlabel="Real-vs-fake logit", ylabel="Density")
+        axis.grid(alpha=0.22)
+    for axis in axes.flat[len(panels):]:
+        axis.set_visible(False)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    figure.legend(
+        handles, labels, loc="lower center", ncol=min(len(labels), 7),
+        bbox_to_anchor=(0.5, 0.005), fontsize=8,
+    )
+    figure.suptitle(f"Held-out discriminator logits ({architecture})")
+    figure.tight_layout(rect=[0.0, 0.07, 1.0, 0.96])
+    output_path = (
+        output_root / "plots" / "target_logit_distributions" / architecture
+        / "forecast" / "all_models_all_lead_times.png"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_figure_bundle(
+        figure, output_path, plot_type="forecast_logit_histogram_gallery",
+        payload=payload, dpi=220, bbox_inches="tight",
+    )
+    plt.close(figure)
+    print(f"Saved two-column forecast-logit gallery to: {output_path}")
+
+
 def plot_discriminator_baselines(rows, cfg, output_root):
     """Plot already evaluated target-discriminator scores."""
     if not rows:
@@ -4488,8 +4653,10 @@ def plot_discriminator_baselines(rows, cfg, output_root):
             visual_corruption_scale = kind == "corruption"
             xlabel = ("Relative corruption severity (1 = corruption-specific maximum)"
                       if visual_corruption_scale else "Lead time (hours)")
-            figure, axis = plt.subplots(figsize=(9, 5))
             targets = sorted({row["target"] for row in architecture_rows if row["kind"] == kind})
+            legend_columns = 2
+            legend_rows = max(1, int(math.ceil(len(targets) / legend_columns)))
+            figure, axis = plt.subplots(figsize=(6.4, 4.8 + 0.5 * legend_rows))
             colors = plt.cm.tab10(np.linspace(0, 1, max(len(targets), 1)))
             for target_index, (color, target) in enumerate(zip(colors, targets)):
                 series = sorted(
@@ -4518,10 +4685,10 @@ def plot_discriminator_baselines(rows, cfg, output_root):
             input_count = len(str(architecture_rows[0].get("input_variables", "")).split(","))
             input_label = "four fields" if input_count == 4 else architecture_rows[0].get("input_variables", "field")
             comparison_label = "Lead Time" if kind == "forecast" else "Corruption Strength"
-            axis.set(
-                xlabel=xlabel, ylabel="Reverse-KL critic score",
-                title=(f"Reverse-KL Critic vs {comparison_label}: {architecture} ({input_label})\n"
-                       "Diamond at zero: ERA5 test-vs-train null"),
+            axis.set(xlabel=xlabel, ylabel="Reverse-KL critic score")
+            figure.suptitle(
+                f"Reverse-KL critic vs {comparison_label.lower()}\n"
+                f"{architecture}, {input_label}; diamonds: ERA5 null",
             )
             if visual_corruption_scale:
                 axis.set_xlim(0.0, 1.0)
@@ -4530,9 +4697,18 @@ def plot_discriminator_baselines(rows, cfg, output_root):
             else:
                 axis.set_yscale(str(settings.get("plot_yscale")))
             axis.grid(alpha=0.3, which="both")
-            axis.legend()
-            figure.tight_layout()
-            save_figure_bundle(figure, architecture_root / filename, plot_type="discriminator_reverse_kl", dpi=220); plt.close(figure)
+            handles, legend_labels = axis.get_legend_handles_labels()
+            figure.legend(
+                handles, legend_labels, loc="lower center", ncol=legend_columns,
+                bbox_to_anchor=(0.5, 0.012), fontsize=8,
+            )
+            bottom = min(0.17 + 0.052 * legend_rows, 0.46)
+            figure.subplots_adjust(left=0.16, right=0.98, bottom=bottom, top=0.80)
+            save_figure_bundle(
+                figure, architecture_root / filename,
+                plot_type="discriminator_reverse_kl", dpi=220,
+                paper_width_kind="half",
+            ); plt.close(figure)
 
 
 def evaluate_standard_metrics(cfg):
@@ -4733,7 +4909,16 @@ def plot_main_corruption_comparison(
         if row.get("variable") == variable and row.get("corruption") in corruptions
     ]
     scales = metric_normalization_scales(selected_rows, metric_names)
+    critic_values = np.asarray([
+        float(row["score"]) for row in critic_rows if np.isfinite(float(row["score"]))
+    ])
+    critic_positive = critic_values[critic_values > 0.0]
+    critic_scale = float(
+        critic_positive.max() if critic_positive.size else np.abs(critic_values).max()
+    ) if critic_values.size else 1.0
+    critic_scale = max(critic_scale, 1e-12)
     colors = metric_colors(metric_names)
+    critic_color, critic_marker = "#222222", "X"
     figure, axes = plt.subplots(2, 3, figsize=(12.0, 7.4), squeeze=False)
     axes = axes.ravel()
 
@@ -4783,6 +4968,33 @@ def plot_main_corruption_comparison(
                     color=colors[metric_name],
                     zorder=4,
                 )
+        target_rows = [row for row in critic_rows if row["target"] == corruption]
+        critic_series = sorted(
+            [row for row in target_rows if not row["is_era5_test_null"]],
+            key=lambda row: row["x"],
+        )
+        critic_x = relative_corruption_coordinates(critic_series, "x")
+        axis.plot(
+            critic_x,
+            [row["score"] / critic_scale for row in critic_series],
+            marker=critic_marker, linestyle="--", linewidth=1.6,
+            color=critic_color, label="Reverse-KL critic",
+        )
+        if critic_series and "score_lower" in critic_series[0]:
+            axis.fill_between(
+                critic_x,
+                [row["score_lower"] / critic_scale for row in critic_series],
+                [row["score_upper"] / critic_scale for row in critic_series],
+                color=critic_color, alpha=0.12, linewidth=0,
+            )
+        critic_null = next(
+            (row for row in target_rows if row["is_era5_test_null"]), None
+        )
+        if critic_null is not None:
+            axis.scatter(
+                [0.0], [critic_null["score"] / critic_scale],
+                marker="D", s=24, color=critic_color, zorder=4,
+            )
         axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
         axis.set(
             title=corruption.replace("_", " "),
@@ -4793,68 +5005,24 @@ def plot_main_corruption_comparison(
             axis.set_ylabel("Normalized divergence")
         axis.grid(True, alpha=0.3)
 
-    critic_axis = axes[5]
-    critic_colors = plt.cm.tab10(np.linspace(0, 1, len(corruptions)))
-    for corruption_index, (color, corruption) in enumerate(
-        zip(critic_colors, corruptions)
-    ):
-        target_rows = [
-            row for row in critic_rows if row["target"] == corruption
-        ]
-        series = sorted(
-            [row for row in target_rows if not row["is_era5_test_null"]],
-            key=lambda row: row["x"],
-        )
-        x_values = relative_corruption_coordinates(series, "x")
-        critic_axis.plot(
-            x_values,
-            [row["score"] for row in series],
-            marker=series_marker(corruption_index),
-            linewidth=1.6,
-            color=color,
-            label=corruption.replace("_", " "),
-        )
-        if series and "score_lower" in series[0]:
-            critic_axis.fill_between(
-                x_values,
-                [row["score_lower"] for row in series],
-                [row["score_upper"] for row in series],
-                color=color,
-                alpha=0.14,
-                linewidth=0,
-            )
-        null_row = next(
-            (row for row in target_rows if row["is_era5_test_null"]), None
-        )
-        if null_row is not None:
-            critic_axis.scatter(
-                [0.0], [null_row["score"]], marker="D", s=24,
-                color=color, zorder=4,
-            )
-    critic_axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
-    critic_axis.set(
-        title="Reverse-KL critic",
-        xlabel="Relative corruption severity",
-        ylabel="Reverse-KL critic score",
-        xlim=(0.0, 1.0),
-    )
-    critic_axis.grid(True, alpha=0.3)
-    critic_axis.legend(fontsize=7, loc="best")
-
+    legend_axis = axes[5]
+    legend_axis.set_axis_off()
     metric_handles, metric_labels = axes[0].get_legend_handles_labels()
-    figure.legend(
+    legend_axis.legend(
         metric_handles,
         metric_labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.005),
-        ncol=min(5, len(metric_labels)),
-        fontsize=8,
+        loc="center",
+        frameon=False,
+        fontsize=9,
+        title="Metrics",
+        title_fontsize=10,
     )
+
     figure.suptitle(
-        "Controlled-corruption response of fixed metrics and learned critic",
+        "Normalized fixed-metric and learned-critic responses to corruption",
         fontsize=14,
     )
-    figure.tight_layout(rect=[0.0, 0.075, 1.0, 0.95])
+    figure.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
     output_path = output_root / "plots" / "corruption_metrics_and_critic.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_figure_bundle(
@@ -4885,6 +5053,7 @@ def plot_saved_standard_metric_baselines(cfg):
     global_mean_diagnostics = (read_global_mean_wasserstein_diagnostics(output_root)
                                if "global_mean_wasserstein" in metric_names else [])
     discriminator_rows = read_discriminator_baselines(output_root)
+    discriminator_terms = read_discriminator_terms(output_root)
 
     plot_lead_metrics(lead_rows, metric_names, variables, output_root)
     plot_corruption_metrics(corruption_rows, metric_names, variables, output_root)
@@ -4893,13 +5062,32 @@ def plot_saved_standard_metric_baselines(cfg):
     plot_main_corruption_comparison(
         corruption_rows, discriminator_rows, metric_names, variables, cfg, output_root
     )
+    repeated_plot_mode = str(
+        (cfg.get("plotting", {}) or {}).get("repeated_plot_mode", "all")
+    )
+    if repeated_plot_mode not in {"all", "representative_only"}:
+        raise ValueError(
+            "plotting.repeated_plot_mode must be 'all' or 'representative_only'."
+        )
+    representative_only = repeated_plot_mode == "representative_only"
     plot_corruption_disturbances(output_root)
-    plot_scwd_anchor_diagnostics(scwd_diagnostics, output_root)
+    plot_scwd_anchor_diagnostics(
+        scwd_diagnostics, output_root, representative_only=representative_only,
+    )
     if bool((cfg.get("plotting", {}) or {}).get("scwd_response_histograms", False)):
-        plot_scwd_top_wasserstein_distributions(scwd_diagnostics, cfg, output_root)
-    plot_scwd_mean_response_differences(scwd_diagnostics, output_root)
-    plot_global_mean_wasserstein_distributions(global_mean_diagnostics, output_root)
+        plot_scwd_top_wasserstein_distributions(
+            scwd_diagnostics, cfg, output_root,
+            representative_only=representative_only,
+        )
+    plot_scwd_mean_response_differences(
+        scwd_diagnostics, output_root, representative_only=representative_only,
+    )
+    plot_global_mean_wasserstein_distributions(
+        global_mean_diagnostics, output_root,
+        representative_only=representative_only,
+    )
     plot_discriminator_baselines(discriminator_rows, cfg, output_root)
+    plot_forecast_logit_histogram_gallery(discriminator_terms, cfg, output_root)
     mmd_root = mmd_global_moment_matching_output_dir(cfg, variables)
     plot_mmd_global_moment_matching(read_mmd_global_moment_matching(mmd_root), mmd_root)
 
