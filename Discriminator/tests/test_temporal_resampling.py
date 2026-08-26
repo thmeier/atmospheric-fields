@@ -132,3 +132,31 @@ class CountSpreadTests(unittest.TestCase):
         self.assertEqual(spreads[(("GraphCast", "192"), "n_samples")], (160, 168))
         # The capped pairwise count is identical, so it must not be flagged.
         self.assertNotIn((("GraphCast", "192"), "pairwise_n_samples"), spreads)
+
+
+class CanonicalPlotCopyTests(unittest.TestCase):
+    """Training figures must be found under either profile and variable tag."""
+
+    def test_finds_plots_under_paper_profile_and_a_different_variable_tag(self):
+        import shutil as _shutil
+        from unittest import mock
+        from Discriminator.scripts import temporal_resampling_pipeline as trp
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child"
+            # Training writes under its own tag, nested under the paper profile.
+            deep = child / "t2m__u10__v10__msl" / "plots" / "paper" / "target_logit_distributions"
+            (deep / "squeezenet" / "forecast" / "GraphCast").mkdir(parents=True)
+            (deep / "squeezenet" / "forecast" / "GraphCast" / "all_lead_times.png").write_text("x")
+            # A wandb media mirror must never be treated as a source.
+            noise = child / "wandb" / "plots" / "target_logit_distributions"
+            noise.mkdir(parents=True)
+            parent = root / "parent"
+            with mock.patch.object(trp, "_child_run_dir", return_value=child), \
+                 mock.patch.object(trp, "_parent_output_root", return_value=parent):
+                copied = trp.copy_canonical_training_plots(
+                    None, TemporalSchedule("learned_04", "learned", 4, (20, 26)))
+            self.assertTrue(copied, "expected the paper-profile plots to be found")
+            landed = parent / "plots" / "paper" / "target_logit_distributions" / \
+                "squeezenet" / "forecast" / "GraphCast" / "all_lead_times.png"
+            self.assertTrue(landed.is_file(), f"missing {landed}")

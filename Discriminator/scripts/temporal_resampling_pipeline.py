@@ -433,21 +433,33 @@ def copy_canonical_training_plots(cfg, canonical):
     The parent already adopts that fold's checkpoints for the discriminator
     figures; copying the matching plots keeps every deliverable in one place
     and keeps the fold identity consistent across them.
+
+    The source is discovered rather than computed. Two things move it: the
+    training stage writes under `target_discriminator.output_dir`, which is
+    pinned to its own variable tag and so need not match the baseline's tag,
+    and `plotting.profile=paper` nests everything one level deeper under
+    `plots/paper/`. Computing either from the baseline config silently found
+    nothing and dropped the logit-distribution figure from a completed run.
     """
-    source_root = _child_output_root(cfg, canonical) / "plots"
+    child_run = _child_run_dir(cfg, canonical)
     target_root = _parent_output_root(cfg) / "plots"
     copied = []
     for name in CANONICAL_PLOT_DIRS:
-        source = source_root / name
-        if not source.is_dir():
-            continue
-        target = target_root / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target, dirs_exist_ok=True)
-        copied.append(target)
+        for source in sorted(child_run.glob(f"*/plots/{name}")) + \
+                      sorted(child_run.glob(f"*/plots/*/{name}")):
+            if not source.is_dir() or "wandb" in source.parts:
+                continue
+            # Preserve any profile directory that sits between plots/ and name.
+            profile = source.parent.name
+            target = target_root / name if profile == "plots" else target_root / profile / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target, dirs_exist_ok=True)
+            copied.append(target)
     if copied:
         print(f"Copied {canonical.resample_id} training plots to "
               f"{', '.join(str(path) for path in copied)}")
+    else:
+        print(f"No training plots found under {child_run} to copy to the parent.")
     return copied
 
 
