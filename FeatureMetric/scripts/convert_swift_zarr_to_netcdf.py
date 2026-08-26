@@ -70,6 +70,32 @@ def prepare_swift_forecasts(dataset, variables=SURFACE_VARIABLES, lead_hour_valu
     return selected.transpose("time", "prediction_timedelta", "latitude", "longitude")
 
 
+def sample_oriented_netcdf_encoding(dataset, compression_level=4):
+    """Return chunks suited to the pipeline's random ``(time, lead)`` reads.
+
+    A training sample contains the complete latitude/longitude grid for one
+    initialization and one lead. Keeping those two axes at chunk size one
+    prevents a single sample read from decompressing hundreds of unrelated
+    times and leads, while retaining each spatial field as one contiguous
+    chunk.
+    """
+    chunksizes = (
+        1,
+        1,
+        int(dataset.sizes["latitude"]),
+        int(dataset.sizes["longitude"]),
+    )
+    return {
+        variable: {
+            "zlib": int(compression_level) > 0,
+            "complevel": int(compression_level),
+            "shuffle": True,
+            "chunksizes": chunksizes,
+        }
+        for variable in dataset.data_vars
+    }
+
+
 def convert_swift_zarr(input_path, output_path, variables=SURFACE_VARIABLES, lead_hour_values=None,
                        member=0, compression_level=4, overwrite=False):
     """Write a selected SWIFT forecast Zarr subset as a pipeline-compatible NetCDF."""
@@ -85,10 +111,7 @@ def convert_swift_zarr(input_path, output_path, variables=SURFACE_VARIABLES, lea
     try:
         converted = prepare_swift_forecasts(dataset, variables, lead_hour_values, member)
         print(f"Writing {dict(converted.sizes)}; leads={lead_hours(converted.prediction_timedelta.values).tolist()} h")
-        encoding = {
-            variable: {"zlib": True, "complevel": int(compression_level)}
-            for variable in converted.data_vars
-        }
+        encoding = sample_oriented_netcdf_encoding(converted, compression_level)
         temporary_output = output_path.with_name(f".{output_path.name}.partial")
         try:
             temporary_output.unlink(missing_ok=True)

@@ -7,6 +7,7 @@ from FeatureMetric.scripts.convert_swift_zarr_to_netcdf import (
     SURFACE_VARIABLES,
     lead_hours,
     prepare_swift_forecasts,
+    sample_oriented_netcdf_encoding,
 )
 
 
@@ -39,6 +40,15 @@ class SwiftConverterTests(unittest.TestCase):
     def test_preparation_rejects_a_missing_lead(self):
         with self.assertRaisesRegex(ValueError, "unavailable"):
             prepare_swift_forecasts(swift_fixture(), lead_hour_values=[48])
+
+    def test_netcdf_chunks_match_one_complete_forecast_sample(self):
+        converted = prepare_swift_forecasts(swift_fixture())
+        encoding = sample_oriented_netcdf_encoding(converted, compression_level=3)
+
+        for variable in SURFACE_VARIABLES:
+            self.assertEqual(encoding[variable]["chunksizes"], (1, 1, 2, 3))
+            self.assertTrue(encoding[variable]["zlib"])
+            self.assertEqual(encoding[variable]["complevel"], 3)
 
 
 if __name__ == "__main__":
