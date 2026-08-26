@@ -63,7 +63,7 @@ try:
     from .plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
     from .histogram_matching_apply import match_standardized
     from .histogram_checkpoint import validate_binding
-    from .temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
+    from .temporal_resampling import active_schedule, settings, file_sha256, write_csv_gz, write_split_membership
     from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
         WeatherDiscriminator,
@@ -83,7 +83,7 @@ except ImportError:
     from plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
     from histogram_matching_apply import match_standardized
     from histogram_checkpoint import validate_binding
-    from temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
+    from temporal_resampling import active_schedule, settings, file_sha256, write_csv_gz, write_split_membership
     from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
         WeatherDiscriminator,
@@ -4784,7 +4784,13 @@ def evaluate_standard_metrics(cfg):
         corruption_rows, metric_names, corruption_path, "corruption_strength"
     )
     schedule = active_schedule(cfg)
-    retain_diagnostics = schedule is None or schedule.ordinal == 4
+    # The canonical fold owns the expensive spatial diagnostics -- it is the fold
+    # the parent lifts up via schedules[min(4, len-1)], i.e. ordinal min(4, N-1)
+    # over the N fixed resamples. Hard-coding 4 silently skipped the write whenever
+    # fewer than five resamples were configured (a single-draw run has one fold at
+    # ordinal 0), and the plot stage then failed on the absent NetCDF.
+    canonical_ordinal = min(4, int(settings(cfg).get("fixed_replicates", 50)) - 1)
+    retain_diagnostics = schedule is None or schedule.ordinal == canonical_ordinal
     if retain_diagnostics:
         write_scwd_anchor_diagnostics(
             null_scwd_diagnostics + scwd_diagnostics + corruption_scwd_diagnostics, output_root

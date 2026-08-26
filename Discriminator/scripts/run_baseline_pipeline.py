@@ -152,13 +152,15 @@ def plot_input_paths(cfg, output_root):
     Target-discriminator results are optional: the plotter renders them when
     present, but standard-only evaluation must not require their CSV.
     """
-    paths = [
+    # scwd_anchor_contributions.nc is an optional spatial diagnostic, not a hard
+    # input: the plotter reads it via read_scwd_anchor_diagnostics, which returns
+    # [] when it is absent, and simply skips the anchor plot. It is only written
+    # for the canonical fold, so a config that has no canonical write (or a resume
+    # that predates one) must still be allowed to plot the target figures.
+    return [
         output_root / "data" / "lead_time.csv",
         output_root / "data" / "corruption_strength.csv",
     ]
-    if "scwd" in metric_names_from_config(cfg):
-        paths.append(output_root / "data" / "scwd_anchor_contributions.nc")
-    return paths
 
 
 def changed_plot_paths(output_root, before):
