@@ -60,8 +60,8 @@ def series_marker(index):
 
 try:
     from .plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
-    from .histogram_matching_apply import match_standardized
-    from .histogram_checkpoint import validate_binding
+    from .fake_matching_apply import match_standardized
+    from .fake_matching_checkpoint import validate_binding
     from .temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
     from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
@@ -80,8 +80,8 @@ try:
     )
 except ImportError:
     from plot_bundles import configure_plot_bundle_saving_from_cfg, save_figure_bundle
-    from histogram_matching_apply import match_standardized
-    from histogram_checkpoint import validate_binding
+    from fake_matching_apply import match_standardized
+    from fake_matching_checkpoint import validate_binding
     from temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
     from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
@@ -1846,6 +1846,33 @@ def streaming_reference_stats(cfg, ds, variables, time_indices):
     return stats
 
 
+def streaming_pointwise_reference_stats(cfg, ds, variables, time_indices):
+    """Compute ordinary pooled-grid-cell moments for affine fake matching."""
+    chunk_size = max(1, int(baseline_get(cfg, "feature_chunk_size", 32)))
+    totals = {variable: [0.0, 0.0, 0.0] for variable in variables}
+    for start in tqdm(range(0, len(time_indices), chunk_size),
+                      desc="Pointwise reference moments"):
+        chunk = ds.isel(time=time_indices[start:start + chunk_size])
+        for variable in variables:
+            values = np.asarray(
+                chunk[variable].transpose("time", "latitude", "longitude").values,
+                dtype=np.float64,
+            )
+            total, total_sq, count = pointwise_moment_totals(values)
+            totals[variable][0] += total
+            totals[variable][1] += total_sq
+            totals[variable][2] += count
+    result = {}
+    for variable, (total, total_sq, count) in totals.items():
+        if count <= 0.0:
+            raise ValueError(f"No finite pointwise values for {variable}.")
+        mean = total / count
+        variance = max(total_sq / count - mean * mean, 0.0)
+        std = float(np.sqrt(variance))
+        result[variable] = {"mean": float(mean), "std": std if std > 1e-8 else 1.0}
+    return result
+
+
 def global_moment_correction(source_stats, target_stats, variables):
     """Fit one per-variable global affine forecast-to-ERA5 correction."""
     corrections = {}
@@ -1993,11 +2020,11 @@ def evaluate_mmd_global_moment_matching(cfg):
                     print(f"Skipping {label} +{lead_hour}h: missing paired train or test samples.")
                     continue
                 train_forecast = forecast_ds.isel(prediction_timedelta=lead_idx)
-                train_forecast_stats = streaming_reference_stats(
+                train_forecast_stats = streaming_pointwise_reference_stats(
                     cfg, train_forecast, variables, [pair.forecast_index for pair in train_pairs]
                 )
                 train_era5 = real_ds.isel(time=[pair.era5_index for pair in train_pairs])
-                train_era5_stats = streaming_reference_stats(
+                train_era5_stats = streaming_pointwise_reference_stats(
                     cfg, train_era5, variables, list(range(len(train_pairs)))
                 )
                 correction = global_moment_correction(train_forecast_stats, train_era5_stats, variables)

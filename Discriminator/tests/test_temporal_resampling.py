@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 from Discriminator.scripts.analyze_temporal_resamples import (
     compare_null_to_coordinate, reconstruct_scores_from_terms,
 )
+from Discriminator.scripts.temporal_resampling_pipeline import _canonical_first
 from Discriminator.scripts.temporal_resampling import (
     TemporalSchedule, aggregate_draws, fixed_schedules, learned_schedules, schedule_mask, write_csv_gz,
 )
@@ -17,7 +18,7 @@ from Discriminator.scripts.temporal_resampling import (
 def config():
     return OmegaConf.create({
         "temporal_resampling": {
-            "enabled": True, "learned_replicates": 5, "fixed_replicates": 50,
+            "enabled": True, "learned_replicates": 5, "fixed_replicates": 10,
             "learned_test_windows": [[5, 11], [9, 15], [13, 19], [17, 23], [20, 26]],
             "buffer_days": 4, "random_test_start_range": [5, 20], "seed": 7,
             "active_schedule": None,
@@ -43,7 +44,7 @@ class TemporalResamplingTests(unittest.TestCase):
         first = fixed_schedules(config(), ranges)
         second = fixed_schedules(config(), ranges)
         self.assertEqual(first, second)
-        self.assertEqual(len(first), 50)
+        self.assertEqual(len(first), 10)
         self.assertEqual(first[4].test_days, (20, 26))
         for schedule in first[5:]:
             for month, _ in schedule.monthly_test_starts:
@@ -51,6 +52,15 @@ class TemporalResamplingTests(unittest.TestCase):
                 self.assertEqual(upper - lower + 1, 7)
                 self.assertGreaterEqual(lower, 5)
                 self.assertLessEqual(upper, 26)
+
+    def test_canonical_learned_fold_executes_first_without_renaming(self):
+        schedules = learned_schedules(config())
+        ordered = _canonical_first(schedules, "learned_04")
+        self.assertEqual(ordered[0].resample_id, "learned_04")
+        self.assertEqual(
+            [schedule.resample_id for schedule in ordered[1:]],
+            ["learned_00", "learned_01", "learned_02", "learned_03"],
+        )
 
     def test_aggregates_preserve_draw_ids_and_requested_bounds(self):
         rows = [

@@ -243,7 +243,7 @@ means are accumulated without retaining all fields. Pairwise field energy and
 MMD use 256 evenly spaced samples, sliced metrics retain 4,096 total spatial
 coordinates and 64 projections, and multi-field SCWD uses 256 samples. CSV
 outputs record both `n_samples` and `pairwise_n_samples`. Standard curves show
-the mean and 5th–95th percentiles over 50 temporal resamples. Learned curves show
+the mean and 5th–95th percentiles over 10 temporal resamples. Learned curves show
 the mean and full min–max envelope over five independently trained critics. No
 within-test bootstrap is applied. The optional legacy bootstrap-null workflow
 instead resamples disjoint ERA5 partitions to estimate a
@@ -265,27 +265,38 @@ sbatch scripts/submit_nosfno_paper_pipeline.sh
 Every invocation writes to an immutable directory:
 
 ```text
-results/baselines/monthly_valid_time_2020/surface/pipeline_runs/<pipeline-id>/
+/cluster/courses/pmlr/teams/team07/results/baseline_pipeline_runs/<pipeline-id>/
 ├── resolved_config.yaml
 ├── manifest.json
-├── resamples/
-│   ├── learned/<pipeline-id>--learned_XX/
-│   └── fixed/<pipeline-id>--fixed_XXX/
 └── <variable-tag>/
-    ├── data/
+    ├── data/                       (aggregate curves and all resample draws)
+    │   ├── fixed_metric_draws.csv
+    │   ├── fixed_metric_draws.npz
+    │   ├── discriminator_metric_draws.csv
+    │   ├── discriminator_metric_draws.npz
+    │   └── resample_status.csv
+    ├── models/target_discriminators/learned_XX/
+    ├── training/learned_XX/
     └── plots/
         └── paper/
 ```
 
-Every figure is accompanied by an NPZ data bundle and a title-less variant.
-Dashboard mode saves PNG/NPZ by default; paper mode additionally saves PDF,
-uses manuscript-scale typography, and places outputs under `plots/paper/`.
+Every figure is accompanied by an NPZ data bundle and a title-less variant. The
+title-less file is a hard link to the canonical NPZ rather than a duplicate. PNG
+and NPZ are the defaults; PDF is opt-in with `plotting.save_pdf=true` (the paper
+batch wrapper enables it). Paper mode uses manuscript-scale typography and places
+outputs under `plots/paper/`.
 SCWD anchor-response histograms are disabled by default; enable them with
 `plotting.scwd_response_histograms=true`. Anchor maps and mean-response maps are
 still generated.
 
-The parent `data/` directory retains `metric_draws.csv`, the learned and fixed
-draw tables, `split_manifest.csv.gz`, and raw `discriminator_terms.csv.gz`.
+The parent `data/` directory retains `metric_draws.csv`, long-form CSV and NPZ
+arrays for learned/fixed draws, `split_manifest.csv.gz`, and raw
+`discriminator_terms.csv.gz`. One invocation evaluates all resamples in-process; it does not create child
+pipeline runs. All five learned folds retain checkpoints and scalar train/test
+records, but only `pipeline.storage.canonical_diagnostic_fold` (default
+`learned_04`) runs first and renders the large attribution, histogram, and
+representation galleries. Checkpoints are uploaded once per fold as a coherent artifact.
 These are uploaded as W&B evaluation artifacts. Every reverse-KL draw is checked
 against the raw saved training and candidate terms before aggregation. For
 example, count a model's null draws above its mean 12-hour score with:
@@ -300,8 +311,11 @@ Set `temporal_resampling.enabled=false` for the original single-split debugging
 workflow. Evaluation-only temporal runs accept
 `temporal_resampling.input_run_dir=<prior-pipeline-run>` and resolve the matching
 checkpoint separately for every learned fold.
-Evaluation CSV/NetCDF artifacts and PNG/PDF/NPZ plot bundles are uploaded to W&B
-when the corresponding pipeline upload switches are enabled.
+Evaluation CSV/NetCDF artifacts and plot bundles are uploaded to W&B when the
+corresponding pipeline upload switches are enabled. Online W&B working data is
+created in node-local scratch and removed when the pipeline exits; offline mode
+keeps it under the run directory. `wandb_runs.csv` is the persistent local index
+of every dashboard run and its status.
 
 ### Learned-Metric Blind-Spot Search
 
@@ -708,6 +722,20 @@ as versioned artifacts according to `pipeline.wandb`. Omitting a producing stage
 does not implicitly fetch its inputs: provide `pipeline.input_checkpoint_dir`
 and, when applicable, `pipeline.input_histogram_matching_dir` explicitly.
 
+Inspect storage or safely migrate an old run with dry-run-first commands:
+
+```bash
+python scripts/manage_pipeline_storage.py inventory --home "$HOME"
+python scripts/manage_pipeline_storage.py migrate OLD_RUN TEAM_RUNS
+python scripts/manage_pipeline_storage.py migrate OLD_RUN TEAM_RUNS --apply --delete-source
+LEGACY_WANDB=/home/yelberkennou/atmospheric-fields/Discriminator/wandb
+python scripts/manage_pipeline_storage.py clean-wandb --home "$HOME" --legacy-root "$LEGACY_WANDB"
+python scripts/manage_pipeline_storage.py clean-wandb --home "$HOME" --legacy-root "$LEGACY_WANDB" --apply
+```
+
+Migration copies to a partial destination, verifies every file by size and SHA-256,
+and only then activates it. Cleanup refuses to run while W&B processes are active.
+
 The normal complete pipeline, including optional SFNO probes, can be submitted
 with `scripts/submit_baseline_pipeline.sh`. The tested paper-oriented run without
 SFNO is:
@@ -756,6 +784,15 @@ across times and grid points, then applies that frozen pointwise mapping before
 standardization throughout training and evaluation. Run the fitting stage in the
 same invocation, or provide a previously fitted map directory explicitly.
 
+Moment matching is also disabled by default and is mutually exclusive with
+histogram matching. Set `moment_matching.enabled=true` and include
+`fit_moment_matching` to fit an ordinary pooled-grid-cell mean and standard
+deviation for every variable, target, and lead/severity using training data only.
+The frozen affine correction is applied to fake fields in physical units before
+standardization. Evaluation-only runs provide
+`pipeline.input_moment_matching_dir=/absolute/path/to/data/moment_matching`.
+Each temporal resample retains its own fit artifact beneath the parent run.
+
 Target discriminator training writes train/test loss and accuracy, normalized
 held-out logit histograms for every lead or severity, integrated-gradient
 interpretability galleries, and checkpoints. SqueezeNet is the default raw-field
@@ -771,8 +808,12 @@ complete replacement so unchanged samples are not labeled fake. Donor
 permutations are refreshed each training epoch and are independently deranged by
 field for `field_splice`.
 
-The pipeline manifest and resolved configuration live directly under the
-pipeline-run directory. Evaluation-only and plotting-only invocations create
+By default, `pipeline.runs_dir=null` resolves first from
+`PIPELINE_RUNS_DIR`, then to `../results/baseline_pipeline_runs` beside
+`DATA_DIR`; this keeps large runs out of home storage. Each atomic manifest also
+records total bytes and bytes by file suffix. The pipeline warns at 5 GiB and
+stops at 10 GiB by default. The pipeline manifest and resolved configuration
+live directly under the pipeline-run directory. Evaluation-only and plotting-only invocations create
 new output directories, preserving prior runs, while reading checkpoints only
 from the explicitly supplied input directory.
 

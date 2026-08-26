@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import csv
 import gzip
-import json
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
 from omegaconf import OmegaConf
+from tqdm.auto import tqdm
 
 try:
     from .temporal_resampling import (
@@ -45,9 +47,34 @@ def _write_csv(path, rows):
         for key in row:
             if key not in fields:
                 fields.append(key)
-    with open(path, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader(); writer.writerows(rows)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with open(temporary, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader(); writer.writerows(rows)
+            handle.flush(); os.fsync(handle.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _write_draw_npz(path, rows):
+    """Persist the long-form draw table as arrays for direct numerical reuse."""
+    rows = list(rows)
+    fields = sorted({field for row in rows for field in row})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.tmp.npz")
+    try:
+        np.savez_compressed(
+            temporary,
+            **{field: np.asarray([str(row.get(field, "")) for row in rows]) for field in fields},
+        )
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -56,23 +83,24 @@ def _ranges(cfg):
     return [monthly.corruption_time_range, *list(monthly.model_valid_time_ranges)]
 
 
-def _child_id(parent_id, schedule):
-    return f"{parent_id}--{schedule.resample_id}"
-
-
-def _child_run_dir(cfg, schedule):
-    return Path(str(cfg.pipeline.run_dir)) / "resamples" / schedule.family / _child_id(cfg.pipeline.id, schedule)
-
-
-def _child_output_root(cfg, schedule):
-    try:
-        from .plot_standard_metric_baselines import baseline_output_dir, variables_from_config
-    except ImportError:
-        from plot_standard_metric_baselines import baseline_output_dir, variables_from_config
-    child = _child_cfg(cfg, schedule, [])
-    run_dir = _child_run_dir(cfg, schedule)
-    child.baseline.output_dir = str(run_dir)
-    return baseline_output_dir(child, variables_from_config(child))
+def _fold_cfg(cfg, schedule, work_dir, checkpoint_dir=None, training_output_dir=None,
+              render_diagnostics=False, diagnostics_output_dir=None):
+    """Make an in-process fold configuration without a child pipeline run."""
+    fold = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    fold.temporal_resampling.active_schedule = schedule.to_dict()
+    fold.pipeline.resume = False
+    fold.baseline.output_dir = str(work_dir)
+    target_root = (Path(training_output_dir) if training_output_dir is not None
+                   else Path(work_dir) / "target_discriminator")
+    fold.target_discriminator.output_dir = str(target_root)
+    fold.target_discriminator.render_diagnostics = bool(render_diagnostics)
+    fold.target_discriminator.diagnostics_output_dir = str(diagnostics_output_dir or target_root)
+    fold.pipeline.output_root = str(target_root)
+    if checkpoint_dir is not None:
+        fold.target_discriminator.checkpoint_dir = str(checkpoint_dir)
+        if fold.baseline.get("discriminator") is not None:
+            fold.baseline.discriminator.checkpoint_dir = str(checkpoint_dir)
+    return fold
 
 
 def _prior_checkpoint(cfg, schedule):
@@ -81,52 +109,22 @@ def _prior_checkpoint(cfg, schedule):
         return None
     root = Path(str(configured))
     if root.name == "target_discriminators":
-        return root
-    candidates = sorted(root.glob(
-        f"resamples/learned/*--{schedule.resample_id}/*/models/target_discriminators"
-    ))
-    if len(candidates) != 1:
-        raise FileNotFoundError(
-            f"Expected one checkpoint directory for {schedule.resample_id} under {root}; found {candidates}"
-        )
-    return candidates[0]
+        return root / schedule.resample_id if (root / schedule.resample_id).is_dir() else root
+    candidates = [
+        root / "models" / "target_discriminators" / schedule.resample_id,
+        root / _parent_output_root(cfg).name / "models" / "target_discriminators" / schedule.resample_id,
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"Expected checkpoint directory for {schedule.resample_id}; checked {candidates}"
+    )
 
 
-def _child_cfg(cfg, schedule, stages, checkpoint=None, resume=False):
-    child = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    child.temporal_resampling.active_schedule = schedule.to_dict()
-    child.pipeline.id = _child_id(str(cfg.pipeline.id), schedule)
-    child.pipeline.runs_dir = str(Path(str(cfg.pipeline.run_dir)) / "resamples" / schedule.family)
-    child.pipeline.stages = list(stages)
-    child.pipeline.resume = bool(resume)
-    child.pipeline.input_checkpoint_dir = None if checkpoint is None else str(checkpoint)
-    return child
-
-
-def _execute_children(cfg, schedules, stages, *, require_checkpoints=False):
-    try:
-        from .run_baseline_pipeline import execute_pipeline
-    except ImportError:
-        from run_baseline_pipeline import execute_pipeline
-    manifests = []
-    for schedule in schedules:
-        checkpoint = None
-        resume = bool(cfg.pipeline.get("resume", False))
-        run_dir = _child_run_dir(cfg, schedule)
-        if require_checkpoints:
-            local = next(iter(sorted(run_dir.glob("*/models/target_discriminators"))), None)
-            checkpoint = local if local is not None else _prior_checkpoint(cfg, schedule)
-            if checkpoint is None:
-                raise FileNotFoundError(f"No discriminator checkpoints found for {schedule.resample_id}")
-            resume = run_dir.exists()
-        child_stages = list(stages)
-        if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
-            if "fit_histogram_matching" not in child_stages:
-                child_stages.insert(0, "fit_histogram_matching")
-        child = _child_cfg(cfg, schedule, child_stages, checkpoint=checkpoint, resume=resume)
-        manifests.append(execute_pipeline(child))
-    return manifests
-
+def _local_checkpoint(cfg, schedule):
+    candidate = _parent_output_root(cfg) / "models" / "target_discriminators" / schedule.resample_id
+    return candidate if candidate.is_dir() else _prior_checkpoint(cfg, schedule)
 
 def _validate_counts(rows, group_fields, count_fields):
     grouped = {}
@@ -147,17 +145,15 @@ def _metric_names(cfg):
     return metric_names_from_config(cfg)
 
 
-def aggregate_standard(cfg, schedules):
+def aggregate_standard(cfg, schedules, fold_data):
+    """Aggregate persisted per-fold files into the parent data contract."""
     metric_names = _metric_names(cfg)
-    root = Path(str(cfg.pipeline.run_dir))
     output_root = _parent_output_root(cfg)
-    draw_rows = []
-    outputs = []
+    draw_rows, outputs = [], []
     for experiment, keys in STANDARD_KEYS.items():
-        source_name = f"{experiment}.csv"
         rows = []
         for schedule in schedules:
-            path = _child_output_root(cfg, schedule) / "data" / source_name
+            path = fold_data[schedule.resample_id] / f"{experiment}.csv"
             for source in _read_csv(path):
                 source["resample_id"] = schedule.resample_id
                 rows.append(source)
@@ -171,49 +167,53 @@ def aggregate_standard(cfg, schedules):
                     })
         _validate_counts(rows, keys, ("n_samples", "pairwise_n_samples"))
         aggregate = aggregate_draws(rows, metric_names, keys, "p05_p95")
-        # Non-metric metadata are constant by construction; retain representative values.
-        by_key = {tuple(row.get(key) for key in keys): row for row in rows}
+        representatives = {tuple(row.get(key) for key in keys): row for row in rows}
         for row in aggregate:
-            representative = by_key[tuple(row.get(key) for key in keys)]
+            representative = representatives[tuple(row.get(key) for key in keys)]
             for field in ("n_samples", "pairwise_n_samples", "n_pairs", "initialization_start",
                           "initialization_end", "valid_start", "valid_end"):
                 if field in representative:
                     row[field] = representative[field]
-        outputs.append(_write_csv(output_root / "data" / source_name, aggregate))
+        outputs.append(_write_csv(output_root / "data" / f"{experiment}.csv", aggregate))
     outputs.append(_write_csv(output_root / "data" / "fixed_metric_draws.csv", draw_rows))
-    split_path = aggregate_split_manifests(cfg, schedules, "fixed")
+    outputs.append(_write_draw_npz(output_root / "data" / "fixed_metric_draws.npz", draw_rows))
+    split_path = aggregate_split_manifests(cfg, schedules, "fixed", fold_data)
     if split_path is not None:
         outputs.append(split_path)
     canonical = schedules[min(4, len(schedules) - 1)]
-    canonical_data = _child_output_root(cfg, canonical) / "data"
+    canonical_data = fold_data[canonical.resample_id]
     for name in ("scwd_anchor_contributions.nc", "global_mean_wasserstein_distributions.nc",
                  "corruption_disturbances.nc"):
         source = canonical_data / name
         if source.is_file():
-            target = output_root / "data" / name; target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target); outputs.append(target)
+            target = output_root / "data" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            outputs.append(target)
     return outputs
 
 
-def aggregate_discriminator(cfg, schedules):
+def aggregate_discriminator(cfg, schedules, fold_data):
     output_root = _parent_output_root(cfg)
     rows, terms = [], []
     for schedule in schedules:
-        data = _child_output_root(cfg, schedule) / "data"
+        data = fold_data[schedule.resample_id]
         for row in _read_csv(data / "discriminator_reverse_kl.csv"):
-            row["resample_id"] = schedule.resample_id; rows.append(row)
+            row["resample_id"] = schedule.resample_id
+            rows.append(row)
         terms_path = data / "discriminator_terms.csv.gz"
         if terms_path.is_file():
             with gzip.open(terms_path, "rt", newline="") as handle:
                 for row in csv.DictReader(handle):
-                    row["resample_id"] = schedule.resample_id; terms.append(row)
+                    row["resample_id"] = schedule.resample_id
+                    terms.append(row)
     _validate_counts(rows, DISCRIMINATOR_KEYS, ("n_samples", "ep_n_samples"))
     try:
         from .analyze_temporal_resamples import reconstruct_scores_from_terms
     except ImportError:
         from analyze_temporal_resamples import reconstruct_scores_from_terms
-    temporary_terms = write_csv_gz(output_root / "data" / "discriminator_terms.csv.gz", terms)
-    reconstructed = reconstruct_scores_from_terms(temporary_terms)
+    terms_path = write_csv_gz(output_root / "data" / "discriminator_terms.csv.gz", terms)
+    reconstructed = reconstruct_scores_from_terms(terms_path)
     for row in rows:
         key = (row["resample_id"], row["architecture"], row["kind"], row["target"],
                row["source"], float(row["x"]))
@@ -229,11 +229,10 @@ def aggregate_discriminator(cfg, schedules):
         row["checkpoint_paths"] = ",".join(item.get("checkpoint_path", "") for item in matching)
         row["checkpoint_sha256s"] = ",".join(item.get("checkpoint_sha256", "") for item in matching)
     score_path = _write_csv(output_root / "data" / "discriminator_reverse_kl.csv", aggregate)
-    terms_path = temporary_terms
     draw_path = _write_csv(output_root / "data" / "discriminator_metric_draws.csv", rows)
-    split_path = aggregate_split_manifests(cfg, schedules, "learned")
-    return [score_path, terms_path, draw_path] + ([split_path] if split_path is not None else [])
-
+    draw_npz_path = _write_draw_npz(output_root / "data" / "discriminator_metric_draws.npz", rows)
+    split_path = aggregate_split_manifests(cfg, schedules, "learned", fold_data)
+    return [score_path, terms_path, draw_path, draw_npz_path] + ([split_path] if split_path is not None else [])
 
 def _parent_output_root(cfg):
     try:
@@ -243,11 +242,11 @@ def _parent_output_root(cfg):
     return baseline_output_dir(cfg, variables_from_config(cfg))
 
 
-def aggregate_split_manifests(cfg, schedules, family):
+def aggregate_split_manifests(cfg, schedules, family, fold_data):
     output_root = _parent_output_root(cfg)
     rows = []
     for schedule in schedules:
-        path = _child_output_root(cfg, schedule) / "data" / "split_manifest.csv.gz"
+        path = fold_data[schedule.resample_id] / "split_manifest.csv.gz"
         if not path.is_file():
             continue
         with gzip.open(path, "rt", newline="") as handle:
@@ -276,34 +275,323 @@ def aggregate_all_draws(cfg):
     return draw_path
 
 
+def _fit_fold_fake_matching(cfg):
+    paths = []
+    if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
+        try:
+            from .fit_histogram_matching import fit_histogram_matching_maps
+        except ImportError:
+            from fit_histogram_matching import fit_histogram_matching_maps
+        paths.extend(fit_histogram_matching_maps(cfg))
+    if bool((cfg.get("moment_matching", {}) or {}).get("enabled", False)):
+        try:
+            from .fit_moment_matching import fit_moment_matching_maps
+        except ImportError:
+            from fit_moment_matching import fit_moment_matching_maps
+        paths.extend(fit_moment_matching_maps(cfg))
+    return paths
+
+
+def _publish_canonical_histogram_maps(cfg, schedule):
+    """Expose the canonical learned-fold maps at the parent plot-data path."""
+    if not bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
+        return None
+    root = _parent_output_root(cfg)
+    source = root / "training" / schedule.resample_id / "data" / "preprocessing" / "histogram_matching"
+    if not (source / "maps.npz").is_file() or not (source / "manifest.json").is_file():
+        return None
+    target = root / "data" / "preprocessing" / "histogram_matching"
+    shutil.copytree(source, target, dirs_exist_ok=True)
+    return target
+
+
+def _publish_canonical_moment_maps(cfg, schedule):
+    """Expose the canonical learned-fold moment maps at the parent data path."""
+    if not bool((cfg.get("moment_matching", {}) or {}).get("enabled", False)):
+        return None
+    root = _parent_output_root(cfg)
+    source = root / "training" / schedule.resample_id / "data" / "preprocessing" / "moment_matching"
+    if not (source / "moments.npz").is_file() or not (source / "manifest.json").is_file():
+        return None
+    target = root / "data" / "preprocessing" / "moment_matching"
+    shutil.copytree(source, target, dirs_exist_ok=True)
+    return target
+
+
+def _archive_fold_matching(cfg, fold, schedule, family):
+    """Retain small preprocessing artifacts that would otherwise live in scratch."""
+    archived = []
+    for mode, archive_name in (("histogram_matching", "maps.npz"),
+                               ("moment_matching", "moments.npz")):
+        if not bool((fold.get(mode, {}) or {}).get("enabled", False)):
+            continue
+        source = Path(str(fold.pipeline.output_root)) / "data" / "preprocessing" / mode
+        if not (source / archive_name).is_file():
+            continue
+        target = (_parent_output_root(cfg) / "data" / "preprocessing" / mode / "resamples" /
+                  family / schedule.resample_id)
+        shutil.copytree(source, target, dirs_exist_ok=True)
+        archived.extend(path for path in target.iterdir() if path.is_file())
+    return archived
+
+
+def _fold_status_path(cfg):
+    return _parent_output_root(cfg) / "data" / "resample_status.csv"
+
+
+def _write_fold_status(cfg, rows):
+    """Update one stage's fold status without discarding other stage records."""
+    path = _fold_status_path(cfg)
+    previous = _read_csv(path) if path.is_file() else []
+    stages = {row.get("stage") for row in rows}
+    return _write_csv(path, [row for row in previous if row.get("stage") not in stages] + list(rows))
+
+
+def _upload_fold_checkpoint_bundle(cfg, fold, tracker, schedule, checkpoint_dir, training_root):
+    """Upload one coherent checkpoint artifact per fold, not one artifact per target."""
+    if not bool((cfg.pipeline.get("wandb", {}) or {}).get("upload_checkpoints", True)):
+        return None
+    paths = sorted(path for path in Path(checkpoint_dir).rglob("*") if path.is_file())
+    paths.extend(path for path in (
+        Path(training_root) / "data" / "target_train_test_metrics.csv",
+        Path(training_root) / "resolved_config.yaml",
+    ) if path.is_file())
+    if not paths:
+        return None
+    metadata = {"temporal_resample_id": schedule.resample_id, "checkpoint_count": len(paths)}
+    with tracker.run(
+        f"train/{schedule.resample_id}/checkpoint-bundle", "checkpoint-bundle", fold,
+        metadata=metadata, tags=["checkpoint-bundle", schedule.resample_id],
+    ) as run:
+        tracker.log_csv_table(
+            run, "training/train_test_metrics",
+            Path(training_root) / "data" / "target_train_test_metrics.csv",
+        )
+        return tracker.log_artifact(
+            run, f"target-discriminators-{schedule.resample_id}", "model", paths,
+            metadata=metadata,
+        )
+
+
+def _check_parent_storage_budget(cfg):
+    try:
+        from .run_baseline_pipeline import check_storage_budget
+    except ImportError:
+        from run_baseline_pipeline import check_storage_budget
+    run_dir = cfg.pipeline.get("run_dir")
+    return None if run_dir is None else check_storage_budget(cfg, Path(str(run_dir)))
+
+
+def _canonical_first(schedules, canonical):
+    """Run the diagnostic fold first without changing identifiers or aggregation order."""
+    return sorted(schedules, key=lambda schedule: schedule.resample_id != canonical)
+
+
+def _train_learned_folds(cfg, schedules, tracker):
+    try:
+        from .train_target_discriminator_baselines import train_target_discriminator_baselines
+    except ImportError:
+        from train_target_discriminator_baselines import train_target_discriminator_baselines
+    root = _parent_output_root(cfg)
+    previous = _read_csv(_fold_status_path(cfg)) if _fold_status_path(cfg).is_file() else []
+    status = [row for row in previous if row.get("stage") == "train_discriminators"]
+    records = []
+    requested_canonical = str((cfg.pipeline.get("storage", {}) or {}).get(
+        "canonical_diagnostic_fold", "learned_04"
+    ))
+    schedule_ids = {schedule.resample_id for schedule in schedules}
+    canonical = requested_canonical if requested_canonical in schedule_ids else schedules[-1].resample_id
+    execution_order = _canonical_first(schedules, canonical)
+    for schedule in tqdm(execution_order, desc="Training learned temporal resamples"):
+        checkpoint_dir = root / "models" / "target_discriminators" / schedule.resample_id
+        training_root = root / "training" / schedule.resample_id
+        metrics_path = training_root / "data" / "target_train_test_metrics.csv"
+        completed = next((row for row in status
+                          if row.get("resample_id") == schedule.resample_id
+                          and row.get("status") == "completed"), None)
+        if bool(cfg.pipeline.get("resume", False)) and completed and metrics_path.is_file():
+            fold_records = _read_csv(metrics_path)
+            if fold_records and all(Path(row.get("path", "")).is_file() for row in fold_records):
+                for record in fold_records:
+                    record["resample_id"] = schedule.resample_id
+                    records.append(record)
+                print(f"Skipping completed learned fold {schedule.resample_id}")
+                continue
+        status = [row for row in status if row.get("resample_id") != schedule.resample_id]
+        render = schedule.resample_id == canonical
+        fold = _fold_cfg(
+            cfg, schedule, training_root, checkpoint_dir=checkpoint_dir,
+            training_output_dir=training_root, render_diagnostics=render,
+            diagnostics_output_dir=root,
+        )
+        # Scalar training runs remain individually inspectable, while their heavy
+        # files are uploaded once in a fold-level artifact below.
+        OmegaConf.update(fold, "pipeline.wandb.upload_checkpoints", False, merge=False)
+        _fit_fold_fake_matching(fold)
+        try:
+            fold_records = train_target_discriminator_baselines(fold, tracker=tracker)
+        except BaseException as error:
+            status.append({"stage": "train_discriminators", "resample_id": schedule.resample_id,
+                           "status": "failed", "error": f"{type(error).__name__}: {error}"})
+            _write_fold_status(cfg, status)
+            raise
+        for record in fold_records:
+            record["resample_id"] = schedule.resample_id
+            records.append(record)
+        _upload_fold_checkpoint_bundle(cfg, fold, tracker, schedule, checkpoint_dir, training_root)
+        status.append({"stage": "train_discriminators", "resample_id": schedule.resample_id,
+                       "status": "completed", "checkpoint_dir": str(checkpoint_dir),
+                       "diagnostics_rendered": render})
+        _write_fold_status(cfg, status)
+        _check_parent_storage_budget(cfg)
+    _write_csv(root / "data" / "learned_target_train_test_draws.csv", records)
+    return records, status
+
+
+def _cache_fold_data(source, target, names):
+    target.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        path = Path(source) / name
+        if path.is_file():
+            shutil.copy2(path, target / name)
+    return target
+
+
+def _fold_cache_complete(path, names):
+    return all((Path(path) / name).is_file() for name in names)
+
+
+def _evaluate_standard_folds(cfg, schedules):
+    try:
+        from .plot_standard_metric_baselines import evaluate_standard_metrics, baseline_output_dir, variables_from_config
+    except ImportError:
+        from plot_standard_metric_baselines import evaluate_standard_metrics, baseline_output_dir, variables_from_config
+    scratch_dir = cfg.baseline.get("scratch_dir")
+    with tempfile.TemporaryDirectory(prefix="temporal-resampling-standard-",
+                                     dir=None if scratch_dir is None else str(scratch_dir)) as directory:
+        scratch = Path(directory)
+        cache_root = _parent_output_root(cfg) / "data" / "resume_cache" / "standard_metrics"
+        previous = _read_csv(_fold_status_path(cfg)) if _fold_status_path(cfg).is_file() else []
+        fold_data = {}
+        status = [row for row in previous if row.get("stage") == "evaluate_standard_metrics"]
+        matching_paths = []
+        canonical_id = schedules[min(4, len(schedules) - 1)].resample_id
+        required = ("lead_time.csv", "corruption_strength.csv", "split_manifest.csv.gz")
+        ancillary = ("scwd_anchor_contributions.nc", "global_mean_wasserstein_distributions.nc",
+                     "corruption_disturbances.nc")
+        for schedule in tqdm(schedules, desc="Evaluating standard-metric temporal resamples"):
+            cached = cache_root / schedule.resample_id
+            completed = next((row for row in status if row.get("resample_id") == schedule.resample_id
+                              and row.get("status") == "completed"), None)
+            if (bool(cfg.pipeline.get("resume", False)) and completed
+                    and _fold_cache_complete(cached, required)):
+                fold_data[schedule.resample_id] = cached
+                print(f"Skipping completed standard-metric fold {schedule.resample_id}")
+                continue
+            status = [row for row in status if row.get("resample_id") != schedule.resample_id]
+            fold = _fold_cfg(cfg, schedule, scratch / schedule.resample_id)
+            _fit_fold_fake_matching(fold)
+            matching_paths.extend(_archive_fold_matching(cfg, fold, schedule, "fixed"))
+            try:
+                evaluate_standard_metrics(fold)
+            except BaseException as error:
+                status.append({"stage": "evaluate_standard_metrics", "resample_id": schedule.resample_id,
+                               "status": "failed", "error": f"{type(error).__name__}: {error}"})
+                _write_fold_status(cfg, status)
+                raise
+            source_data = baseline_output_dir(fold, variables_from_config(fold)) / "data"
+            names = required + (ancillary if schedule.resample_id == canonical_id else ())
+            fold_data[schedule.resample_id] = _cache_fold_data(source_data, cached, names)
+            status.append({"stage": "evaluate_standard_metrics", "resample_id": schedule.resample_id,
+                           "status": "completed"})
+            _write_fold_status(cfg, status)
+            _check_parent_storage_budget(cfg)
+        outputs = aggregate_standard(cfg, schedules, fold_data) + matching_paths
+        shutil.rmtree(cache_root, ignore_errors=True)
+        return outputs, status
+
+
+def _evaluate_discriminator_folds(cfg, schedules):
+    try:
+        from .plot_standard_metric_baselines import evaluate_discriminator_metrics, baseline_output_dir, variables_from_config
+    except ImportError:
+        from plot_standard_metric_baselines import evaluate_discriminator_metrics, baseline_output_dir, variables_from_config
+    scratch_dir = cfg.baseline.get("scratch_dir")
+    with tempfile.TemporaryDirectory(prefix="temporal-resampling-discriminator-",
+                                     dir=None if scratch_dir is None else str(scratch_dir)) as directory:
+        scratch = Path(directory)
+        cache_root = _parent_output_root(cfg) / "data" / "resume_cache" / "discriminator_metrics"
+        previous = _read_csv(_fold_status_path(cfg)) if _fold_status_path(cfg).is_file() else []
+        fold_data = {}
+        status = [row for row in previous if row.get("stage") == "evaluate_discriminator_metrics"]
+        matching_paths = []
+        required = ("discriminator_reverse_kl.csv", "discriminator_terms.csv.gz", "split_manifest.csv.gz")
+        for schedule in tqdm(schedules, desc="Evaluating discriminator temporal resamples"):
+            cached = cache_root / schedule.resample_id
+            completed = next((row for row in status if row.get("resample_id") == schedule.resample_id
+                              and row.get("status") == "completed"), None)
+            if (bool(cfg.pipeline.get("resume", False)) and completed
+                    and _fold_cache_complete(cached, required)):
+                fold_data[schedule.resample_id] = cached
+                print(f"Skipping completed discriminator-metric fold {schedule.resample_id}")
+                continue
+            status = [row for row in status if row.get("resample_id") != schedule.resample_id]
+            checkpoint = _local_checkpoint(cfg, schedule)
+            if checkpoint is None:
+                raise FileNotFoundError(f"No discriminator checkpoints found for {schedule.resample_id}")
+            fold = _fold_cfg(cfg, schedule, scratch / schedule.resample_id, checkpoint_dir=checkpoint)
+            _fit_fold_fake_matching(fold)
+            matching_paths.extend(_archive_fold_matching(cfg, fold, schedule, "learned"))
+            try:
+                evaluate_discriminator_metrics(fold)
+            except BaseException as error:
+                status.append({"stage": "evaluate_discriminator_metrics", "resample_id": schedule.resample_id,
+                               "status": "failed", "error": f"{type(error).__name__}: {error}"})
+                _write_fold_status(cfg, status)
+                raise
+            source_data = baseline_output_dir(fold, variables_from_config(fold)) / "data"
+            fold_data[schedule.resample_id] = _cache_fold_data(source_data, cached, required)
+            status.append({"stage": "evaluate_discriminator_metrics", "resample_id": schedule.resample_id,
+                           "status": "completed", "checkpoint_dir": str(checkpoint)})
+            _write_fold_status(cfg, status)
+            _check_parent_storage_budget(cfg)
+        outputs = aggregate_discriminator(cfg, schedules, fold_data) + matching_paths
+        shutil.rmtree(cache_root, ignore_errors=True)
+        return outputs, status
+
+
 def run_resampled_stage(stage, cfg, tracker, output_root, resolved_path):
-    """Run one parent stage over its required schedules."""
+    """Run all temporal schedules in the parent pipeline and aggregate in place."""
     learned = learned_schedules(cfg)
     fixed = fixed_schedules(cfg, _ranges(cfg))
     if stage == "plot":
         canonical = learned[min(4, len(learned) - 1)]
-        checkpoint = next(iter(sorted(_child_run_dir(cfg, canonical).glob("*/models/target_discriminators"))), None)
-        if checkpoint is None:
-            checkpoint = _prior_checkpoint(cfg, canonical)
+        checkpoint = _local_checkpoint(cfg, canonical)
         if checkpoint is not None:
             OmegaConf.update(cfg, "target_discriminator.checkpoint_dir", str(checkpoint), merge=False)
             if cfg.baseline.get("discriminator") is not None:
                 OmegaConf.update(cfg, "baseline.discriminator.checkpoint_dir", str(checkpoint), merge=False)
-        if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
-            source_maps = _child_run_dir(cfg, canonical) / "data" / "histogram_matching"
-            target_maps = Path(str(cfg.baseline.output_dir)) / "data" / "histogram_matching"
-            if source_maps.is_dir():
-                shutil.copytree(source_maps, target_maps, dirs_exist_ok=True)
+        maps = _publish_canonical_histogram_maps(cfg, canonical)
+        if maps is not None:
+            OmegaConf.update(cfg, "pipeline.input_histogram_matching_dir", str(maps), force_add=True)
+        moment_maps = _publish_canonical_moment_maps(cfg, canonical)
+        if moment_maps is not None:
+            OmegaConf.update(cfg, "pipeline.input_moment_matching_dir", str(moment_maps), force_add=True)
         return None
-    if stage == "fit_histogram_matching":
-        # Fitting is performed inside each consuming child so maps are train-fold specific.
+    if stage in {"fit_histogram_matching", "fit_moment_matching"}:
         return [], []
     if stage == "train_discriminators":
-        manifests = _execute_children(cfg, learned, ["train_discriminators"])
-        return [m["manifest_path"] for m in manifests], manifests
+        records, status = _train_learned_folds(cfg, learned, tracker)
+        paths = [Path(record["path"]) for record in records if record.get("path")]
+        paths.extend([_parent_output_root(cfg) / "data" / "learned_target_train_test_draws.csv",
+                      _fold_status_path(cfg)])
+        paths.extend((_parent_output_root(cfg) / "training").glob(
+            "learned_*/data/preprocessing/moment_matching/*"
+        ))
+        return [str(path) for path in paths if path.is_file()], status
     if stage == "evaluate_standard_metrics":
-        manifests = _execute_children(cfg, fixed, ["evaluate_standard_metrics"])
-        paths = aggregate_standard(cfg, fixed); draw_path = aggregate_all_draws(cfg)
+        paths, status = _evaluate_standard_folds(cfg, fixed)
+        draw_path = aggregate_all_draws(cfg)
         if draw_path is not None:
             paths.append(draw_path)
         with tracker.run("evaluation/standard-metrics-aggregate", "temporal-resampling-aggregate", cfg,
@@ -313,12 +601,10 @@ def run_resampled_stage(stage, cfg, tracker, output_root, resolved_path):
             if bool(cfg.pipeline.wandb.get("upload_evaluation_data", True)):
                 tracker.log_artifact(run, "temporal-standard-metric-samples", "evaluation",
                                      [*paths, resolved_path], metadata={"pipeline_id": tracker.group})
-        return [str(path) for path in paths], manifests
+        return [str(path) for path in paths], status
     if stage == "evaluate_discriminator_metrics":
-        manifests = _execute_children(
-            cfg, learned, ["evaluate_discriminator_metrics"], require_checkpoints=True,
-        )
-        paths = aggregate_discriminator(cfg, learned); draw_path = aggregate_all_draws(cfg)
+        paths, status = _evaluate_discriminator_folds(cfg, learned)
+        draw_path = aggregate_all_draws(cfg)
         if draw_path is not None:
             paths.append(draw_path)
         with tracker.run("evaluation/discriminator-metrics-aggregate", "temporal-resampling-aggregate", cfg,
@@ -328,9 +614,8 @@ def run_resampled_stage(stage, cfg, tracker, output_root, resolved_path):
             if bool(cfg.pipeline.wandb.get("upload_evaluation_data", True)):
                 tracker.log_artifact(run, "temporal-discriminator-metric-samples", "evaluation",
                                      [*paths, resolved_path], metadata={"pipeline_id": tracker.group})
-        return [str(path) for path in paths], manifests
+        return [str(path) for path in paths], status
     return None
-
 
 def finalize_resampling_manifest(cfg):
     output_root = _parent_output_root(cfg)

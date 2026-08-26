@@ -2,6 +2,8 @@
 
 import fnmatch
 import json
+import os
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -30,7 +32,7 @@ def configure_plot_bundle_saving(*, save_pdf=False, profile="dashboard",
     if paper_width_kind not in {"full", "half"}:
         raise ValueError("paper_width_kind must be 'full' or 'half'.")
     _PLOT_PROFILE = profile
-    _DEFAULT_SAVE_PDF = bool(save_pdf) or profile == "paper"
+    _DEFAULT_SAVE_PDF = bool(save_pdf)
     _PAPER_WIDTH_INCHES = float(paper_width_inches)
     _PAPER_WIDTH_KIND = str(paper_width_kind)
     _PAPER_COLUMN_GAP_INCHES = float(paper_column_gap_inches)
@@ -259,33 +261,77 @@ def rasterize_field_artists(figure):
     return count
 
 
+def _atomic_figure_save(figure, path, **kwargs):
+    path = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.", suffix=f".tmp{path.suffix}", dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        figure.savefig(temporary, **kwargs)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_json(path, payload):
+    path = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush(); os.fsync(handle.fileno())
+        Path(temporary_name).replace(path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
 def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, dpi,
-                            bbox_inches, capture_artists=True, save_pdf=False):
+                            bbox_inches, capture_artists=True, save_pdf=False, shared_npz=None):
     png_path, pdf_path, npz_path = plot_bundle_paths(png_path)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs = {"dpi": int(dpi)}
     if bbox_inches is not None:
         save_kwargs["bbox_inches"] = bbox_inches
-    figure.savefig(png_path, **save_kwargs)
+    _atomic_figure_save(figure, png_path, **save_kwargs)
     if save_pdf:
         rasterize_field_artists(figure)
-        figure.savefig(pdf_path, dpi=int(dpi), bbox_inches=bbox_inches)
+        _atomic_figure_save(figure, pdf_path, dpi=int(dpi), bbox_inches=bbox_inches)
 
-    arrays, axes = _artist_arrays(figure) if capture_artists else ({}, [])
-    for key, value in (payload or {}).items():
-        arrays[f"input_{key}"] = _safe_array(value)
-    bundle_metadata = {
-        "schema_version": 2,
-        "figure_size_inches": list(map(float, figure.get_size_inches())),
-        "plot_type": str(plot_type),
-        "png": png_path.name,
-        "pdf": pdf_path.name if save_pdf else None,
-        "npz": npz_path.name,
-        "axes": axes,
-        **(metadata or {}),
-    }
-    arrays["metadata_json"] = np.asarray(json.dumps(bundle_metadata, sort_keys=True))
-    np.savez_compressed(npz_path, **arrays)
+    if shared_npz is None:
+        arrays, axes = _artist_arrays(figure) if capture_artists else ({}, [])
+        for key, value in (payload or {}).items():
+            arrays[f"input_{key}"] = _safe_array(value)
+        bundle_metadata = {
+            "schema_version": 2,
+            "figure_size_inches": list(map(float, figure.get_size_inches())),
+            "plot_type": str(plot_type),
+            "png": png_path.name,
+            "pdf": pdf_path.name if save_pdf else None,
+            "npz": npz_path.name,
+            "axes": axes,
+            **(metadata or {}),
+        }
+        arrays["metadata_json"] = np.asarray(json.dumps(bundle_metadata, sort_keys=True))
+        temporary_npz = npz_path.with_name(f".{npz_path.stem}.tmp.npz")
+        try:
+            np.savez_compressed(temporary_npz, **arrays)
+            temporary_npz.replace(npz_path)
+        except BaseException:
+            temporary_npz.unlink(missing_ok=True)
+            raise
+    else:
+        shared_npz = Path(shared_npz)
+        npz_path.unlink(missing_ok=True)
+        try:
+            npz_path.hardlink_to(shared_npz)
+        except OSError:
+            npz_path.symlink_to(shared_npz.name)
 
     manifest_path = png_path.parent / "plot_data_manifest.json"
     manifest = {"schema_version": 2, "plots": {}}
@@ -297,8 +343,10 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
     manifest.setdefault("plots", {})[png_path.stem] = {
         "plot_type": str(plot_type), "png": png_path.name,
         "pdf": pdf_path.name if save_pdf else None, "npz": npz_path.name,
+        "shared_npz": None if shared_npz is None else Path(shared_npz).name,
+        **({"titleless": True} if shared_npz is not None else {}),
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    _atomic_json(manifest_path, manifest)
     return [png_path, *([pdf_path] if save_pdf else []), npz_path]
 
 
@@ -321,6 +369,7 @@ def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=No
         paths.extend(_save_one_figure_bundle(
             figure, titleless_plot_path(png_path), plot_type=plot_type,
             payload=payload, metadata={**(metadata or {}), "titleless": True},
-            dpi=dpi, bbox_inches=bbox_inches, capture_artists=capture_artists, save_pdf=save_pdf,
+            dpi=dpi, bbox_inches=bbox_inches, capture_artists=False, save_pdf=save_pdf,
+            shared_npz=plot_bundle_paths(png_path)[2],
         ))
     return paths

@@ -23,10 +23,11 @@ source "${CONDA_SH}"
 conda activate "${CONDA_ENV_NAME}"
 export PYTHONUNBUFFERED=1
 export DATA_DIR="${DATA_DIR:-/cluster/courses/pmlr/teams/team07/data}"
+export PIPELINE_RUNS_DIR="${PIPELINE_RUNS_DIR:-$(dirname "${DATA_DIR}")/results/baseline_pipeline_runs}"
 cd "${REPO_DIR}"
 python scripts/run_baseline_pipeline.py \
   "pipeline.id=nosfno-paper-${SLURM_JOB_ID:-local}" \
-  "pipeline.stages=[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]" \
+  "pipeline.stages=[fit_histogram_matching,fit_moment_matching,train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]" \
   target_discriminator.sfno.enabled=false \
   baseline.discriminator.sfno.enabled=false \
   target_discriminator.train_attention_squeezenet=false \

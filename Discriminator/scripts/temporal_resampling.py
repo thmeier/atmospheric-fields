@@ -6,6 +6,7 @@ import csv
 import gzip
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -86,7 +87,7 @@ def learned_schedules(cfg) -> list[TemporalSchedule]:
 
 def fixed_schedules(cfg, ranges) -> list[TemporalSchedule]:
     learned = learned_schedules(cfg)
-    count = int(settings(cfg).get("fixed_replicates", 50))
+    count = int(settings(cfg).get("fixed_replicates", 10))
     if count < len(learned):
         raise ValueError("fixed_replicates cannot be smaller than learned_replicates")
     schedules = [TemporalSchedule(f"fixed_{s.ordinal:03d}", "fixed", s.ordinal,
@@ -134,9 +135,15 @@ def schedule_mask(values, schedule: TemporalSchedule, split: str, ranges) -> np.
 def write_csv_gz(path: Path, rows, fieldnames=None):
     rows = list(rows); path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(fieldnames or (rows[0].keys() if rows else []))
-    with gzip.open(path, "wt", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader(); writer.writerows(rows)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with gzip.open(temporary, "wt", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader(); writer.writerows(rows)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -184,7 +191,15 @@ def write_manifest(root: Path, payload: dict, paths):
                 "bytes": path.stat().st_size, "sha256": file_sha256(path),
             }
     target = root / "manifest.json"
-    target.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        with open(temporary, "w") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.flush(); os.fsync(handle.fileno())
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     return target
 
 
@@ -294,5 +309,14 @@ def write_split_membership(cfg, dataset, output_root: Path):
         "era5_path": str(cfg.real_nc_file), "era5_time_coordinate_sha256": coordinate_hash,
         "rows": len(rows),
     }
-    (path.parent / "split_manifest.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    metadata_path = path.parent / "split_manifest.json"
+    temporary = metadata_path.with_name(f".{metadata_path.name}.tmp")
+    try:
+        with open(temporary, "w") as handle:
+            json.dump(metadata, handle, indent=2, sort_keys=True)
+            handle.flush(); os.fsync(handle.fileno())
+        temporary.replace(metadata_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     return path

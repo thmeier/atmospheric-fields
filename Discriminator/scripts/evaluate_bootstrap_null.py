@@ -29,9 +29,11 @@ from tqdm import tqdm
 try:
     from . import plot_standard_metric_baselines as P
     from .monthly_split import datetime_mask, time_ranges
+    from .fake_matching_apply import matching_mode
 except ImportError:
     import plot_standard_metric_baselines as P
     from monthly_split import datetime_mask, time_ranges
+    from fake_matching_apply import matching_mode
 
 
 # Everything the blind-spot figure plots (DEFAULT_METRICS minus
@@ -334,8 +336,8 @@ def bootstrap_null_output_dir(cfg, variables):
 def evaluate_bootstrap_null(cfg):
     """Resample the null, sweep the severity ladder; returns written paths."""
     variables = P.variables_from_config(cfg)
-    if bool((cfg.get("histogram_matching", {}) or {}).get("enabled", False)):
-        raise ValueError("Bootstrap null evaluation does not yet support histogram matching.")
+    if matching_mode(cfg) != "none":
+        raise ValueError("Bootstrap null evaluation does not yet support fake-distribution matching.")
     metric_names = [m for m in TABLE_METRICS if m in set(P.metric_names_from_config(cfg))]
     replicates = int(bootstrap_get(cfg, "replicates", 200))
     pool_samples = int(bootstrap_get(cfg, "pool_samples", 3000))

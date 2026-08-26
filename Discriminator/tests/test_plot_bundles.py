@@ -41,10 +41,13 @@ class PlotBundleTests(unittest.TestCase):
             self.assertEqual(manifest["plots"]["curve"]["npz"], "curve.npz")
             self.assertEqual(manifest["plots"]["curve_notitle"]["png"], "curve_notitle.png")
             self.assertTrue(titleless_plot_path(output).is_file())
-            with np.load(titleless_plot_path(output).with_suffix(".npz"), allow_pickle=False) as data:
-                titleless_metadata = json.loads(str(data["metadata_json"]))
-            self.assertTrue(titleless_metadata["titleless"])
-            self.assertEqual(titleless_metadata["axes"][0]["title"], "Panel title")
+            titled_npz = output.with_suffix(".npz")
+            titleless_npz = titleless_plot_path(output).with_suffix(".npz")
+            self.assertEqual(titled_npz.stat().st_ino, titleless_npz.stat().st_ino)
+            self.assertEqual(
+                manifest["plots"]["curve_notitle"]["shared_npz"], "curve.npz",
+            )
+            self.assertTrue(manifest["plots"]["curve_notitle"]["titleless"])
 
     def test_bundle_writes_pdfs_when_requested(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,7 +76,7 @@ class PlotBundleTests(unittest.TestCase):
             axis.set_xscale("log")
             axis.plot([1.0, 10.0], [2.0, 3.0], label="Metric", marker="s")
             configure_plot_bundle_saving(
-                profile="paper", paper_width_inches=5.5, paper_width_kind="full"
+                profile="paper", save_pdf=True, paper_width_inches=5.5, paper_width_kind="full"
             )
             try:
                 paths = save_figure_bundle(figure, output, plot_type="unit_curve")

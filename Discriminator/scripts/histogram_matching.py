@@ -21,7 +21,9 @@ def artifact_dir(cfg, *, writing=False):
         configured = (cfg.get("pipeline", {}) or {}).get("input_histogram_matching_dir")
         if configured:
             return Path(str(configured))
-    return Path(str(cfg.baseline.output_dir)) / "data" / "histogram_matching"
+    pipeline = cfg.get("pipeline", {}) or {}
+    root = Path(str(pipeline.get("output_root") or cfg.baseline.output_dir))
+    return root / "data" / "preprocessing" / "histogram_matching"
 
 
 def coordinate_token(value):

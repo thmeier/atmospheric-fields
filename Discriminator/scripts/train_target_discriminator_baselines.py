@@ -16,9 +16,9 @@ from tqdm import tqdm
 
 try:
     from .plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle
-    from .histogram_matching_apply import match_raw, match_standardized
-    from .histogram_checkpoint import binding_path, validate_binding, write_binding
-    from .temporal_resampling import write_split_membership
+    from .fake_matching_apply import match_raw, match_standardized
+    from .fake_matching_checkpoint import binding_path, validate_binding, write_binding
+    from .temporal_resampling import active_schedule, write_split_membership
     from .train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from .plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -36,9 +36,9 @@ try:
     )
 except ImportError:
     from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle
-    from histogram_matching_apply import match_raw, match_standardized
-    from histogram_checkpoint import binding_path, validate_binding, write_binding
-    from temporal_resampling import write_split_membership
+    from fake_matching_apply import match_raw, match_standardized
+    from fake_matching_checkpoint import binding_path, validate_binding, write_binding
+    from temporal_resampling import active_schedule, write_split_membership
     from train_discriminator import WeatherDiscriminator, apply_configured_corruption, safe_open_dataset, select_time_ranges, normalize_prediction_timedelta
     from plot_standard_metric_baselines import (
         DATA_DEPENDENT_CORRUPTIONS,
@@ -619,9 +619,10 @@ def _plot_logit_histogram_overlay(groups, title, output_path):
 
 
 def plot_target_test_logit_histograms(model, architecture, kind, label, test_real, test_fake, records,
-                                      corruption, variables, means, stds, cfg, device, maximum, batch_size):
+                                      corruption, variables, means, stds, cfg, device, maximum, batch_size,
+                                      output_root=None):
     """Plot held-out real/fake logit densities for every target test point."""
-    root = Path(str(get(cfg, "output_dir"))) / "plots" / "target_logit_distributions" / architecture / kind / safe_target_name(label)
+    root = Path(str(output_root or get(cfg, "output_dir"))) / "plots" / "target_logit_distributions" / architecture / kind / safe_target_name(label)
     groups = []
     if corruption:
         selected = indices(test_fake, maximum)
@@ -1975,7 +1976,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
     corruption_train=select_era5_split(real,cfg,"train",coverage="corruption")
     corruption_means={v:float(corruption_train[v].mean()) for v in variables}
     corruption_stds={v:max(float(corruption_train[v].std()),1e-8) for v in variables}
-    checkpoint_root = root / "models" / "target_discriminators"
+    checkpoint_root = Path(str(get(cfg, "checkpoint_dir") or (root / "models" / "target_discriminators")))
     outputs = []
     interpretability_rows = []
     representation_ratio_rows = []
@@ -1983,17 +1984,27 @@ def train_target_discriminator_baselines(cfg, tracker=None):
     wandb_settings = pipeline.get("wandb", {}) or {}
     log_every = int(wandb_settings.get("log_every_n_steps", 20))
     upload = bool(wandb_settings.get("upload_checkpoints", True))
+    render_diagnostics = bool(get(cfg, "render_diagnostics", True))
+    diagnostics_root = Path(str(get(cfg, "diagnostics_output_dir", root)))
 
     def tracked_context(architecture, kind, label):
         if tracker is None:
             return nullcontext(None)
+        schedule = active_schedule(cfg)
+        resample_id = None if schedule is None else schedule.resample_id
         metadata = {
             "architecture": architecture, "target_kind": kind, "target": label,
             "variables": list(SFNO_VARIABLES if architecture == "sfno" else variables),
         }
+        if resample_id is not None:
+            metadata["temporal_resample_id"] = resample_id
+        run_name = f"train/{architecture}/{kind}/{label}"
+        if resample_id is not None:
+            run_name = f"train/{resample_id}/{architecture}/{kind}/{label}"
         return tracker.run(
-            f"train/{architecture}/{kind}/{label}", "discriminator-training", cfg,
-            metadata=metadata, tags=[architecture, kind, str(label)],
+            run_name, "discriminator-training", cfg,
+            metadata=metadata,
+            tags=[architecture, kind, str(label), *([] if resample_id is None else [resample_id])],
         )
 
     def evaluate_target(model, architecture, kind, label, fake, corruption, means, stds, run, equator_mask_degrees=0.0):
@@ -2002,7 +2013,8 @@ def train_target_discriminator_baselines(cfg, tracker=None):
         maximum = int(get(cfg, "max_eval_samples", 0))
         interpretability = get(cfg, "interpretability", {}) or {}
         supports_attribution = architecture in {"squeezenet", "squeezenet_attention", "squeezenet_equator_mask", "sfno_linear", "sfno_mlp"}
-        attribution_enabled = bool(interpretability.get("enabled", True)) and supports_attribution
+        attribution_enabled = (render_diagnostics and bool(interpretability.get("enabled", True))
+                               and supports_attribution)
         attribution_seed = int(interpretability.get("seed", get(cfg, "seed", 0)))
         random_count = int(interpretability.get("random_samples_per_class", 2)) if attribution_enabled else 0
         if bool(getattr(model, "expects_raw_fields", False)):
@@ -2052,14 +2064,17 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 run.summary["corruption/fake_severity_levels"] = target_fake_severity_levels(
                     cfg, corruption,
                 ).tolist()
-        logit_histogram_paths = plot_target_test_logit_histograms(
-            model, architecture, kind, label, test_real, test_fake, test_records, corruption,
-            variables, means, stds, cfg, device, maximum, int(get(cfg, "batch_size")),
-        )
+        logit_histogram_paths = []
+        if render_diagnostics:
+            logit_histogram_paths = plot_target_test_logit_histograms(
+                model, architecture, kind, label, test_real, test_fake, test_records, corruption,
+                variables, means, stds, cfg, device, maximum, int(get(cfg, "batch_size")),
+                output_root=diagnostics_root,
+            )
         plot_paths = list(logit_histogram_paths)
         record["test_logit_histograms"] = [str(path) for path in logit_histogram_paths]
         if run is not None:
-            tracker.log_images(run, logit_histogram_paths, root / "plots")
+            tracker.log_images(run, logit_histogram_paths, diagnostics_root / "plots")
             run.summary["test/logit_histograms"] = len(logit_histogram_paths)
         ratio_settings = (sfno_settings(cfg).get("representation_ratio", {}) or {})
         if bool(getattr(model, "expects_raw_fields", False)) and bool(ratio_settings.get("enabled", True)):
@@ -2071,11 +2086,13 @@ def train_target_discriminator_baselines(cfg, tracker=None):
             for ratio in ratios:
                 ratio.update({"architecture": architecture, "kind": kind, "target": label})
             representation_ratio_rows.extend(ratios)
-            ratio_path = plot_sfno_representation_ratio(
-                ratios, architecture, kind, label,
-                root / "plots" / "sfno_representation_ratio" / architecture / kind /
-                f"{safe_target_name(label)}.png",
-            )
+            ratio_path = None
+            if render_diagnostics:
+                ratio_path = plot_sfno_representation_ratio(
+                    ratios, architecture, kind, label,
+                    diagnostics_root / "plots" / "sfno_representation_ratio" / architecture / kind /
+                    f"{safe_target_name(label)}.png",
+                )
             record["sfno_representation_ratios"] = ratios
             record["sfno_representation_ratio_plot"] = str(ratio_path) if ratio_path else ""
             if run is not None:
@@ -2090,10 +2107,10 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                     })
                 run.summary["sfno/representation_ratio_points"] = len(ratios)
                 if ratio_path is not None:
-                    tracker.log_images(run, [ratio_path], root / "plots")
+                    tracker.log_images(run, [ratio_path], diagnostics_root / "plots")
                     plot_paths.append(ratio_path)
         if attribution_enabled:
-            gallery_path = (root / "plots" / "target_interpretability" / architecture / kind /
+            gallery_path = (diagnostics_root / "plots" / "target_interpretability" / architecture / kind /
                             f"{safe_target_name(label)}_integrated_gradients.png")
             try:
                 input_variables = list(getattr(model, "input_variables", variables))
@@ -2106,7 +2123,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                 plot_paths.append(gallery_path)
                 residuals = [abs(float(row["completeness_residual"])) for row in rows]
                 if run is not None:
-                    tracker.log_images(run, [gallery_path], root / "plots")
+                    tracker.log_images(run, [gallery_path], diagnostics_root / "plots")
                     tracker.log_records_table(run, "interpretability/cases", rows)
                     run.summary["interpretability/status"] = "completed"
                     run.summary["interpretability/n_cases"] = len(rows)
@@ -2123,7 +2140,7 @@ def train_target_discriminator_baselines(cfg, tracker=None):
                     record["sfno_representation_magnitude_gallery"] = str(representation_path)
                     plot_paths.append(representation_path)
                     if run is not None:
-                        tracker.log_images(run, [representation_path], root / "plots")
+                        tracker.log_images(run, [representation_path], diagnostics_root / "plots")
                     print(f"Saved SFNO representation magnitude gallery to: {representation_path}")
             except Exception as error:
                 print(f"Interpretability failed for {architecture} {kind}/{label}: {error}")

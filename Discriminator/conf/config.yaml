@@ -20,7 +20,7 @@ monthly_split:
 temporal_resampling:
   enabled: true
   learned_replicates: 5
-  fixed_replicates: 50
+  fixed_replicates: 10
   learned_test_windows: [[5, 11], [9, 15], [13, 19], [17, 23], [20, 26]]
   buffer_days: 4
   random_test_start_range: [5, 20]
