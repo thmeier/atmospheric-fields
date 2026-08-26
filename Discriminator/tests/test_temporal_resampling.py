@@ -104,3 +104,31 @@ class TemporalResamplingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CountSpreadTests(unittest.TestCase):
+    """Sample counts differ per fold wherever no evaluation cap binds."""
+
+    @staticmethod
+    def _rows(counts):
+        return [
+            {"label": "GraphCast", "lead_hour": "192", "resample_id": f"fixed_{i:03d}",
+             "n_samples": str(n), "pairwise_n_samples": "256"}
+            for i, n in enumerate(counts)
+        ]
+
+    def test_equal_counts_report_no_spread(self):
+        from Discriminator.scripts.temporal_resampling_pipeline import _validate_counts
+        spreads = _validate_counts(self._rows([1000, 1000, 1000]),
+                                   ["label", "lead_hour"], ("n_samples", "pairwise_n_samples"))
+        self.assertEqual(spreads, {})
+
+    def test_varying_forecast_counts_are_recorded_not_fatal(self):
+        # A +192 h forecast pair survives only if its valid time lands inside the
+        # same seven-day window, so the count depends on where the window fell.
+        from Discriminator.scripts.temporal_resampling_pipeline import _validate_counts
+        spreads = _validate_counts(self._rows([160, 164, 166, 168]),
+                                   ["label", "lead_hour"], ("n_samples", "pairwise_n_samples"))
+        self.assertEqual(spreads[(("GraphCast", "192"), "n_samples")], (160, 168))
+        # The capped pairwise count is identical, so it must not be flagged.
+        self.assertNotIn((("GraphCast", "192"), "pairwise_n_samples"), spreads)

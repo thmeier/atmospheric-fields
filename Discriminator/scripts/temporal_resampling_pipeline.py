@@ -241,14 +241,35 @@ def _execute_children(cfg, schedules, stages, *, require_checkpoints=False, para
 
 
 def _validate_counts(rows, group_fields, count_fields):
+    """Record how each sample count varies across resamples.
+
+    Counts are equal wherever an evaluation cap binds: corruption rows are
+    thinned to `corruption_eval_samples`, so every fold reports the same n.
+    Forecast lead-time rows are not capped by default, and there the count
+    genuinely differs per fold -- a forecast initialised near the end of a
+    seven-day test window has its +192 h valid time outside that window, so how
+    many pairs survive depends on where the window fell. Observed spreads run
+    from 154 to 168 pairs.
+
+    Treating that as an error fails a legitimate run after every resample has
+    already been computed, so the spread is returned for the caller to record
+    instead. It is still worth surfacing: an unexpected spread on a capped
+    quantity would point at folds being mixed that should not be.
+    """
     grouped = {}
     for row in rows:
         grouped.setdefault(tuple(row.get(field) for field in group_fields), []).append(row)
+    spreads = {}
     for key, group in grouped.items():
         for field in count_fields:
-            values = {int(float(row[field])) for row in group if row.get(field, "") != ""}
+            values = sorted({int(float(row[field])) for row in group if row.get(field, "") != ""})
             if len(values) > 1:
-                raise ValueError(f"Inconsistent {field} across temporal resamples for {dict(zip(group_fields, key))}: {sorted(values)}")
+                spreads[(key, field)] = (min(values), max(values))
+    if spreads:
+        fields = sorted({field for _, field in spreads})
+        print(f"  {len(spreads)} group/field combinations vary across resamples "
+              f"({', '.join(fields)}); recording min and max per group.")
+    return spreads
 
 
 def _metric_names(cfg):
@@ -281,16 +302,23 @@ def aggregate_standard(cfg, schedules):
                         "value": source[metric], "n_samples": source.get("n_samples", ""),
                         "pairwise_n_samples": source.get("pairwise_n_samples", ""),
                     })
-        _validate_counts(rows, keys, ("n_samples", "pairwise_n_samples"))
+        spreads = _validate_counts(rows, keys, ("n_samples", "pairwise_n_samples"))
         aggregate = aggregate_draws(rows, metric_names, keys, "p05_p95")
         # Non-metric metadata are constant by construction; retain representative values.
         by_key = {tuple(row.get(key) for key in keys): row for row in rows}
         for row in aggregate:
-            representative = by_key[tuple(row.get(key) for key in keys)]
+            identity = tuple(row.get(key) for key in keys)
+            representative = by_key[identity]
             for field in ("n_samples", "pairwise_n_samples", "n_pairs", "initialization_start",
                           "initialization_end", "valid_start", "valid_end"):
                 if field in representative:
                     row[field] = representative[field]
+            # Where a count varies across folds the representative value alone
+            # would misreport it, so carry the observed range beside it.
+            for field in ("n_samples", "pairwise_n_samples"):
+                low_high = spreads.get((identity, field))
+                if low_high is not None:
+                    row[f"{field}_min"], row[f"{field}_max"] = low_high
         outputs.append(_write_csv(output_root / "data" / source_name, aggregate))
     outputs.append(_write_csv(output_root / "data" / "fixed_metric_draws.csv", draw_rows))
     split_path = aggregate_split_manifests(cfg, schedules, "fixed")
@@ -319,7 +347,7 @@ def aggregate_discriminator(cfg, schedules):
             with gzip.open(terms_path, "rt", newline="") as handle:
                 for row in csv.DictReader(handle):
                     row["resample_id"] = schedule.resample_id; terms.append(row)
-    _validate_counts(rows, DISCRIMINATOR_KEYS, ("n_samples", "ep_n_samples"))
+    discriminator_spreads = _validate_counts(rows, DISCRIMINATOR_KEYS, ("n_samples", "ep_n_samples"))
     try:
         from .analyze_temporal_resamples import reconstruct_scores_from_terms
     except ImportError:
@@ -337,6 +365,11 @@ def aggregate_discriminator(cfg, schedules):
         source = representative[tuple(row.get(key) for key in DISCRIMINATOR_KEYS)]
         for field in ("stderr", "n_samples", "ep_train", "ep_n_samples"):
             row[field] = source.get(field, "")
+        for field in ("n_samples", "ep_n_samples"):
+            low_high = discriminator_spreads.get(
+                (tuple(row.get(key) for key in DISCRIMINATOR_KEYS), field))
+            if low_high is not None:
+                row[f"{field}_min"], row[f"{field}_max"] = low_high
         matching = [item for item in rows if tuple(item.get(key) for key in DISCRIMINATOR_KEYS) == tuple(row.get(key) for key in DISCRIMINATOR_KEYS)]
         row["checkpoint_paths"] = ",".join(item.get("checkpoint_path", "") for item in matching)
         row["checkpoint_sha256s"] = ",".join(item.get("checkpoint_sha256", "") for item in matching)
