@@ -124,11 +124,19 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 RUN_DIR="$(find "${OUT}" -type d -name "${PIPELINE_ID}" -path '*pipeline_runs*' | head -1)"
 [[ -n "${RUN_DIR}" ]] || { echo "Could not locate the run directory under ${OUT}" >&2; exit 0; }
+# The blind-spot table thresholds each metric against a p95 of the resampled null,
+# which needs at least 20 null draws (NULL_REPLICATE_FLOOR). A single-draw "final
+# plots first" run cannot produce it -- that is deferred to the later selective
+# multi-sampling run -- so skip it here rather than let it abort the script (and
+# with it the team07 sync) under `set -e`.
+NULL_FLOOR=20
 DRAWS="$(find "${RUN_DIR}" -maxdepth 3 -name fixed_metric_draws.csv | head -1)"
-if [[ -n "${DRAWS}" ]]; then
+if [[ -n "${DRAWS}" && "${FIXED_REPLICATES:-1}" -ge "${NULL_FLOOR}" ]]; then
   BLINDSPOTS="${RUN_DIR}/blindspots"
   "${PYTHON}" scripts/blindspots_from_temporal_draws.py "${DRAWS}" --output-dir "${BLINDSPOTS}"
   "${PYTHON}" scripts/plot_bootstrap_blindspots.py "+bootstrap_null.data_dir=${BLINDSPOTS}"
+else
+  echo "Skipping blind-spot table: fixed_replicates=${FIXED_REPLICATES:-1} < ${NULL_FLOOR} (p95 null needs >=${NULL_FLOOR} draws)."
 fi
 
 # Keep everything worth reusing on the shared volume. Trained critics are ~2.8 MB
