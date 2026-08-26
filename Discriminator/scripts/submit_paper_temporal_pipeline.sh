@@ -142,12 +142,17 @@ fi
 # Keep everything worth reusing on the shared volume. Trained critics are ~2.8 MB
 # each (~250 MB for all 90) and are what makes a rerun cheap: pass the copied tree
 # back as temporal_resampling.input_run_dir to evaluate or replot without
-# retraining. Only the per-fold plot trees are left behind -- the canonical fold's
-# plots are already copied up to the parent.
+# retraining. We also keep every per-resample metric artifact (csv/csv.gz/nc), so
+# this backup is a COMPLETE resume source: with the same PIPELINE_ID and seed a
+# later run can raise fixed_replicates (0..9 are reused byte-for-byte, only the
+# new draws compute) or append learned windows without redoing finished work.
+# Only the bulky per-fold plot trees (png/pdf) are left behind -- the canonical
+# fold's plots are already copied up to the parent.
 KEEP="${KEEP_ROOT:-/cluster/courses/pmlr/teams/team07/results}/${PIPELINE_ID}"
 mkdir -p "${KEEP}"
 rsync -a --prune-empty-dirs \
-      --include='*/' --include='model.pth' --include='*.json' --exclude='*' \
+      --include='*/' --include='model.pth' --include='*.json' \
+      --include='*.csv' --include='*.csv.gz' --include='*.nc' --exclude='*' \
       "${RUN_DIR}/resamples/" "${KEEP}/resamples/" 2>/dev/null || true
 rsync -a --exclude='resamples/' "${RUN_DIR}/" "${KEEP}/" 2>/dev/null || \
   cp -r "${RUN_DIR}"/* "${KEEP}/" 2>/dev/null || true
