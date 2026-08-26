@@ -8,7 +8,7 @@ import numpy as np
 
 from Discriminator.scripts.plot_bundles import (
     all_plot_bundle_paths, configure_plot_bundle_saving, rasterize_field_artists, save_figure_bundle,
-    titleless_plot_path,
+    titleless_plot_path, without_suptitle,
 )
 from Discriminator.scripts.render_npz_paper_plots import load_bundle, reconstruct
 
@@ -45,6 +45,32 @@ class PlotBundleTests(unittest.TestCase):
                 titleless_metadata = json.loads(str(data["metadata_json"]))
             self.assertTrue(titleless_metadata["titleless"])
             self.assertEqual(titleless_metadata["axes"][0]["title"], "Panel title")
+
+    def test_titleless_context_removes_single_axis_main_title(self):
+        figure, axis = plt.subplots()
+        figure.suptitle("Figure heading")
+        axis.set_title("Axis heading")
+        try:
+            with without_suptitle(figure):
+                self.assertEqual(figure._suptitle.get_text(), "")
+                self.assertEqual(axis.get_title(), "")
+            self.assertEqual(figure._suptitle.get_text(), "Figure heading")
+            self.assertEqual(axis.get_title(), "Axis heading")
+        finally:
+            plt.close(figure)
+
+    def test_titleless_context_keeps_multi_panel_titles(self):
+        figure, axes = plt.subplots(1, 2)
+        figure.suptitle("Figure heading")
+        axes[0].set_title("First panel")
+        axes[1].set_title("Second panel")
+        try:
+            with without_suptitle(figure):
+                self.assertEqual(figure._suptitle.get_text(), "")
+                self.assertEqual(axes[0].get_title(), "First panel")
+                self.assertEqual(axes[1].get_title(), "Second panel")
+        finally:
+            plt.close(figure)
 
     def test_bundle_writes_pdfs_when_requested(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -595,27 +595,41 @@ def _plot_logit_histogram(reference, candidate, title, candidate_label, output_p
     save_figure_bundle(
         figure, output_path, plot_type="target_logit_histogram",
         payload={"reference_logits": reference, "candidate_logits": candidate, "bin_edges": edges}, dpi=200,
+        paper_width_kind="half",
     ); plt.close(figure)
 
 
 def _plot_logit_histogram_overlay(groups, title, output_path):
     edges = _logit_histogram_edges([value for group in groups for value in (group["reference"], group["candidate"])])
-    figure, axis = plt.subplots(figsize=(7.2, 4.4))
+    legend_columns = 2
+    legend_rows = int(np.ceil((len(groups) + 1) / legend_columns))
+    figure, axis = plt.subplots(figsize=(6.4, 4.6 + 0.5 * legend_rows))
     pooled_reference = np.concatenate([group["reference"] for group in groups])
     axis.hist(pooled_reference, bins=edges, density=True, histtype="stepfilled", color="tab:blue", alpha=0.30, label="ERA5 test (pooled)")
     colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(groups)))
     for color, group in zip(colors, groups):
         axis.hist(group["candidate"], bins=edges, density=True, histtype="step", linewidth=1.7, color=color, label=group["label"])
     axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
-    axis.set(title=title, xlabel="Real-vs-fake logit", ylabel="Density")
-    axis.grid(alpha=0.25); axis.legend(fontsize=8, ncol=2); figure.tight_layout()
+    axis.set(xlabel="Real-vs-fake logit", ylabel="Density")
+    axis.grid(alpha=0.25)
+    handles, labels = axis.get_legend_handles_labels()
+    figure.legend(
+        handles, labels, loc="lower center", ncol=legend_columns,
+        bbox_to_anchor=(0.5, 0.015), fontsize=8,
+    )
+    figure.suptitle(title)
+    bottom = min(0.18 + 0.055 * legend_rows, 0.46)
+    figure.subplots_adjust(left=0.14, right=0.98, bottom=bottom, top=0.84)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"bin_edges": edges, "pooled_reference_logits": pooled_reference}
     for index, group in enumerate(groups):
         payload[f"reference_logits_{index}"] = group["reference"]
         payload[f"candidate_logits_{index}"] = group["candidate"]
         payload[f"label_{index}"] = np.asarray(group["label"])
-    save_figure_bundle(figure, output_path, plot_type="target_logit_histogram_overlay", payload=payload, dpi=200); plt.close(figure)
+    save_figure_bundle(
+        figure, output_path, plot_type="target_logit_histogram_overlay", payload=payload,
+        dpi=200, paper_width_kind="half",
+    ); plt.close(figure)
 
 
 def plot_target_test_logit_histograms(model, architecture, kind, label, test_real, test_fake, records,

@@ -7,6 +7,10 @@ defaults:
 plotting:
   save_pdf: false
   profile: dashboard
+  # all: render every target-specific diagnostic; representative_only: for
+  # repeated single-target templates, render one representative per comparison
+  # kind. Combined/multi-target figures and galleries are always retained.
+  repeated_plot_mode: all
   # Dense per-anchor SCWD response histograms are expensive and rarely needed.
   # Anchor maps and mean-response-difference maps remain enabled.
   scwd_response_histograms: false
@@ -29,6 +33,17 @@ plotting:
       - checkerboard_2px
       - zonal_scanlines
       - hemisphere_splice
+  # One panel per manuscript forecast model, with all held-out lead-time logit
+  # distributions overlaid against the corresponding ERA5 test distribution.
+  logit_histogram_gallery:
+    enabled: true
+    architecture: squeezenet
+    resample_id: learned_04
+    models:
+      - GraphCast
+      - Pangu-Weather
+      - FuXi
+      - IFS HRES
 
 # Point-estimate distribution baselines aligned with the temporal-holdout
 # surface experiment. ERA5 paths, real-data time splits, lead times, and the

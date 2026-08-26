@@ -32,6 +32,7 @@ try:
         joint_variable_name,
         metric_names_from_config,
         plot_saved_standard_metric_baselines,
+        plot_forecast_logit_histogram_gallery,
         write_scwd_anchor_diagnostics,
         write_global_mean_wasserstein_diagnostics,
         variables_from_config,
@@ -44,6 +45,7 @@ except ImportError:
         joint_variable_name,
         metric_names_from_config,
         plot_saved_standard_metric_baselines,
+        plot_forecast_logit_histogram_gallery,
         write_scwd_anchor_diagnostics,
         write_global_mean_wasserstein_diagnostics,
         variables_from_config,
@@ -74,6 +76,11 @@ def parse_args():
         ),
     )
     parser.add_argument("--text-width-inches", type=float, default=5.5)
+    parser.add_argument(
+        "--repeated-plot-mode", choices=("all", "representative_only"), default="all",
+        help=("Use representative_only to render one example of repeated single-target "
+              "templates while retaining galleries and multi-target figures."),
+    )
     parser.add_argument(
         "--pdf", action=argparse.BooleanOptionalAction, default=True,
         help="Save PDF companions (enabled by default for manuscript layout checks).",
@@ -400,7 +407,6 @@ def plot_dummy_logit_histograms(cfg, output_root, seed):
     """Render representative per-point and overlay production logit histograms."""
     architecture = "squeezenet"
     paths = []
-
     forecast = next(iter(cfg.baseline.forecast_files))
     leads = np.asarray([int(value) for value in cfg.lead_times], dtype=float)
     forecast_groups = dummy_logit_groups(
@@ -425,6 +431,39 @@ def plot_dummy_logit_histograms(cfg, output_root, seed):
         overlay,
     )
     paths.append(overlay)
+
+    gallery_rows = []
+    selected_models = list(
+        ((cfg.get("plotting", {}) or {}).get("logit_histogram_gallery", {}) or {}).get(
+            "models", list(cfg.baseline.forecast_files)
+        )
+    )
+    for model_index, model in enumerate(selected_models):
+        groups = dummy_logit_groups(
+            leads,
+            [f"+{int(value)}h" for value in leads],
+            seed + 20 + model_index,
+            shift_scale=1.5 + 0.25 * model_index,
+        )
+        for value in groups[0]["reference"]:
+            gallery_rows.append({
+                "architecture": architecture, "kind": "forecast",
+                "target": model, "role": "candidate", "source": ERA5_NULL_LABEL,
+                "lead_hour": "", "logit": float(value), "resample_id": "learned_04",
+            })
+        for group, lead in zip(groups, leads):
+            for value in group["candidate"]:
+                gallery_rows.append({
+                    "architecture": architecture, "kind": "forecast",
+                    "target": model, "role": "candidate", "source": model,
+                    "lead_hour": int(lead), "logit": float(value),
+                    "resample_id": "learned_04",
+                })
+    plot_forecast_logit_histogram_gallery(gallery_rows, cfg, output_root)
+    paths.append(
+        output_root / "plots" / "target_logit_distributions" / architecture
+        / "forecast" / "all_models_all_lead_times.png"
+    )
 
     corruption = "hemisphere_splice"
     levels = np.asarray(corruption_levels(corruption, cfg), dtype=float)
@@ -488,6 +527,7 @@ def run(args):
     cfg.baseline.output_dir = str(run_dir)
     cfg.target_discriminator.output_dir = str(run_dir)
     cfg.plotting.profile = "paper"
+    cfg.plotting.repeated_plot_mode = str(args.repeated_plot_mode)
     cfg.plotting.save_pdf = bool(args.pdf)
     cfg.plotting.paper.text_width_inches = float(args.text_width_inches)
     cfg.plotting.paper.width = "full"
