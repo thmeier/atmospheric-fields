@@ -4016,10 +4016,14 @@ def evaluate_corruption_disturbances(cfg, truth_ds, normalization_stats, variabl
 
 def plot_corruption_field_gallery(
     output_dir, corruption_type, levels, fields, variables, latitudes, longitudes, timestamp,
-    title, colorbar_label, filename, symmetric=False,
+    title, colorbar_label, filename, symmetric=False, placeholder=False,
 ):
     """Render one two-row-per-field corruption gallery from persisted physical values."""
-    if symmetric:
+    if placeholder:
+        lower = np.full(len(variables), -1.0)
+        upper = np.full(len(variables), 1.0)
+        cmap = "Greys"
+    elif symmetric:
         upper = np.maximum(np.nanpercentile(np.abs(fields), 99, axis=(0, 2, 3)), 1e-8)
         lower = -upper
         cmap = "RdBu_r"
@@ -4045,13 +4049,19 @@ def plot_corruption_field_gallery(
             column = severity_index % severity_columns
             axis = axes[row, column]
             image = axis.pcolormesh(
-                longitudes, latitudes, fields[severity_index, variable_index], shading="auto",
+                longitudes, latitudes,
+                (np.ma.masked_all_like(fields[severity_index, variable_index])
+                 if placeholder else fields[severity_index, variable_index]),
+                shading="auto",
                 cmap=cmap, vmin=float(lower[variable_index]), vmax=float(upper[variable_index]),
                 transform=ccrs.PlateCarree(), rasterized=True,
             )
             axis.set_global()
             axis.coastlines(linewidth=0.5)
             axis.add_feature(cfeature.BORDERS, linewidth=0.3, alpha=0.5)
+            if placeholder:
+                axis.text(0.5, 0.5, "blank field", transform=axis.transAxes,
+                          ha="center", va="center", color="0.45", fontsize=8)
             axis.set_title(f"severity={severity:.3g}", fontsize=9)
             if column == 0:
                 axis.set_ylabel(variable.replace("_", " "), fontsize=9)
@@ -4073,17 +4083,20 @@ def plot_corruption_field_gallery(
 
 
 def plot_combined_corruption_gallery(output_dir, corruptions, levels, corrupted_fields, disturbances,
-                                     variables, latitudes, longitudes, timestamp):
+                                     variables, latitudes, longitudes, timestamp, placeholder=False):
     """Render a large raw-field/difference overview with one pair of rows per corruption."""
     n_corruptions, n_severity, n_variables = corrupted_fields.shape[:3]
     n_columns = n_severity
     for variable_index, variable in enumerate(variables):
         raw = corrupted_fields[:, :, variable_index]
         difference = disturbances[:, :, variable_index]
-        raw_low, raw_high = np.nanpercentile(raw, [1.0, 99.0])
-        if np.isclose(raw_low, raw_high):
-            raw_low -= 1e-8; raw_high += 1e-8
-        difference_limit = max(float(np.nanpercentile(np.abs(difference), 99.0)), 1e-8)
+        if placeholder:
+            raw_low, raw_high, difference_limit = -1.0, 1.0, 1.0
+        else:
+            raw_low, raw_high = np.nanpercentile(raw, [1.0, 99.0])
+            if np.isclose(raw_low, raw_high):
+                raw_low -= 1e-8; raw_high += 1e-8
+            difference_limit = max(float(np.nanpercentile(np.abs(difference), 99.0)), 1e-8)
         n_rows = 2 * n_corruptions
         figure, axes = plt.subplots(
             n_rows, n_columns,
@@ -4096,17 +4109,26 @@ def plot_combined_corruption_gallery(output_dir, corruptions, levels, corrupted_
                 raw_axis = axes[2 * corruption_index, severity_index]
                 difference_axis = axes[2 * corruption_index + 1, severity_index]
                 raw_artist = raw_axis.pcolormesh(
-                    longitudes, latitudes, raw[corruption_index, severity_index], shading="auto",
+                    longitudes, latitudes,
+                    (np.ma.masked_all_like(raw[corruption_index, severity_index])
+                     if placeholder else raw[corruption_index, severity_index]),
+                    shading="auto",
                     cmap="viridis", vmin=raw_low, vmax=raw_high, transform=ccrs.PlateCarree(), rasterized=True,
                 )
                 difference_artist = difference_axis.pcolormesh(
-                    longitudes, latitudes, difference[corruption_index, severity_index], shading="auto",
+                    longitudes, latitudes,
+                    (np.ma.masked_all_like(difference[corruption_index, severity_index])
+                     if placeholder else difference[corruption_index, severity_index]),
+                    shading="auto",
                     cmap="RdBu_r", vmin=-difference_limit, vmax=difference_limit,
                     transform=ccrs.PlateCarree(), rasterized=True,
                 )
                 for axis in (raw_axis, difference_axis):
                     axis.set_global(); axis.coastlines(linewidth=0.42)
                     axis.add_feature(cfeature.BORDERS, linewidth=0.25, alpha=0.4)
+                    if placeholder:
+                        axis.text(0.5, 0.5, "blank field", transform=axis.transAxes,
+                                  ha="center", va="center", color="0.45", fontsize=7)
                 raw_axis.set_title(f"severity={levels[corruption_index, severity_index]:.3g}", fontsize=8)
             axes[2 * corruption_index, 0].set_ylabel(f"{corruption}\ncorrupted", fontsize=8)
             axes[2 * corruption_index + 1, 0].set_ylabel(f"{corruption}\nminus ERA5", fontsize=8)
@@ -4137,6 +4159,7 @@ def plot_corruption_disturbances(output_root):
         longitudes = np.asarray(dataset.longitude.values)
         timestamp = str(dataset.attrs.get("timestamp", ""))
         has_corrupted_fields = "corrupted_field" in dataset.variables
+        placeholder = bool(dataset.attrs.get("synthetic_layout_preview", 0))
         for corruption_index, corruption_type in enumerate(dataset.corruption.values):
             corruption_type = str(corruption_type)
             levels = np.asarray(dataset.severity.values[corruption_index])
@@ -4144,12 +4167,14 @@ def plot_corruption_disturbances(output_root):
             plot_corruption_field_gallery(
                 output_dir, corruption_type, levels, disturbances, variables, latitudes, longitudes, timestamp,
                 "physical disturbance", "Corrupted − ERA5", f"{corruption_type}.png", symmetric=True,
+                placeholder=placeholder,
             )
             if has_corrupted_fields:
                 corrupted_fields = np.asarray(dataset.corrupted_field.values[corruption_index])
                 plot_corruption_field_gallery(
                     output_dir, corruption_type, levels, corrupted_fields, variables, latitudes, longitudes, timestamp,
                     "corrupted field", "Corrupted field", f"{corruption_type}_corrupted.png",
+                    placeholder=placeholder,
                 )
         if has_corrupted_fields:
             plot_combined_corruption_gallery(
@@ -4158,7 +4183,7 @@ def plot_corruption_disturbances(output_root):
                 np.asarray(dataset.severity.values),
                 np.asarray(dataset.corrupted_field.values),
                 np.asarray(dataset.disturbance.values),
-                variables, latitudes, longitudes, timestamp,
+                variables, latitudes, longitudes, timestamp, placeholder=placeholder,
             )
         else:
             print(f"{input_path} lacks raw corrupted fields; rerun standard metric evaluation once.")
@@ -4640,6 +4665,195 @@ def evaluate_standard_metric_baselines(cfg):
     return evaluate_standard_metrics(cfg) + evaluate_discriminator_metrics(cfg)
 
 
+def plot_main_corruption_comparison(
+    corruption_rows, discriminator_rows, metric_names, variables, cfg, output_root,
+):
+    """Plot five fixed-metric corruption panels beside their learned-critic curves."""
+    settings = (cfg.get("plotting", {}) or {}).get("main_corruption_figure", {}) or {}
+    if not bool(settings.get("enabled", True)):
+        return
+    metric_names = plotted_metric_names(metric_names)
+    if not metric_names or not corruption_rows or not discriminator_rows:
+        return
+
+    variable = joint_variable_name(variables)
+    available = {
+        row["corruption"] for row in corruption_rows if row.get("variable") == variable
+    }
+    requested = [
+        str(value) for value in settings.get(
+            "corruptions",
+            [
+                "gaussian_blur", "grf", "checkerboard_2px",
+                "zonal_scanlines", "hemisphere_splice",
+            ],
+        )
+    ]
+    corruptions = [name for name in requested if name in available][:5]
+    if len(corruptions) != 5:
+        print(
+            "Skipping main corruption comparison: expected five configured "
+            f"corruptions with saved rows, found {corruptions}."
+        )
+        return
+
+    architecture = str(settings.get("architecture", "squeezenet"))
+    critic_rows = [
+        row for row in discriminator_rows
+        if row.get("architecture") == architecture
+        and row.get("kind") == "corruption"
+        and row.get("target") in corruptions
+    ]
+    critic_targets = {row["target"] for row in critic_rows}
+    if any(corruption not in critic_targets for corruption in corruptions):
+        missing = [name for name in corruptions if name not in critic_targets]
+        print(
+            "Skipping main corruption comparison: missing learned-critic rows "
+            f"for {architecture}: {missing}."
+        )
+        return
+
+    selected_rows = [
+        row for row in corruption_rows
+        if row.get("variable") == variable and row.get("corruption") in corruptions
+    ]
+    scales = metric_normalization_scales(selected_rows, metric_names)
+    colors = metric_colors(metric_names)
+    figure, axes = plt.subplots(2, 3, figsize=(12.0, 7.4), squeeze=False)
+    axes = axes.ravel()
+
+    for panel_index, (axis, corruption) in enumerate(zip(axes[:5], corruptions)):
+        series = sorted(
+            [
+                row for row in selected_rows
+                if row["corruption"] == corruption and not row_is_null(row)
+            ],
+            key=lambda row: row["severity"],
+        )
+        x_values = relative_corruption_coordinates(series, "severity")
+        null_row = next(
+            (
+                row for row in selected_rows
+                if row["corruption"] == corruption and row_is_null(row)
+            ),
+            None,
+        )
+        for metric_index, metric_name in enumerate(metric_names):
+            axis.plot(
+                x_values,
+                [normalized_metric_value(row, metric_name, scales) for row in series],
+                marker=series_marker(metric_index),
+                linewidth=1.6,
+                color=colors[metric_name],
+                label=displayed_metric_name(metric_name),
+            )
+            if series and f"{metric_name}_lower" in series[0]:
+                bounds = [
+                    normalized_metric_bounds(row, metric_name, scales) for row in series
+                ]
+                axis.fill_between(
+                    x_values,
+                    [bound[0] for bound in bounds],
+                    [bound[1] for bound in bounds],
+                    color=colors[metric_name],
+                    alpha=0.14,
+                    linewidth=0,
+                )
+            if null_row is not None:
+                axis.scatter(
+                    [0.0],
+                    [normalized_metric_value(null_row, metric_name, scales)],
+                    marker="D",
+                    s=24,
+                    color=colors[metric_name],
+                    zorder=4,
+                )
+        axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
+        axis.set(
+            title=corruption.replace("_", " "),
+            xlabel="Relative corruption severity",
+            xlim=(0.0, 1.0),
+        )
+        if panel_index % 3 == 0:
+            axis.set_ylabel("Normalized divergence")
+        axis.grid(True, alpha=0.3)
+
+    critic_axis = axes[5]
+    critic_colors = plt.cm.tab10(np.linspace(0, 1, len(corruptions)))
+    for corruption_index, (color, corruption) in enumerate(
+        zip(critic_colors, corruptions)
+    ):
+        target_rows = [
+            row for row in critic_rows if row["target"] == corruption
+        ]
+        series = sorted(
+            [row for row in target_rows if not row["is_era5_test_null"]],
+            key=lambda row: row["x"],
+        )
+        x_values = relative_corruption_coordinates(series, "x")
+        critic_axis.plot(
+            x_values,
+            [row["score"] for row in series],
+            marker=series_marker(corruption_index),
+            linewidth=1.6,
+            color=color,
+            label=corruption.replace("_", " "),
+        )
+        if series and "score_lower" in series[0]:
+            critic_axis.fill_between(
+                x_values,
+                [row["score_lower"] for row in series],
+                [row["score_upper"] for row in series],
+                color=color,
+                alpha=0.14,
+                linewidth=0,
+            )
+        null_row = next(
+            (row for row in target_rows if row["is_era5_test_null"]), None
+        )
+        if null_row is not None:
+            critic_axis.scatter(
+                [0.0], [null_row["score"]], marker="D", s=24,
+                color=color, zorder=4,
+            )
+    critic_axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
+    critic_axis.set(
+        title="Reverse-KL critic",
+        xlabel="Relative corruption severity",
+        ylabel="Reverse-KL critic score",
+        xlim=(0.0, 1.0),
+    )
+    critic_axis.grid(True, alpha=0.3)
+    critic_axis.legend(fontsize=7, loc="best")
+
+    metric_handles, metric_labels = axes[0].get_legend_handles_labels()
+    figure.legend(
+        metric_handles,
+        metric_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=min(5, len(metric_labels)),
+        fontsize=8,
+    )
+    figure.suptitle(
+        "Controlled-corruption response of fixed metrics and learned critic",
+        fontsize=14,
+    )
+    figure.tight_layout(rect=[0.0, 0.075, 1.0, 0.95])
+    output_path = output_root / "plots" / "corruption_metrics_and_critic.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_figure_bundle(
+        figure,
+        output_path,
+        plot_type="main_corruption_comparison",
+        dpi=220,
+        bbox_inches="tight",
+    )
+    plt.close(figure)
+    print(f"Saved main corruption-comparison figure to: {output_path}")
+
+
+
 def plot_saved_standard_metric_baselines(cfg):
     """Render baseline figures exclusively from persisted evaluation artifacts."""
     configure_plot_bundle_saving_from_cfg(cfg)
@@ -4661,6 +4875,9 @@ def plot_saved_standard_metric_baselines(cfg):
     plot_corruption_metrics(corruption_rows, metric_names, variables, output_root)
     plot_normalized_lead_metrics_by_model(lead_rows, metric_names, variables, output_root)
     plot_normalized_corruption_metrics_by_type(corruption_rows, metric_names, variables, output_root)
+    plot_main_corruption_comparison(
+        corruption_rows, discriminator_rows, metric_names, variables, cfg, output_root
+    )
     plot_corruption_disturbances(output_root)
     plot_scwd_anchor_diagnostics(scwd_diagnostics, output_root)
     if bool((cfg.get("plotting", {}) or {}).get("scwd_response_histograms", False)):

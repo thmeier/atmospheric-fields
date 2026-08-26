@@ -818,6 +818,33 @@ evaluations, and plotting, and opts into manuscript-sized PNG/PDF/NPZ bundles.
 The cluster account supplies one GPU, two CPUs, and 24 GB without explicit TRES
 requests. Hydra overrides may be appended after the script name.
 
+Preview the exact paper plot layouts without data, checkpoints, evaluation, or
+W&B by rendering deterministic synthetic values through the real plot stage:
+
+```bash
+python scripts/preview_paper_plot_layouts.py
+```
+
+To upload the preview under a distinct, clearly synthetic W&B name:
+
+```bash
+python scripts/preview_paper_plot_layouts.py \
+  --wandb \
+  --wandb-name draft-layout-v1
+```
+
+The command creates a timestamped directory below
+`results/paper_layout_previews/`, including titled and title-less PNG/PDF/NPZ
+bundles. Pass `--output-dir PATH`, `--text-width-inches WIDTH`, `--no-pdf`, or
+repeated `--include 'GLOB'` options as needed. Add `--wandb` to create a
+clearly tagged synthetic preview run in the normal W&B project and upload every
+PNG plus a complete PDF/NPZ/CSV/config artifact. Every preview run contains a
+prominent `SYNTHETIC_LAYOUT_PREVIEW.txt`; none of its numerical values are real.
+With no `--include` filters, the preview also renders blank-field corruption and
+SCWD map galleries, synthetic global-mean distribution overlays, plus representative per-point and overlaid GraphCast lead-time
+and hemisphere-splice severity logit histograms. The blank panels retain the real
+coastlines, colorbars, panel geometry, and labels without depicting fake weather.
+
 A small end-to-end check is available as:
 
 ```bash
