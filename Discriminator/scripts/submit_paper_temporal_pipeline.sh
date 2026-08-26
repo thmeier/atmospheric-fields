@@ -59,6 +59,17 @@ PIPELINE_ID="${PIPELINE_ID:-paper-temporal-${SLURM_JOB_ID:-local}}"
 WORKERS="${WORKERS:-$(nproc)}"
 STAGES="${STAGES:-[train_discriminators,evaluate_standard_metrics,evaluate_discriminator_metrics,plot]}"
 RESUME="${RESUME:-false}"
+# Single-run defaults: one critic-training window and one resample draw, so every
+# curve is a bare point estimate with no bands. This is the "final plots first"
+# pass over the full 4-field input; error bars come later, only for the handful of
+# corruptions worth the compute. To restore the banded protocol, override:
+#   LEARNED_REPLICATES=5 LEARNED_WINDOWS='[[5,11],[9,15],[13,19],[17,23],[20,26]]' \
+#   FIXED_REPLICATES=25 sbatch scripts/submit_paper_temporal_pipeline.sh
+# fixed_replicates must stay >= learned_replicates, and learned_replicates must
+# equal the number of learned_test_windows.
+LEARNED_REPLICATES="${LEARNED_REPLICATES:-1}"
+FIXED_REPLICATES="${FIXED_REPLICATES:-1}"
+LEARNED_WINDOWS="${LEARNED_WINDOWS:-[[20,26]]}"
 
 cd "$HOME/atmospheric-fields/Discriminator"
 
@@ -95,6 +106,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
   "pipeline.stages=${STAGES}" \
   "pipeline.resume=${RESUME}" \
   "temporal_resampling.workers=${WORKERS}" \
+  "temporal_resampling.learned_replicates=${LEARNED_REPLICATES}" \
+  "temporal_resampling.fixed_replicates=${FIXED_REPLICATES}" \
+  "temporal_resampling.learned_test_windows=${LEARNED_WINDOWS}" \
   target_discriminator.sfno.enabled=false \
   baseline.discriminator.sfno.enabled=false \
   target_discriminator.train_attention_squeezenet=false \
