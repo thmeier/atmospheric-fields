@@ -298,7 +298,9 @@ records, but only `pipeline.storage.canonical_diagnostic_fold` (default
 `learned_04`) runs first and renders the large attribution, histogram, and
 representation galleries. Checkpoints are uploaded once per fold as a coherent artifact.
 These are uploaded as W&B evaluation artifacts. Every reverse-KL draw is checked
-against the raw saved training and candidate terms before aggregation. For
+against the raw saved held-out ERA5-reference and candidate terms before
+aggregation. Normalization remains fitted on the training split, while both
+variational expectations are evaluated out of sample. For
 example, count a model's null draws above its mean 12-hour score with:
 
 ```bash
@@ -836,8 +838,10 @@ permutations are refreshed each training epoch and are independently deranged by
 field for `field_splice`.
 
 By default, `pipeline.runs_dir=null` resolves first from
-`PIPELINE_RUNS_DIR`, then to `../baseline_pipeline_runs` beside
-`DATA_DIR`; this keeps large runs out of home storage. Each atomic manifest also
+`PIPELINE_RUNS_DIR`. The Slurm wrappers default that variable to
+`/work/scratch/$USER/baseline_pipeline_runs`, since `/cluster/courses` is
+read-only on compute nodes. Direct invocations without the variable retain the
+legacy fallback beside `DATA_DIR`. Each atomic manifest also
 records total bytes and bytes by file suffix. The pipeline warns at 5 GiB and
 stops at 10 GiB by default. The pipeline manifest and resolved configuration
 live directly under the pipeline-run directory. Evaluation-only and plotting-only invocations create

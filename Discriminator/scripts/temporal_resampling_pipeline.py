@@ -193,6 +193,105 @@ def aggregate_standard(cfg, schedules, fold_data):
     return outputs
 
 
+def _evenly_spaced(items, count):
+    """Select ``count`` ordered records while retaining the sampled span."""
+    if len(items) <= count:
+        return list(items)
+    selected = np.linspace(0, len(items) - 1, count, dtype=int)
+    return [items[int(index)] for index in selected]
+
+
+def _equalize_discriminator_term_counts(rows, terms):
+    """Equalize persisted held-out term counts across temporal folds.
+
+    A forecast source can occasionally lack a valid time in one otherwise
+    equal-width calendar window. Use the minimum available count at each
+    evaluated coordinate and deterministically retain evenly spaced raw terms.
+    Scores and standard errors are then reconstructed without repeating model
+    inference, while every temporal fold retains equal statistical weight.
+    """
+    ep_groups, candidate_groups = {}, {}
+    for term in terms:
+        base = (
+            term["resample_id"], term["architecture"], term["kind"],
+            term["target"],
+        )
+        if term["role"] in {"ep_reference", "ep_train"}:
+            ep_groups.setdefault(base, []).append(term)
+        else:
+            key = (*base, term["source"], float(term["x"]))
+            candidate_groups.setdefault(key, []).append(term)
+
+    for group in list(ep_groups.values()) + list(candidate_groups.values()):
+        group.sort(key=lambda item: int(float(item.get("sample_position", 0))))
+
+    ep_minimum = {}
+    for key, group in ep_groups.items():
+        cross_fold = key[1:]
+        ep_minimum[cross_fold] = min(ep_minimum.get(cross_fold, len(group)), len(group))
+    candidate_minimum = {}
+    for key, group in candidate_groups.items():
+        cross_fold = key[1:]
+        candidate_minimum[cross_fold] = min(
+            candidate_minimum.get(cross_fold, len(group)), len(group)
+        )
+
+    selected_ep = {
+        key: _evenly_spaced(group, ep_minimum[key[1:]])
+        for key, group in ep_groups.items()
+    }
+    selected_candidates = {
+        key: _evenly_spaced(group, candidate_minimum[key[1:]])
+        for key, group in candidate_groups.items()
+    }
+    equalized_terms = [
+        term
+        for group in list(selected_ep.values()) + list(selected_candidates.values())
+        for term in group
+    ]
+
+    changed = set()
+    for row in rows:
+        base = (
+            row["resample_id"], row["architecture"], row["kind"], row["target"],
+        )
+        candidate_key = (*base, row["source"], float(row["x"]))
+        ep_values = np.asarray([
+            float(term["transformed_term"]) for term in selected_ep[base]
+        ])
+        candidate_values = np.asarray([
+            float(term["transformed_term"])
+            for term in selected_candidates[candidate_key]
+        ])
+        original_counts = (int(float(row["n_samples"])), int(float(row["ep_n_samples"])))
+        new_counts = (len(candidate_values), len(ep_values))
+        if original_counts != new_counts:
+            changed.add((row["architecture"], row["kind"], row["target"], row["source"], row["x"], *new_counts))
+        ep = float(ep_values.mean())
+        candidate = float(candidate_values.mean())
+        ep_stderr = (
+            float(ep_values.std(ddof=1) / np.sqrt(len(ep_values)))
+            if len(ep_values) > 1 else 0.0
+        )
+        candidate_stderr = (
+            float(candidate_values.std(ddof=1) / np.sqrt(len(candidate_values)))
+            if len(candidate_values) > 1 else 0.0
+        )
+        row.update(
+            score=ep - candidate,
+            stderr=float(np.hypot(ep_stderr, candidate_stderr)),
+            n_samples=len(candidate_values),
+            ep_reference=ep,
+            ep_n_samples=len(ep_values),
+        )
+    if changed:
+        print(
+            f"Equalized {len(changed)} discriminator coordinates to their "
+            "minimum held-out counts across temporal folds."
+        )
+    return rows, equalized_terms
+
+
 def aggregate_discriminator(cfg, schedules, fold_data):
     output_root = _parent_output_root(cfg)
     rows, terms = [], []
@@ -207,6 +306,7 @@ def aggregate_discriminator(cfg, schedules, fold_data):
                 for row in csv.DictReader(handle):
                     row["resample_id"] = schedule.resample_id
                     terms.append(row)
+    rows, terms = _equalize_discriminator_term_counts(rows, terms)
     _validate_counts(rows, DISCRIMINATOR_KEYS, ("n_samples", "ep_n_samples"))
     try:
         from .analyze_temporal_resamples import reconstruct_scores_from_terms
@@ -223,8 +323,12 @@ def aggregate_discriminator(cfg, schedules, fold_data):
     representative = {tuple(row.get(key) for key in DISCRIMINATOR_KEYS): row for row in rows}
     for row in aggregate:
         source = representative[tuple(row.get(key) for key in DISCRIMINATOR_KEYS)]
-        for field in ("stderr", "n_samples", "ep_train", "ep_n_samples"):
-            row[field] = source.get(field, "")
+        for field in (
+            "stderr", "n_samples", "ep_reference", "ep_reference_split",
+            "ep_train", "ep_n_samples",
+        ):
+            if source.get(field, "") != "":
+                row[field] = source[field]
         matching = [item for item in rows if tuple(item.get(key) for key in DISCRIMINATOR_KEYS) == tuple(row.get(key) for key in DISCRIMINATOR_KEYS)]
         row["checkpoint_paths"] = ",".join(item.get("checkpoint_path", "") for item in matching)
         row["checkpoint_sha256s"] = ",".join(item.get("checkpoint_sha256", "") for item in matching)

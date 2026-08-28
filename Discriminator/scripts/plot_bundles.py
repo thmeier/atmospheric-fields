@@ -20,6 +20,24 @@ _PAPER_COLUMN_GAP_INCHES = 0.12
 _INCLUDE_PATTERNS = ()
 
 
+# Shared categorical palette for dashboard and manuscript plots. Series beyond
+# five reuse these colors and remain distinguishable through their markers.
+PLOT_PALETTE = (
+    "#AD99FF",  # Soft Periwinkle
+    "#030027",  # Prussian Blue
+    "#5CA4A9",  # Tropical Teal
+    "#DC9E82",  # Light Bronze
+    "#AB494B",  # Dusty Mauve
+)
+REFERENCE_COLOR = PLOT_PALETTE[0]
+CRITIC_COLOR = PLOT_PALETTE[-1]
+
+
+def categorical_colors(count, offset=0):
+    """Return exactly ``count`` colors drawn cyclically from the shared palette."""
+    return [PLOT_PALETTE[(int(offset) + index) % len(PLOT_PALETTE)] for index in range(int(count))]
+
+
 def configure_plot_bundle_saving(*, save_pdf=False, profile="dashboard",
                                  paper_width_inches=5.5, paper_width_kind="full",
                                  paper_column_gap_inches=0.12, include_patterns=None):
@@ -37,6 +55,15 @@ def configure_plot_bundle_saving(*, save_pdf=False, profile="dashboard",
     _PAPER_WIDTH_KIND = str(paper_width_kind)
     _PAPER_COLUMN_GAP_INCHES = float(paper_column_gap_inches)
     _INCLUDE_PATTERNS = tuple(str(value) for value in (include_patterns or ()))
+    mpl.rcParams["axes.prop_cycle"] = mpl.cycler(color=PLOT_PALETTE)
+    mpl.rcParams["font.family"] = ["Nimbus Roman", "serif"]
+    mpl.rcParams["font.serif"] = [
+        "Nimbus Roman", "DejaVu Serif",
+    ]
+    # STIX closely matches Times-style LaTeX mathematics; make math text italic
+    # unless an expression explicitly requests another style.
+    mpl.rcParams["mathtext.fontset"] = "stix"
+    mpl.rcParams["mathtext.default"] = "it"
 
 
 def configure_plot_bundle_saving_from_cfg(cfg):
@@ -118,7 +145,7 @@ def _paperize_figure(figure, paper_width_kind=None):
         legend = axis.get_legend()
         if legend is not None:
             for text_artist in legend.get_texts():
-                text_artist.set_fontsize(7.0)
+                text_artist.set_fontsize(6.5)
         for line in axis.lines:
             line.set_linewidth(min(float(line.get_linewidth()), 1.1))
             if line.get_marker() not in {None, "None", ""}:
@@ -127,7 +154,7 @@ def _paperize_figure(figure, paper_width_kind=None):
         # The creating plot owns legend placement and reserves its surrounding
         # margin. Paperization changes typography, not layout semantics.
         for text_artist in legend.get_texts():
-            text_artist.set_fontsize(7.0)
+            text_artist.set_fontsize(6.5)
 
 
 def titleless_plot_path(png_path):
@@ -328,6 +355,7 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
         arrays, axes = _artist_arrays(figure) if capture_artists else ({}, [])
         for key, value in (payload or {}).items():
             arrays[f"input_{key}"] = _safe_array(value)
+        supertitle = getattr(figure, "_suptitle", None)
         bundle_metadata = {
             "schema_version": 2,
             "figure_size_inches": list(map(float, figure.get_size_inches())),
@@ -336,6 +364,9 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
             "pdf": pdf_path.name if save_pdf else None,
             "npz": npz_path.name,
             "axes": axes,
+            "figure": {
+                "suptitle": None if supertitle is None else supertitle.get_text(),
+            },
             **(metadata or {}),
         }
         arrays["metadata_json"] = np.asarray(json.dumps(bundle_metadata, sort_keys=True))

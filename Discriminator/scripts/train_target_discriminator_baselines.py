@@ -15,7 +15,10 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
-    from .plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle
+    from .plot_bundles import (
+        CRITIC_COLOR, REFERENCE_COLOR, categorical_colors, all_plot_bundle_paths,
+        configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle,
+    )
     from .fake_matching_apply import match_raw, match_standardized
     from .fake_matching_checkpoint import binding_path, validate_binding, write_binding
     from .temporal_resampling import active_schedule, write_split_membership
@@ -35,7 +38,10 @@ try:
         select_era5_split,
     )
 except ImportError:
-    from plot_bundles import all_plot_bundle_paths, configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle
+    from plot_bundles import (
+        CRITIC_COLOR, REFERENCE_COLOR, categorical_colors, all_plot_bundle_paths,
+        configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle,
+    )
     from fake_matching_apply import match_raw, match_standardized
     from fake_matching_checkpoint import binding_path, validate_binding, write_binding
     from temporal_resampling import active_schedule, write_split_membership
@@ -583,14 +589,18 @@ def _logit_histogram_edges(values, bins=40):
     return np.histogram_bin_edges(combined, bins=max(2, int(bins)))
 
 
-def _plot_logit_histogram(reference, candidate, title, candidate_label, output_path, color="tab:red"):
+def _plot_logit_histogram(reference, candidate, title, candidate_label, output_path, color=CRITIC_COLOR):
     edges = _logit_histogram_edges([reference, candidate])
-    figure, axis = plt.subplots(figsize=(6.4, 4.0))
-    axis.hist(reference, bins=edges, density=True, histtype="stepfilled", color="tab:blue", alpha=0.35, label="ERA5 test")
+    figure, axis = plt.subplots(figsize=(6.4, 5.0), layout="constrained")
+    axis.hist(reference, bins=edges, density=True, histtype="stepfilled", color=REFERENCE_COLOR, alpha=0.35, label="ERA5 test")
     axis.hist(candidate, bins=edges, density=True, histtype="step", linewidth=2.0, color=color, label=candidate_label)
     axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
     axis.set(title=title, xlabel="Real-vs-fake logit", ylabel="Density")
-    axis.grid(alpha=0.25); axis.legend(); figure.tight_layout()
+    axis.grid(alpha=0.25)
+    axis.legend(
+        loc="upper center", bbox_to_anchor=(0.5, -0.20),
+        ncol=2, frameon=False, fontsize=7,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_figure_bundle(
         figure, output_path, plot_type="target_logit_histogram",
@@ -603,23 +613,29 @@ def _plot_logit_histogram_overlay(groups, title, output_path):
     edges = _logit_histogram_edges([value for group in groups for value in (group["reference"], group["candidate"])])
     legend_columns = 2
     legend_rows = int(np.ceil((len(groups) + 1) / legend_columns))
-    figure, axis = plt.subplots(figsize=(6.4, 4.6 + 0.5 * legend_rows))
+    figure = plt.figure(
+        figsize=(6.4, 5.2 + 0.65 * legend_rows), layout="constrained",
+    )
+    grid = figure.add_gridspec(
+        2, 1, height_ratios=[4.2, max(1.15, 0.55 * legend_rows)],
+    )
+    axis = figure.add_subplot(grid[0])
+    legend_axis = figure.add_subplot(grid[1])
+    legend_axis.set_axis_off()
     pooled_reference = np.concatenate([group["reference"] for group in groups])
-    axis.hist(pooled_reference, bins=edges, density=True, histtype="stepfilled", color="tab:blue", alpha=0.30, label="ERA5 test (pooled)")
-    colors = plt.cm.tab10(np.linspace(0.0, 1.0, len(groups)))
+    axis.hist(pooled_reference, bins=edges, density=True, histtype="stepfilled", color=REFERENCE_COLOR, alpha=0.30, label="ERA5 test (pooled)")
+    colors = categorical_colors(len(groups), offset=1)
     for color, group in zip(colors, groups):
         axis.hist(group["candidate"], bins=edges, density=True, histtype="step", linewidth=1.7, color=color, label=group["label"])
     axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
     axis.set(xlabel="Real-vs-fake logit", ylabel="Density")
     axis.grid(alpha=0.25)
     handles, labels = axis.get_legend_handles_labels()
-    figure.legend(
-        handles, labels, loc="lower center", ncol=legend_columns,
-        bbox_to_anchor=(0.5, 0.015), fontsize=8,
+    legend_axis.legend(
+        handles, labels, loc="center", ncol=legend_columns,
+        frameon=False, fontsize=7,
     )
     figure.suptitle(title)
-    bottom = min(0.18 + 0.055 * legend_rows, 0.46)
-    figure.subplots_adjust(left=0.14, right=0.98, bottom=bottom, top=0.84)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"bin_edges": edges, "pooled_reference_logits": pooled_reference}
     for index, group in enumerate(groups):
@@ -630,6 +646,29 @@ def _plot_logit_histogram_overlay(groups, title, output_path):
         figure, output_path, plot_type="target_logit_histogram_overlay", payload=payload,
         dpi=200, paper_width_kind="half",
     ); plt.close(figure)
+
+
+def _histogram_display_name(value):
+    names = {
+        "squeezenet": "SqueezeNet",
+        "squeezenet_equator_mask": "Equator-masked SqueezeNet",
+        "grf": "GRF noise",
+        "hf_noise": "High-frequency noise",
+        "checkerboard_2px": "2-pixel checkerboard",
+        "equatorial_checker_texture": "Equatorial checkerboard",
+        "hemisphere_splice": "Hemisphere splice",
+        "pixel_replace": "Pixel replacement",
+        "zonal_scanlines": "Zonal scanlines",
+        "meridional_scanlines": "Meridional scanlines",
+        "GraphCast": "GraphCast",
+        "Pangu-Weather": "Pangu-Weather",
+        "FuXi": "FuXi",
+        "IFS HRES": "IFS HRES",
+        "ERA5 Forecast": "ERA5 Forecast",
+        "UCast member 0": "UCast member 0",
+        "SWIFT": "SWIFT",
+    }
+    return names.get(str(value), str(value).replace("_", " ").title())
 
 
 def plot_target_test_logit_histograms(model, architecture, kind, label, test_real, test_fake, records,
@@ -649,11 +688,11 @@ def plot_target_test_logit_histograms(model, architecture, kind, label, test_rea
                                    maximum_severity=maximum_severity, selected_indices=selected)
             name = f"severity={severity:.3g}"
             path = root / f"severity_{severity:.3g}.png"
-            _plot_logit_histogram(reference, candidate, f"{architecture}: {label} ({name})", label, path)
+            _plot_logit_histogram(reference, candidate, f"{_histogram_display_name(label)}: {name} ({_histogram_display_name(architecture)})", label, path)
             groups.append({"label": name, "reference": reference, "candidate": candidate,
                            "path": profiled_plot_path(path)})
         overlay_path = root / "all_corruption_strengths.png"
-        _plot_logit_histogram_overlay(groups, f"{architecture}: {label} — all corruption strengths", overlay_path)
+        _plot_logit_histogram_overlay(groups, f"{_histogram_display_name(label)}: all corruption strengths ({_histogram_display_name(architecture)})", overlay_path)
         overlay_path = profiled_plot_path(overlay_path)
     else:
         for lead_index, lead in enumerate(np.asarray(test_fake.prediction_timedelta.values).astype("timedelta64[h]").astype(int)):
@@ -673,12 +712,12 @@ def plot_target_test_logit_histograms(model, architecture, kind, label, test_rea
             )
             name = f"+{int(lead)}h"
             path = root / f"lead_{int(lead):03d}h.png"
-            _plot_logit_histogram(reference, candidate, f"{architecture}: {label} ({name})", label, path)
+            _plot_logit_histogram(reference, candidate, f"{_histogram_display_name(label)}: {name} ({_histogram_display_name(architecture)})", label, path)
             groups.append({"label": name, "reference": reference, "candidate": candidate,
                            "path": profiled_plot_path(path)})
         overlay_path = root / "all_lead_times.png"
         if groups:
-            _plot_logit_histogram_overlay(groups, f"{architecture}: {label} — all lead times", overlay_path)
+            _plot_logit_histogram_overlay(groups, f"{_histogram_display_name(label)}: all lead times ({_histogram_display_name(architecture)})", overlay_path)
             overlay_path = profiled_plot_path(overlay_path)
     return [group["path"] for group in groups] + ([overlay_path] if groups else [])
 
@@ -835,7 +874,7 @@ def plot_sfno_representation_ratio(rows, architecture, kind, label, output_path)
         "block7_pre_projection": "Block 7 pre-projection (34×31×60)",
         "pooled_embedding": "Pooled 8-channel embedding",
     }
-    colors = {layer: color for layer, color in zip(layer_order, plt.cm.tab10.colors)}
+    colors = {layer: color for layer, color in zip(layer_order, categorical_colors(len(layer_order)))}
     markers = ("o", "s", "^", "v", "D")
     for layer_index, layer in enumerate(layer_order):
         layer_rows = [row for row in rows if row.get("representation_layer", "pooled_embedding") == layer]
@@ -915,8 +954,9 @@ def create_interpretability_gallery(
             np.concatenate([np.abs(row[2].sum(axis=0)).ravel() for row in rows]), 99.0
         )), np.finfo(np.float32).eps)
         figure, axes = plt.subplots(
-            len(rows), 2, figsize=(10.5, max(2.4 * len(rows), 5.0)),
+            len(rows), 2, figsize=(10.5, max(2.65 * len(rows), 5.0)),
             subplot_kw={"projection": projection}, squeeze=False,
+            layout="constrained",
         )
         physical_artist = relevance_artist = None
         for row_index, (case, physical, attribution, diagnostics) in enumerate(rows):
@@ -930,16 +970,27 @@ def create_interpretability_gallery(
                 cmap="RdBu_r", vmin=-relevance_limit, vmax=relevance_limit, transform=projection, rasterized=True,
             )
             _title_interpretability_case(axes[row_index, 0], case, diagnostics)
-            axes[row_index, 1].set_title("Signed integrated gradients (positive supports ERA5)", fontsize=8)
             for axis in axes[row_index]:
                 axis.coastlines(linewidth=0.45); axis.set_global()
             metadata_rows.append(_interpretability_metadata(
                 case, diagnostics, architecture, kind, target, output_path, "standardized_zero", variables, attribution,
             ))
-        figure.suptitle(f"{architecture}: {kind}/{target} — held-out logit cases", fontsize=12)
-        figure.subplots_adjust(top=0.94, bottom=0.12, left=0.03, right=0.97, hspace=0.32, wspace=0.12)
-        figure.colorbar(physical_artist, cax=figure.add_axes([0.08, 0.035, 0.36, 0.015]), orientation="horizontal", label=f"{variables[0]} (physical units)")
-        figure.colorbar(relevance_artist, cax=figure.add_axes([0.56, 0.035, 0.36, 0.015]), orientation="horizontal", label="Integrated-gradient attribution")
+        figure.suptitle(
+            f"{architecture.replace('_', ' ').title()}: {kind} / "
+            f"{str(target).replace('_', ' ')} held-out logit cases\n"
+            "Signed IG: positive values support ERA5",
+            fontsize=12,
+        )
+        figure.colorbar(
+            physical_artist, ax=list(axes[:, 0]), orientation="horizontal",
+            fraction=0.025, pad=0.025, aspect=45,
+            label=f"{variables[0]} (physical units)",
+        )
+        figure.colorbar(
+            relevance_artist, ax=list(axes[:, 1]), orientation="horizontal",
+            fraction=0.025, pad=0.025, aspect=45,
+            label="Integrated-gradient attribution",
+        )
     else:
         if list(variables) != SFNO_VARIABLES:
             raise ValueError("SFNO interpretability requires the fixed four-field channel order.")
@@ -1001,6 +1052,18 @@ def create_interpretability_gallery(
             "logits": np.asarray([row[0]["logit"] for row in rows]),
             "true_classes": np.asarray([row[0]["true_class"] for row in rows]),
             "selections": np.asarray([row[0]["selection"] for row in rows]),
+            "times": np.asarray([str(row[0].get("time", "")) for row in rows]),
+            "lead_hours": np.asarray([
+                np.nan if row[0].get("lead_hour") is None else float(row[0]["lead_hour"])
+                for row in rows
+            ]),
+            "severities": np.asarray([
+                np.nan if row[0].get("severity") is None else float(row[0]["severity"])
+                for row in rows
+            ]),
+            "completeness_residuals": np.asarray([
+                float(row[3]["completeness_residual"]) for row in rows
+            ]),
         }, dpi=int(settings.get("figure_dpi", 140)), bbox_inches="tight",
         capture_artists=False,
     )
@@ -1096,15 +1159,24 @@ def create_sfno_representation_magnitude_gallery(model, cases, dataset, output_p
 
 def _title_interpretability_case(axis, case, diagnostics):
     predicted = "real" if case["logit"] >= 0.0 else "fake"
-    details = [case.get("time"),
-               "+{}h".format(case.get("lead_hour")) if case.get("lead_hour") is not None else None,
-               "severity={:.4g}".format(case.get("severity")) if case.get("severity") is not None else None]
-    details = ", ".join(str(value) for value in details if value)
+    details = [
+        case.get("time"),
+        "+{} h".format(case.get("lead_hour"))
+        if case.get("lead_hour") is not None else None,
+        "severity {:.4g}".format(case.get("severity"))
+        if case.get("severity") is not None else None,
+    ]
+    context = " | ".join(str(value) for value in details if value)
     axis.set_title(
-        "{} {} | logit={:.3f} → classified {}\n{} | IG residual={:.2e}".format(
-            case["true_class"].upper(), case["selection"], case["logit"], predicted.upper(),
-            details or "no temporal/corruption context", diagnostics["completeness_residual"],
-        ), fontsize=8, loc="left",
+        "{} / {} | logit {:+.3f} | predicted {}\n{}".format(
+            case["true_class"].upper(),
+            str(case["selection"]).replace("_", " "),
+            case["logit"],
+            predicted.upper(),
+            context or "No temporal/corruption context",
+        ),
+        fontsize=7,
+        loc="left",
     )
 
 

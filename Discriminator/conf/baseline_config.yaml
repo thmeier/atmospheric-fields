@@ -29,16 +29,33 @@ plotting:
     architecture: squeezenet
     corruptions:
       - gaussian_blur
-      - grf
+      - hf_noise
       - checkerboard_2px
-      - zonal_scanlines
       - hemisphere_splice
+      - field_splice
+    # Used in order when a requested critic was excluded by its validity check.
+    fallback_corruptions:
+      - hf_noise
+      - field_splice
+      - wind_patch_shuffle
+      - pixel_replace
+  # Compact appendix gallery: the five corruptions in the main comparison at
+  # identity, midpoint, and maximum configured strength. Per-corruption
+  # diagnostic galleries retain every evaluated severity.
+  corruption_gallery:
+    corruptions: ${plotting.main_corruption_figure.corruptions}
+    severity_count: 3
+
   # One panel per manuscript forecast model, with all held-out lead-time logit
   # distributions overlaid against the corresponding ERA5 test distribution.
   logit_histogram_gallery:
     enabled: true
     architecture: squeezenet
     resample_id: learned_04
+    individual_models: true
+    # Keep the preferred manuscript ordering, then append every other forecast
+    # target for which held-out per-sample logits are available.
+    include_all_available: true
     models:
       - GraphCast
       - Pangu-Weather
@@ -57,6 +74,8 @@ baseline:
 
   # Per-model maximum coverage. Each forecast is evaluated only at configured
   # valid-time test days and paired to ERA5 at that exact timestamp.
+  # Disable for corruption-only standard-metric runs; the ERA5 null is retained.
+  evaluate_forecasts: true
   forecast_files:
     "GraphCast":
       - "${data_dir}/graphcast_6steps_surf_1.5deg_2020-01-01_2020-12-31.nc"

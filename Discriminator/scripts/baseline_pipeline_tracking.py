@@ -1,6 +1,7 @@
 """Small W&B adapter shared by baseline pipeline stages."""
 
 import csv
+import hashlib
 import os
 import re
 import shutil
@@ -36,6 +37,15 @@ def safe_name(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-") or "unnamed"
 
 
+
+def wandb_tag(value, maximum=64):
+    """Bound a W&B tag deterministically while retaining collision resistance."""
+    value = str(value)
+    if len(value) <= int(maximum):
+        return value
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+    return f"{value[:int(maximum) - len(digest) - 1]}-{digest}"
+
 def parsed_csv_value(value):
     if value == "":
         return None
@@ -56,7 +66,7 @@ class PipelineTracker:
         self.project = str(settings.get("project", "weather-discriminator-baselines"))
         self.entity = settings.get("entity")
         self.group = str(pipeline_id)
-        self.tags = [str(tag) for tag in settings.get("tags", [])]
+        self.tags = [wandb_tag(tag) for tag in settings.get("tags", [])]
         self.pipeline_alias = safe_name(pipeline_id)
         run_dir = cfg.pipeline.get("run_dir")
         self.run_dir = None if run_dir is None else Path(str(run_dir))
@@ -105,7 +115,10 @@ class PipelineTracker:
             group=self.group,
             job_type=str(job_type),
             name=f"{self.pipeline_alias}/{name}",
-            tags=self.tags + [f"pipeline:{self.pipeline_alias}"] + [str(tag) for tag in (tags or [])],
+            tags=(
+                self.tags + [wandb_tag(f"pipeline:{self.pipeline_alias}")]
+                + [wandb_tag(tag) for tag in (tags or [])]
+            ),
             config=config,
             mode=self.mode,
             save_code=True,

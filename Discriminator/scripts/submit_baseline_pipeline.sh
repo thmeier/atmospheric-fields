@@ -44,12 +44,16 @@ conda activate "${CONDA_ENV_NAME}"
 export PYTHONUNBUFFERED=1
 export DATA_DIR="${DATA_DIR:-/cluster/courses/pmlr/teams/team07/data}"
 export SFNO_REPO="${SFNO_REPO:-${HOME}/SFNO-Embedding}"
+# /cluster/courses is read-only from compute nodes even when its login-node
+# permissions appear writable. Keep pipeline artifacts on per-user scratch.
+export PIPELINE_RUNS_DIR="${PIPELINE_RUNS_DIR:-/work/scratch/${USER}/baseline_pipeline_runs}"
 
 cd "${REPO_DIR}"
 
 echo "Baseline pipeline job ${SLURM_JOB_ID:-unknown} on $(hostname)"
 echo "DATA_DIR=${DATA_DIR}"
 echo "SFNO_REPO=${SFNO_REPO}"
+echo "PIPELINE_RUNS_DIR=${PIPELINE_RUNS_DIR}"
 nvidia-smi || true
 
 python scripts/run_baseline_pipeline.py "$@"

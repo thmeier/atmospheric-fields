@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from Discriminator.scripts.baseline_pipeline_tracking import (
     PipelineTracker,
     parsed_csv_value,
+    wandb_tag,
     safe_name,
 )
 from Discriminator.scripts.run_baseline_pipeline import (
@@ -49,9 +50,10 @@ class BaselinePipelineTests(unittest.TestCase):
     def test_plot_does_not_require_optional_discriminator_results(self):
         cfg = pipeline_config(Path("/tmp"), ["plot"])
         cfg.baseline.discriminator = {"enabled": True}
-        cfg.baseline.metrics = ["mean_bias"]
+        cfg.baseline.metrics = ["mean_bias", "scwd"]
         paths = plot_input_paths(cfg, Path("/tmp/fixture"))
         self.assertNotIn(Path("/tmp/fixture/data/discriminator_reverse_kl.csv"), paths)
+        self.assertNotIn(Path("/tmp/fixture/data/scwd_anchor_contributions.nc"), paths)
 
     def test_stages_are_validated_and_run_in_canonical_order(self):
         cfg = pipeline_config(Path("/tmp"), ["plot", "train_discriminators"])
@@ -179,6 +181,11 @@ class BaselinePipelineTests(unittest.TestCase):
     def test_wandb_names_and_csv_values_are_stable(self):
         self.assertEqual(safe_name("train/GraphCast +6h"), "train-GraphCast-6h")
         self.assertEqual(parsed_csv_value("7"), 7)
+        long_tag = "pipeline:" + "descriptive-pipeline-name-" * 4
+        bounded = wandb_tag(long_tag)
+        self.assertEqual(len(bounded), 64)
+        self.assertEqual(bounded, wandb_tag(long_tag))
+        self.assertNotEqual(bounded, wandb_tag(long_tag + "different"))
         self.assertEqual(parsed_csv_value("0.25"), 0.25)
         self.assertIs(parsed_csv_value("false"), False)
         self.assertEqual(parsed_csv_value("GraphCast"), "GraphCast")

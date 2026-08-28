@@ -146,19 +146,22 @@ class FullStatisticsBaselineTest(unittest.TestCase):
         self.assertEqual(display_metric_value(row, "mean_bias"), 3.5)
         self.assertEqual(display_metric_value(row, "std_ratio_error"), 0.25)
         self.assertEqual(display_metric_value(row, "scwd"), -1.5)
-        self.assertEqual(displayed_metric_name("mean_bias"), "|mean_bias|")
-        self.assertEqual(displayed_metric_name("std_ratio_error"), "|std_ratio_error|")
+        self.assertEqual(displayed_metric_name("mean_bias"), "|Mean bias|")
+        self.assertEqual(displayed_metric_name("std_ratio_error"), "|Std. ratio error|")
+        self.assertEqual(displayed_metric_name("mmd_rbf"), "RBF MMD")
+        self.assertEqual(displayed_metric_name("scwd"), "SCWD")
 
     def test_corruption_coordinates_span_one_per_native_range(self):
         blur = [{"severity": 0.0}, {"severity": 0.5}, {"severity": 1.0}]
         pixels = [{"severity": 0.0}, {"severity": 0.025}, {"severity": 0.05}]
         self.assertEqual(relative_corruption_coordinates(blur, "severity"), [0.0, 0.5, 1.0])
         self.assertEqual(relative_corruption_coordinates(pixels, "severity"), [0.0, 0.5, 1.0])
-        self.assertEqual(corruption_range_label("pixel_replace", pixels, "severity"), "pixel_replace [0, 0.05]")
+        self.assertEqual(corruption_range_label("pixel_replace", pixels, "severity"), "Pixel replace (0.05)")
 
     def test_evaluation_only_metrics_are_not_selected_for_standard_plots(self):
         metrics = ["mean_bias", "crps_like_field_energy", "sliced_wasserstein",
-                   "sliced_wasserstein_lon_corrected", "zonal_energy_spectrum_l2", "scwd"]
+                   "sliced_wasserstein_lon_corrected", "zonal_energy_spectrum_l2",
+                   "scwd_area_weighted", "scwd"]
         self.assertEqual(plotted_metric_names(metrics), ["scwd"])
         self.assertEqual(standalone_metric_names(metrics), ["mean_bias", "scwd"])
 

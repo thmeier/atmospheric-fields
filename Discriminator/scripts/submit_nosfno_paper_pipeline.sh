@@ -23,7 +23,7 @@ source "${CONDA_SH}"
 conda activate "${CONDA_ENV_NAME}"
 export PYTHONUNBUFFERED=1
 export DATA_DIR="${DATA_DIR:-/cluster/courses/pmlr/teams/team07/data}"
-export PIPELINE_RUNS_DIR="${PIPELINE_RUNS_DIR:-$(dirname "${DATA_DIR}")/baseline_pipeline_runs}"
+export PIPELINE_RUNS_DIR="${PIPELINE_RUNS_DIR:-/work/scratch/${USER}/baseline_pipeline_runs}"
 cd "${REPO_DIR}"
 python scripts/run_baseline_pipeline.py \
   "pipeline.id=nosfno-paper-${SLURM_JOB_ID:-local}" \

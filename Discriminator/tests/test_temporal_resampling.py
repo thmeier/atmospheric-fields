@@ -9,7 +9,9 @@ from omegaconf import OmegaConf
 from Discriminator.scripts.analyze_temporal_resamples import (
     compare_null_to_coordinate, reconstruct_scores_from_terms,
 )
-from Discriminator.scripts.temporal_resampling_pipeline import _canonical_first
+from Discriminator.scripts.temporal_resampling_pipeline import (
+    _canonical_first, _equalize_discriminator_term_counts,
+)
 from Discriminator.scripts.temporal_resampling import (
     TemporalSchedule, aggregate_draws, fixed_schedules, learned_schedules, schedule_mask, write_csv_gz,
 )
@@ -94,13 +96,46 @@ class TemporalResamplingTests(unittest.TestCase):
             self.assertEqual(result["null_exceeding_count"], 3)
             self.assertEqual(result["null_count"], 5)
 
+    def test_discriminator_terms_are_equalized_to_cross_fold_minimum(self):
+        rows, terms = [], []
+        for fold, ep_values, candidate_values in (
+            ("learned_00", [1.0, 2.0, 3.0], [10.0, 20.0, 30.0, 40.0]),
+            ("learned_01", [4.0, 6.0], [50.0, 60.0]),
+        ):
+            common = {
+                "resample_id": fold, "architecture": "squeezenet",
+                "kind": "forecast", "target": "GraphCast",
+            }
+            rows.append({
+                **common, "source": "GraphCast", "x": "192.0",
+                "n_samples": str(len(candidate_values)),
+                "ep_n_samples": str(len(ep_values)), "score": "0",
+            })
+            terms.extend({
+                **common, "role": "ep_reference", "source": "ERA5 test",
+                "x": "", "sample_position": str(index),
+                "transformed_term": str(value),
+            } for index, value in enumerate(ep_values))
+            terms.extend({
+                **common, "role": "candidate", "source": "GraphCast",
+                "x": "192.0", "sample_position": str(index),
+                "transformed_term": str(value),
+            } for index, value in enumerate(candidate_values))
+
+        equalized_rows, equalized_terms = _equalize_discriminator_term_counts(rows, terms)
+        self.assertEqual([row["n_samples"] for row in equalized_rows], [2, 2])
+        self.assertEqual([row["ep_n_samples"] for row in equalized_rows], [2, 2])
+        self.assertEqual(len(equalized_terms), 8)
+        self.assertAlmostEqual(equalized_rows[0]["score"], -23.0)
+        self.assertAlmostEqual(equalized_rows[1]["score"], -50.0)
+
     def test_raw_terms_exactly_reconstruct_reverse_kl_draw(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "terms.csv.gz"
             common = {"resample_id": "learned_00", "architecture": "squeezenet",
                       "kind": "forecast", "target": "GraphCast"}
             terms = [
-                {**common, "role": "ep_train", "source": "ERA5 train", "x": "",
+                {**common, "role": "ep_reference", "source": "ERA5 test", "x": "",
                  "transformed_term": value} for value in (-2.0, -4.0)
             ] + [
                 {**common, "role": "candidate", "source": "GraphCast", "x": 12,

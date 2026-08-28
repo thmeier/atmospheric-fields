@@ -233,13 +233,13 @@ def plot_input_paths(cfg, output_root):
     Target-discriminator results are optional: the plotter renders them when
     present, but standard-only evaluation must not require their CSV.
     """
-    paths = [
+    # Per-anchor SCWD and global-mean distribution diagnostics are optional
+    # enrichment artifacts. The curve CSVs remain sufficient for the main
+    # comparison plots and allow a later plotting-only rerun of older runs.
+    return [
         output_root / "data" / "lead_time.csv",
         output_root / "data" / "corruption_strength.csv",
     ]
-    if "scwd" in metric_names_from_config(cfg):
-        paths.append(output_root / "data" / "scwd_anchor_contributions.nc")
-    return paths
 
 
 def changed_plot_paths(output_root, before):

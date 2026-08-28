@@ -20,7 +20,7 @@ def reconstruct_scores_from_terms(path):
     candidates = {}
     for row in records:
         base = (row["resample_id"], row["architecture"], row["kind"], row["target"])
-        if row["role"] == "ep_train":
+        if row["role"] in {"ep_reference", "ep_train"}:
             ep.setdefault(base, []).append(float(row["transformed_term"]))
         else:
             key = (*base, row["source"], float(row["x"]))

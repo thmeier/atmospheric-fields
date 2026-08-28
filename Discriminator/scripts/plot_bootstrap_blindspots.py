@@ -39,7 +39,7 @@ except ImportError:
 # Column identity, established by reproducing the published table against the
 # shipped single null: these four choices match it 9/9, 9/9, 8/9 and 9/9.
 TABLE_COLUMNS = [
-    ("SCWD", "scwd_area_weighted"),
+    ("SCWD", "scwd"),
     ("Mean WD", "global_mean_wasserstein"),
     ("Zonal spec.", "zonal_energy_spectrum_log_l2"),
     ("Raw MMD", "mmd_rbf"),
