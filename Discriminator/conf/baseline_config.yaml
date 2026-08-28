@@ -40,11 +40,11 @@ plotting:
       - wind_patch_shuffle
       - pixel_replace
   # Compact appendix gallery: the five corruptions in the main comparison at
-  # identity, midpoint, and maximum configured strength. Per-corruption
+  # identity, two interior points, and maximum configured strength. Per-corruption
   # diagnostic galleries retain every evaluated severity.
   corruption_gallery:
     corruptions: ${plotting.main_corruption_figure.corruptions}
-    severity_count: 3
+    severity_count: 4
 
   # One panel per manuscript forecast model, with all held-out lead-time logit
   # distributions overlaid against the corresponding ERA5 test distribution.
