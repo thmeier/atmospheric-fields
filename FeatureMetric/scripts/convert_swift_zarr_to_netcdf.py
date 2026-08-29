@@ -70,30 +70,37 @@ def prepare_swift_forecasts(dataset, variables=SURFACE_VARIABLES, lead_hour_valu
     return selected.transpose("time", "prediction_timedelta", "latitude", "longitude")
 
 
-def sample_oriented_netcdf_encoding(dataset, compression_level=4):
-    """Return chunks suited to the pipeline's random ``(time, lead)`` reads.
+def forecast_encoding(dataset, compression_level):
+    """Storage layout tuned for how the pipeline actually reads these files.
 
-    A training sample contains the complete latitude/longitude grid for one
-    initialization and one lead. Keeping those two axes at chunk size one
-    prevents a single sample read from decompressing hundreds of unrelated
-    times and leads, while retaining each spatial field as one contiguous
-    chunk.
+    Every consumer reads one (time, lead) field at a time, in shuffled order.
+    Compressed variables whose chunks span many timesteps make that pathological:
+    the first SWIFT export used zlib with HDF5's auto-chosen [244, 2, 41, 80]
+    chunks, so a single field read decompressed chunks covering 244 timesteps,
+    and discriminator training ran at 7.8 s/step against 0.16 s/step for the
+    uncompressed GraphCast file -- a ~49x penalty for a ~25% space saving.
+
+    So default to uncompressed and contiguous, matching the other forecast files.
+    When compression is explicitly requested, chunk one timestep and lead at a
+    time so a read decompresses exactly the field it asked for.
     """
-    chunksizes = (
-        1,
-        1,
-        int(dataset.sizes["latitude"]),
-        int(dataset.sizes["longitude"]),
-    )
-    return {
-        variable: {
-            "zlib": int(compression_level) > 0,
-            "complevel": int(compression_level),
-            "shuffle": True,
-            "chunksizes": chunksizes,
+    encoding = {}
+    for variable in dataset.data_vars:
+        array = dataset[variable]
+        if compression_level <= 0:
+            encoding[variable] = {"zlib": False, "complevel": 0, "contiguous": True}
+            continue
+        sizes = [1 if dimension in ("time", "prediction_timedelta") else array.sizes[dimension]
+                 for dimension in array.dims]
+        encoding[variable] = {
+            "zlib": True, "complevel": compression_level, "chunksizes": tuple(sizes),
         }
-        for variable in dataset.data_vars
-    }
+    return encoding
+
+
+def sample_oriented_netcdf_encoding(dataset, compression_level=4):
+    """Backward-compatible name for the sample-oriented forecast encoding."""
+    return forecast_encoding(dataset, int(compression_level))
 
 
 def convert_swift_zarr(input_path, output_path, variables=SURFACE_VARIABLES, lead_hour_values=None,
@@ -111,7 +118,7 @@ def convert_swift_zarr(input_path, output_path, variables=SURFACE_VARIABLES, lea
     try:
         converted = prepare_swift_forecasts(dataset, variables, lead_hour_values, member)
         print(f"Writing {dict(converted.sizes)}; leads={lead_hours(converted.prediction_timedelta.values).tolist()} h")
-        encoding = sample_oriented_netcdf_encoding(converted, compression_level)
+        encoding = forecast_encoding(converted, int(compression_level))
         temporary_output = output_path.with_name(f".{output_path.name}.partial")
         try:
             temporary_output.unlink(missing_ok=True)
@@ -132,8 +139,9 @@ def main():
     parser.add_argument("--lead-hours", type=int, nargs="+", default=None,
                         help="Forecast leads to retain. Defaults to every available lead.")
     parser.add_argument("--member", type=int, default=0, help="Ensemble member to export (default: 0)")
-    parser.add_argument("--compression-level", type=int, default=4,
-                        help="NetCDF zlib compression level, 0–9 (default: 4)")
+    parser.add_argument("--compression-level", type=int, default=0,
+                        help="NetCDF zlib compression level, 0-9 (default: 0, uncompressed). "
+                             "Non-zero chunks per timestep so reads stay cheap.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output file")
     arguments = parser.parse_args()
     if not 0 <= arguments.compression_level <= 9:

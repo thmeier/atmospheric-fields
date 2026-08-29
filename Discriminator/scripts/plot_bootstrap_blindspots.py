@@ -123,6 +123,11 @@ def curve_table(curves, metrics):
 
 
 def null_table(draws, metrics, scheme="day_partition"):
+    """Null draws under one sampling scheme, in display convention.
+
+    `blindspots_from_temporal_draws` writes the same schema under its own
+    scheme name, so the summary carries the prefix rather than assuming it.
+    """
     return {
         name: displayed(name, [float(r[f"{scheme}__{name}"]) for r in draws])
         for name in metrics
@@ -375,7 +380,7 @@ def plot_bootstrap_blindspots(cfg):
     summary, curves, draws, verdicts = load_outputs(data_root)
     metrics = summary["metrics"]
     table = curve_table(curves, metrics)
-    nulls = null_table(draws, metrics)
+    nulls = null_table(draws, metrics, summary.get("null_scheme", "day_partition"))
 
     figure_path = output_root / "plots" / "corruption_by_type_bootstrap_null.png"
     paths = render_figure(table, nulls, summary, figure_path, P.joint_variable_name(variables))
@@ -419,6 +424,8 @@ def report(verdicts, summary):
             "Re-derive that cell before publishing."
         )
     print("The 'Ours' column in blindspot_table.tex is carried over, not re-derived.")
+    if summary.get("null_definition"):
+        print(f"Null: {summary['null_definition']}.")
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="baseline_config")

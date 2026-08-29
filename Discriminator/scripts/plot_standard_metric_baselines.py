@@ -67,7 +67,7 @@ try:
     )
     from .fake_matching_apply import match_standardized
     from .fake_matching_checkpoint import validate_binding
-    from .temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
+    from .temporal_resampling import active_schedule, settings, file_sha256, write_csv_gz, write_split_membership
     from .corruptions import U10_CHANNEL, V10_CHANNEL
     from .train_discriminator import (
         WeatherDiscriminator,
@@ -90,7 +90,7 @@ except ImportError:
     )
     from fake_matching_apply import match_standardized
     from fake_matching_checkpoint import validate_binding
-    from temporal_resampling import active_schedule, file_sha256, write_csv_gz, write_split_membership
+    from temporal_resampling import active_schedule, settings, file_sha256, write_csv_gz, write_split_membership
     from corruptions import U10_CHANNEL, V10_CHANNEL
     from train_discriminator import (
         WeatherDiscriminator,
@@ -5472,7 +5472,8 @@ def evaluate_standard_metrics(cfg):
         corruption_rows, metric_names, corruption_path, "corruption_strength"
     )
     schedule = active_schedule(cfg)
-    retain_diagnostics = schedule is None or schedule.ordinal == 4
+    canonical_ordinal = min(4, int(settings(cfg).get("fixed_replicates", 50)) - 1)
+    retain_diagnostics = schedule is None or schedule.ordinal == canonical_ordinal
     if retain_diagnostics:
         write_scwd_anchor_diagnostics(
             null_scwd_diagnostics + scwd_diagnostics + corruption_scwd_diagnostics, output_root

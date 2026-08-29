@@ -234,5 +234,20 @@ class PipelineTracker:
         if not self.enabled or not records:
             return
         columns = sorted({column for record in records for column in record})
-        data = [[record.get(column) for column in columns] for record in records]
+        # wandb.Table infers one type per column and rejects rows that disagree.
+        # Interpretability rows mix types within a column -- lead_hour is an int for
+        # forecast cases but None/"" for cases with no lead context, and severity is
+        # a float for corruptions but "" for forecasts -- which trips a "Number not
+        # assignable to None or String" error. Coerce any column that carries a
+        # string to strings throughout (keeping None as None); purely numeric or
+        # all-None columns are left untouched.
+        stringify = {
+            column for column in columns
+            if any(isinstance(record.get(column), str) for record in records)
+        }
+        def cell(column, value):
+            if value is None or column not in stringify:
+                return value
+            return str(value)
+        data = [[cell(column, record.get(column)) for column in columns] for record in records]
         run.log({str(key): self._wandb.Table(columns=columns, data=data)})
