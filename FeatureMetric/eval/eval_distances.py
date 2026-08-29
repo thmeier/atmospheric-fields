@@ -1,3 +1,5 @@
+"""Frechet Distance and MMD vs. corruption severity in encoder latent space."""
+
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

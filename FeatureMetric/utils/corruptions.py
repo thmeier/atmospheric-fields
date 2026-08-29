@@ -1,3 +1,10 @@
+"""Synthetic corruptions for self-supervised evaluation.
+
+A parallel copy lives at Discriminator/scripts/corruptions.py with blur-floor
+remapping and mean-preservation additions; this copy adds spectral-lowpass
+filtering and contrastive corruption sampling.
+"""
+
 import torch
 import scipy.ndimage as ndimage
 import numpy as np

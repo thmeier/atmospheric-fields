@@ -1,3 +1,5 @@
+"""Linear probe: regress corruption severity from frozen encoder latents."""
+
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

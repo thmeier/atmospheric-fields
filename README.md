@@ -31,10 +31,10 @@ classifier logit is then used directly as a realism score.
   weather-channel input).
 - Hydra-based configuration, with CSV or Weights and Biases logging.
 - Analyses: logit versus forecast lead time, logit versus corruption severity, leave-one-model-out
-  k-fold for numerical-model comparisons, and poster figures.
+  k-fold for numerical-model comparisons, and paper figures.
 
-Refer to [`Discriminator/README.md`](Discriminator/README.md) for the full pipeline,
-configuration options, and poster reproduction.
+Refer to [`Discriminator/README.md`](Discriminator/README.md) for the full pipeline
+and configuration options.
 
 ### FeatureMetric: self-supervised latent-space metric
 
