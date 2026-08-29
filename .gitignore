@@ -59,6 +59,13 @@ sfno_8c_31x60_code_and_weights/
 # U-Cast evaluation working log + its raw logs/figures (local working notes)
 ucast_eval/
 
+# Local working notes and AI tool config
+CLAUDE.md
+AGENTS.md
+HANDOFF-*.md
+.claude/
+figures/
+
 # job / run logs (complements *.out above)
 *.log
 *.err
