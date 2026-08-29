@@ -11,52 +11,30 @@ as the reference "real" distribution, and validated against machine-learning wea
 forecasts (Pangu-Weather, GraphCast, FuXi, and others) as well as a suite of
 physically-motivated synthetic corruptions.
 
-The canonical experiments, including the baseline pipeline, use the same four 1.5-degree surface fields by default; some diagnostic configurations deliberately select a single field: `2m_temperature`,
-`10m_u_component_of_wind`, `10m_v_component_of_wind`, and `mean_sea_level_pressure`.
+The canonical experiments, including the baseline pipeline, use the same four 1.5-degree
+surface fields by default: `2m_temperature`, `10m_u_component_of_wind`,
+`10m_v_component_of_wind`, and `mean_sea_level_pressure`.
 
-## Two complementary directions
+## Approach
 
-The project investigates two independent approaches to the same problem. Each lives in its
-own top-level directory with a dedicated README, scripts, and configuration.
+A binary classifier (the *discriminator*) is trained to separate real ERA5 fields
+(label 1) from fakes (label 0), where fakes consist of ML weather forecasts and
+synthetically corrupted fields. The raw classifier logit serves as the realism score.
 
-### Discriminator: supervised adversarial discriminator
-
-See [`Discriminator/`](Discriminator/).
-
-A binary classifier is trained to separate real ERA5 fields (label 1) from fakes (label 0),
-where fakes consist of machine-learning forecasts and synthetically corrupted fields. The raw
-classifier logit is then used directly as a realism score.
-
-- Backbones: ResNet18 and SqueezeNet (torchvision, ImageNet initialization, adapted for the
-  weather-channel input).
+- Backbones: ResNet18 and SqueezeNet (torchvision, ImageNet initialization, adapted for
+  the weather-channel input).
 - Hydra-based configuration, with CSV or Weights and Biases logging.
-- Analyses: logit versus forecast lead time, logit versus corruption severity, leave-one-model-out
-  k-fold for numerical-model comparisons, and paper figures.
+- Analyses: logit versus forecast lead time, logit versus corruption severity,
+  leave-one-model-out k-fold for numerical-model comparisons, and paper figures.
 
 Refer to [`Discriminator/README.md`](Discriminator/README.md) for the full pipeline
 and configuration options.
-
-### FeatureMetric: self-supervised latent-space metric
-
-See [`FeatureMetric/`](FeatureMetric/).
-
-Two self-supervised encoders, a Masked Autoencoder (MAE) and I-JEPA, are trained on ERA5 without
-labels. Realism is then measured in the encoders' latent space rather than from a trained
-classifier:
-
-- Protocol 1 (linear probe): regress corruption severity from frozen latents and report R-squared.
-- Protocol 2 (distribution distance): Frechet Distance and Maximum Mean Discrepancy between a clean
-  reference latent distribution and corrupted or forecast distributions across a severity ladder.
-- Temporal variants (`none`, `diff`, `concat`, `phase`) inject time-difference dynamics so the
-  metric can react to forecast-specific artifacts rather than static state alone.
-
 
 ## Repository layout
 
 ```
 .
-├── Discriminator/     adversarial discriminator direction (supervised)
-├── FeatureMetric/     self-supervised encoder direction (MAE and I-JEPA)
+├── Discriminator/     discriminator pipeline (training, evaluation, plotting)
 ├── download/          shared data-download utilities (ERA5 and forecasts from WeatherBench2)
 ├── .gitignore
 └── README.md
@@ -93,14 +71,8 @@ Each team member uses their own conda environment (Python 3.12):
 conda create -n pmlr python=3.12 -y && conda activate pmlr
 ```
 
-Install dependencies. The FeatureMetric direction pins its requirements:
-
-```bash
-conda install --file FeatureMetric/requirements.txt
-```
-
-The Discriminator direction additionally uses PyTorch Lightning, torchvision, and Hydra. See
-[`Discriminator/README.md`](Discriminator/README.md) for its specific requirements.
+The Discriminator direction uses PyTorch Lightning, torchvision, and Hydra. See
+[`Discriminator/README.md`](Discriminator/README.md) for specific requirements.
 
 ### Cluster access
 
@@ -116,5 +88,4 @@ and create the `pmlr` environment as described above.
 | Task | Location |
 |------|----------|
 | Train or evaluate the discriminator | [`Discriminator/README.md`](Discriminator/README.md) |
-| Train MAE or I-JEPA encoders and run the latent-space probes and distances | [`FeatureMetric/README.md`](FeatureMetric/README.md) |
 | Download ERA5 or forecast data | [`download/`](download/) |

@@ -1,9 +1,4 @@
-"""Synthetic corruptions for the discriminator pipeline.
-
-A parallel copy lives at FeatureMetric/utils/corruptions.py with spectral-lowpass
-and contrastive-sampling additions; this copy adds blur-floor remapping and
-mean-preservation logic.
-"""
+"""Synthetic corruptions for the discriminator pipeline."""
 
 import torch
 import scipy.ndimage as ndimage
