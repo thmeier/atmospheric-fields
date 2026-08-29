@@ -20,8 +20,8 @@ _PAPER_COLUMN_GAP_INCHES = 0.12
 _INCLUDE_PATTERNS = ()
 
 
-# Shared categorical palette for dashboard and manuscript plots. Series beyond
-# five reuse these colors and remain distinguishable through their markers.
+# Shared categorical palette for dashboard and manuscript plots. Model/metric
+# series reuse the four non-critic colors and remain distinguishable through markers.
 PLOT_PALETTE = (
     "#AD99FF",  # Soft Periwinkle
     "#030027",  # Prussian Blue
@@ -30,12 +30,68 @@ PLOT_PALETTE = (
     "#AB494B",  # Dusty Mauve
 )
 REFERENCE_COLOR = PLOT_PALETTE[0]
-CRITIC_COLOR = PLOT_PALETTE[-1]
+CANDIDATE_COLOR = PLOT_PALETTE[-1]
+# Reserve Prussian Blue for the learned critic throughout the paper. It is
+# intentionally excluded from automatically assigned model/metric colors.
+CRITIC_COLOR = PLOT_PALETTE[1]
+SERIES_PALETTE = (
+    PLOT_PALETTE[0], PLOT_PALETTE[2], PLOT_PALETTE[3], PLOT_PALETTE[4],
+)
+# Six distinct non-critic colors for the standard 6/12/24/48/96/192 h set.
+# Start from teal so the first outline does not duplicate the ERA5 fill.
+LEAD_TIME_PALETTE = (
+    PLOT_PALETTE[2], PLOT_PALETTE[3], PLOT_PALETTE[4],
+    "#C58F2A",  # Muted ochre
+    "#356859",  # Deep pine
+    PLOT_PALETTE[0],
+)
+
+
+MODEL_COLOR_OVERRIDES = {
+    "era5 forecast": "#030027",  # Prussian/midnight blue
+    "ucast member 0": "#C58F2A",  # Muted ochre
+    "ucast": "#C58F2A",
+    "swift": "#356859",  # Deep pine
+}
+
+MODEL_DISPLAY_NAMES = {
+    "ucast member 0": "UCast",
+    "ucast": "UCast",
+}
+
+
+def normalized_model_name(label):
+    """Canonicalize a model identifier for display/color lookup only."""
+    return " ".join(str(label).replace("_", " ").split()).lower()
+
+
+def displayed_model_name(label):
+    """Return a concise plot label without changing persisted target IDs."""
+    return MODEL_DISPLAY_NAMES.get(normalized_model_name(label), str(label))
 
 
 def categorical_colors(count, offset=0):
-    """Return exactly ``count`` colors drawn cyclically from the shared palette."""
-    return [PLOT_PALETTE[(int(offset) + index) % len(PLOT_PALETTE)] for index in range(int(count))]
+    """Return non-critic series colors, reserving Prussian Blue for ours."""
+    return [
+        SERIES_PALETTE[(int(offset) + index) % len(SERIES_PALETTE)]
+        for index in range(int(count))
+    ]
+
+
+def lead_time_colors(count):
+    """Return distinct ordered colors for multi-lead overlays."""
+    return [LEAD_TIME_PALETTE[index % len(LEAD_TIME_PALETTE)] for index in range(int(count))]
+
+
+def model_colors(labels, offset=0):
+    """Return stable model colors, including overrides for selected forecasts."""
+    labels = [str(label) for label in labels]
+    defaults = categorical_colors(len(labels), offset=offset)
+    colors = []
+    for label, default in zip(labels, defaults):
+        normalized = normalized_model_name(label)
+        colors.append(MODEL_COLOR_OVERRIDES.get(normalized, default))
+    return colors
 
 
 def configure_plot_bundle_saving(*, save_pdf=False, profile="dashboard",
@@ -55,7 +111,7 @@ def configure_plot_bundle_saving(*, save_pdf=False, profile="dashboard",
     _PAPER_WIDTH_KIND = str(paper_width_kind)
     _PAPER_COLUMN_GAP_INCHES = float(paper_column_gap_inches)
     _INCLUDE_PATTERNS = tuple(str(value) for value in (include_patterns or ()))
-    mpl.rcParams["axes.prop_cycle"] = mpl.cycler(color=PLOT_PALETTE)
+    mpl.rcParams["axes.prop_cycle"] = mpl.cycler(color=SERIES_PALETTE)
     mpl.rcParams["font.family"] = ["Nimbus Roman", "serif"]
     mpl.rcParams["font.serif"] = [
         "Nimbus Roman", "DejaVu Serif",
@@ -404,12 +460,17 @@ def _save_one_figure_bundle(figure, png_path, *, plot_type, payload, metadata, d
 
 def save_figure_bundle(figure, png_path, *, plot_type, payload=None, metadata=None,
                        dpi=220, bbox_inches=None, capture_artists=True, save_pdf=None,
-                       paper_width_kind=None):
-    """Save titled and title-less PNG/NPZ bundles, optionally including PDFs."""
+                       paper_width_kind=None, paperize=True):
+    """Save titled and title-less PNG/NPZ bundles, optionally including PDFs.
+
+    Large composite galleries may set ``paperize=False`` when their layout is
+    already authored at its final aspect and typography; resizing those figures
+    after layout changes the relative text/colorbar geometry.
+    """
     png_path = profiled_plot_path(png_path)
     if not _selected(png_path):
         return []
-    if _PLOT_PROFILE == "paper":
+    if _PLOT_PROFILE == "paper" and paperize:
         _paperize_figure(figure, paper_width_kind=paper_width_kind)
         bbox_inches = None
     if save_pdf is None:

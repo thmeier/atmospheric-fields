@@ -12,6 +12,7 @@ from tqdm import tqdm
 from omegaconf import DictConfig
 
 try:
+    from .plot_bundles import categorical_colors
     from .analysis_utils import normalization_stats
     from .corruptions import get_corruption_ladder
     from .train_discriminator import (
@@ -21,6 +22,7 @@ try:
         select_time_ranges,
     )
 except ImportError:
+    from plot_bundles import categorical_colors
     from analysis_utils import normalization_stats
     from corruptions import get_corruption_ladder
     from train_discriminator import (
@@ -239,7 +241,7 @@ def main(cfg: DictConfig):
     n_rows = int(np.ceil(len(disturbances) / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6 * n_rows))
     axes = np.atleast_1d(axes).flatten()
-    colors = plt.cm.tab10(np.linspace(0, 1, len(results)))
+    colors = categorical_colors(len(results))
     
     for i, (dtype, dinfo) in enumerate(disturbances.items()):
         ax = axes[i]

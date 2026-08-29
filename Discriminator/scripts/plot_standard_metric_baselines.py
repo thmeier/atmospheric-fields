@@ -35,6 +35,7 @@ import json
 import math
 from fractions import Fraction
 import tempfile
+import textwrap
 import zlib
 from pathlib import Path
 
@@ -61,8 +62,8 @@ def series_marker(index):
 
 try:
     from .plot_bundles import (
-        CRITIC_COLOR, PLOT_PALETTE, REFERENCE_COLOR, categorical_colors,
-        configure_plot_bundle_saving_from_cfg, save_figure_bundle,
+        CANDIDATE_COLOR, CRITIC_COLOR, PLOT_PALETTE, REFERENCE_COLOR, categorical_colors,
+        configure_plot_bundle_saving_from_cfg, displayed_model_name, lead_time_colors, model_colors, save_figure_bundle,
     )
     from .fake_matching_apply import match_standardized
     from .fake_matching_checkpoint import validate_binding
@@ -84,8 +85,8 @@ try:
     )
 except ImportError:
     from plot_bundles import (
-        CRITIC_COLOR, PLOT_PALETTE, REFERENCE_COLOR, categorical_colors,
-        configure_plot_bundle_saving_from_cfg, save_figure_bundle,
+        CANDIDATE_COLOR, CRITIC_COLOR, PLOT_PALETTE, REFERENCE_COLOR, categorical_colors,
+        configure_plot_bundle_saving_from_cfg, displayed_model_name, lead_time_colors, model_colors, save_figure_bundle,
     )
     from fake_matching_apply import match_standardized
     from fake_matching_checkpoint import validate_binding
@@ -1970,7 +1971,7 @@ def plot_mmd_global_moment_matching(rows, output_root):
     plot_root.mkdir(parents=True, exist_ok=True)
     figure, axis = plt.subplots(figsize=(9.0, 5.0))
     labels = sorted({row["label"] for row in rows})
-    colors = categorical_colors(max(len(labels), 1))
+    colors = model_colors(labels)
     for label_index, (color, label) in enumerate(zip(colors, labels)):
         series = sorted((row for row in rows if row["label"] == label), key=lambda row: row["lead_hour"])
         leads = [row["lead_hour"] for row in series]
@@ -2757,7 +2758,7 @@ def plot_global_mean_wasserstein_distributions(
                     else:
                         edges = np.linspace(lower - 0.5, upper + 0.5, item["n_bins"] + 1)
                     axis.hist(reference, bins=edges, density=True, histtype="step", linewidth=1.8, color="black", label="ERA5 test")
-                    axis.hist(np.clip(candidate, edges[0], edges[-1]), bins=edges, density=True, histtype="step", linewidth=1.8, color=CRITIC_COLOR, label=label)
+                    axis.hist(np.clip(candidate, edges[0], edges[-1]), bins=edges, density=True, histtype="step", linewidth=1.8, color=CANDIDATE_COLOR, label=label)
                 axis.set_title(f"+{item['lead_hour']} h | {field}\nJoint global-mean W2={item['distance']:.4g}", fontsize=10)
                 axis.set_xlabel("Cosine-area-weighted global mean (standardized)")
                 axis.set_ylabel("Density")
@@ -3095,7 +3096,7 @@ def plot_scwd_top_wasserstein_distributions(
                 axis.hist(reference, bins=edges, density=True, histtype="step", linewidth=1.5,
                           color="black", label=("ERA5 training complement" if scwd_comparison_kind(diagnostic) == "null" else "ERA5 test"))
                 axis.hist(candidate, bins=edges, density=True, histtype="step", linewidth=1.5,
-                          color=CRITIC_COLOR, label=diagnostic["label"])
+                          color=CANDIDATE_COLOR, label=diagnostic["label"])
                 latitude = item["latitude"]
                 longitude = item["longitude"]
                 local_wasserstein = item["wasserstein"]
@@ -3732,6 +3733,25 @@ def normalized_metric_bounds(row, metric_name, scales):
     return lower / scales[metric_name], upper / scales[metric_name]
 
 
+def null_diamond_positions(count, negative_extent):
+    """Dodge coincident null markers within the reserved space left of zero."""
+    count = int(count)
+    if count <= 1:
+        return np.asarray([0.0])
+    return np.linspace(-float(negative_extent), 0.0, count)
+
+
+def plot_null_diamond(axis, x, value, lower, upper, color, marker="D"):
+    """Draw one dodged null estimate with its persisted uncertainty interval."""
+    value, lower, upper = float(value), float(lower), float(upper)
+    axis.errorbar(
+        [float(x)], [value],
+        yerr=[[max(value - lower, 0.0)], [max(upper - value, 0.0)]],
+        marker=marker, markersize=3.6, linestyle="None", color=color,
+        elinewidth=0.75, capsize=1.5, capthick=0.75, zorder=5,
+    )
+
+
 def metric_colors(metric_names):
     return {
         metric_name: color
@@ -3741,8 +3761,9 @@ def metric_colors(metric_names):
     }
 
 
-def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_root):
-    """Plot one forecast target per panel and one line per normalized metric."""
+def plot_normalized_lead_metrics_by_model(
+        rows, metric_names, variables, output_root, discriminator_rows=None):
+    """Plot one forecast target per panel with fixed metrics and our critic."""
     metric_names = plotted_metric_names(metric_names)
     if not metric_names:
         return
@@ -3753,6 +3774,21 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
     })
     if not labels:
         return
+    critic_rows = [
+        row for row in (discriminator_rows or [])
+        if row.get("architecture") == "squeezenet" and row.get("kind") == "forecast"
+    ]
+    critic_values = np.asarray([
+        row["score"] for row in critic_rows if np.isfinite(row.get("score", np.nan))
+    ], dtype=float)
+    critic_positive = critic_values[critic_values > 0.0]
+    critic_scale = (
+        float(critic_positive.max()) if critic_positive.size
+        else (float(np.abs(critic_values).max()) if critic_values.size else 1.0)
+    )
+    if critic_scale <= 0.0:
+        critic_scale = 1.0
+
     scales = metric_normalization_scales(variable_rows, metric_names)
     colors = metric_colors(metric_names)
     n_cols = 2
@@ -3762,6 +3798,7 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
         layout="constrained",
     )
     era5_rows = [row for row in variable_rows if row["label"] == ERA5_NULL_LABEL]
+    null_positions = null_diamond_positions(len(metric_names) + 1, 4.5)
     for panel_index, (axis, label) in enumerate(zip(axes.ravel(), labels)):
         series = sorted(
             [row for row in variable_rows if row["label"] == label],
@@ -3782,12 +3819,48 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
                     color=colors[metric_name], alpha=0.14, linewidth=0,
                 )
             if era5_rows:
-                axis.scatter(
-                    [0], [normalized_metric_value(era5_rows[0], metric_name, scales)],
-                    marker="D", s=14, color=colors[metric_name], zorder=4,
+                null_value = normalized_metric_value(era5_rows[0], metric_name, scales)
+                null_lower, null_upper = normalized_metric_bounds(
+                    era5_rows[0], metric_name, scales,
                 )
+                plot_null_diamond(
+                    axis, null_positions[metric_index], null_value,
+                    null_lower, null_upper, colors[metric_name],
+                )
+
+        target_rows = [row for row in critic_rows if row.get("target") == label]
+        critic_series = sorted(
+            [row for row in target_rows if not row["is_era5_test_null"]],
+            key=lambda row: row["x"],
+        )
+        if critic_series:
+            critic_x = [row["x"] for row in critic_series]
+            axis.plot(
+                critic_x, [row["score"] / critic_scale for row in critic_series],
+                marker=series_marker(len(metric_names)), linestyle="--", linewidth=1.6,
+                color=CRITIC_COLOR, label="Learned critic",
+            )
+            if "score_lower" in critic_series[0]:
+                axis.fill_between(
+                    critic_x,
+                    [row["score_lower"] / critic_scale for row in critic_series],
+                    [row["score_upper"] / critic_scale for row in critic_series],
+                    color=CRITIC_COLOR, alpha=0.12, linewidth=0,
+                )
+            critic_null = next(
+                (row for row in target_rows if row["is_era5_test_null"]), None
+            )
+            if critic_null is not None:
+                critic_value = critic_null["score"] / critic_scale
+                critic_lower = critic_null.get("score_lower", critic_null["score"]) / critic_scale
+                critic_upper = critic_null.get("score_upper", critic_null["score"]) / critic_scale
+                plot_null_diamond(
+                    axis, null_positions[-1], critic_value, critic_lower, critic_upper,
+                    CRITIC_COLOR,
+                )
+
         axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
-        axis.set_title(label)
+        axis.set_title(displayed_model_name(label))
         axis.set_xlim(-6.0, max([row["lead_hour"] for row in series], default=192) * 1.03)
         if panel_index // 2 == n_rows - 1:
             axis.set_xlabel("Lead time (hours)")
@@ -3806,14 +3879,13 @@ def plot_normalized_lead_metrics_by_model(rows, metric_names, variables, output_
     fig.suptitle(
         f"Normalized distributional metrics by forecast model: "
         f"{displayed_variable_name(variable)}\n"
-        "Diamonds: ERA5 test-vs-train null"
+        "Diamonds: ERA5 test-vs-train null (horizontally offset)"
     )
     output_path = output_root / "plots" / "lead_time_by_model_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_figure_bundle(fig, output_path, plot_type="baseline_plot", dpi=220)
     plt.close(fig)
     print(f"Saved normalized lead-time-by-model plot to: {output_path}")
-
 
 def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, output_root):
     """Plot one corruption per panel on a common relative-severity axis."""
@@ -3833,6 +3905,7 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
         n_rows, n_cols, figsize=(10.0, 3.0 * n_rows), squeeze=False,
         layout="constrained",
     )
+    null_positions = null_diamond_positions(len(metric_names), 0.03)
     for panel_index, (axis, corruption) in enumerate(zip(axes.ravel(), corruptions)):
         series = sorted(
             [
@@ -3863,9 +3936,13 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
                     color=colors[metric_name], alpha=0.14, linewidth=0,
                 )
             if null_row is not None:
-                axis.scatter(
-                    [0], [normalized_metric_value(null_row, metric_name, scales)],
-                    marker="D", s=14, color=colors[metric_name], zorder=4,
+                null_value = normalized_metric_value(null_row, metric_name, scales)
+                null_lower, null_upper = normalized_metric_bounds(
+                    null_row, metric_name, scales,
+                )
+                plot_null_diamond(
+                    axis, null_positions[metric_index], null_value,
+                    null_lower, null_upper, colors[metric_name],
                 )
         axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
         axis.set_title(displayed_corruption_name(corruption))
@@ -3888,7 +3965,7 @@ def plot_normalized_corruption_metrics_by_type(rows, metric_names, variables, ou
     fig.suptitle(
         f"Normalized distributional metrics by corruption: "
         f"{displayed_variable_name(variable)}\n"
-        "Diamonds: ERA5 test-vs-train null"
+        "Diamonds: ERA5 test-vs-train null (horizontally offset)"
     )
     output_path = output_root / "plots" / "corruption_by_type_normalized.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3909,7 +3986,7 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
     labels = sorted({
         row["label"] for row in variable_rows if row["label"] != ERA5_NULL_LABEL
     })
-    colors = categorical_colors(max(len(labels), 1))
+    colors = model_colors(labels)
     n_cols = 2
     n_rows = int(np.ceil((len(metric_names) + 1) / n_cols))
     fig, axes = plt.subplots(
@@ -3931,7 +4008,7 @@ def plot_lead_metrics(rows, metric_names, variables, output_root):
             axis.plot(
                 x_values, [display_metric_value(row, metric_name) for row in series],
                 marker=series_marker(label_index), linewidth=1.5,
-                color=color, label=label,
+                color=color, label=displayed_model_name(label),
             )
             if series and f"{metric_name}_lower" in series[0]:
                 bounds = [display_metric_bounds(row, metric_name) for row in series]
@@ -4329,70 +4406,125 @@ def plot_corruption_field_gallery(
 
 def plot_combined_corruption_gallery(output_dir, corruptions, levels, corrupted_fields, disturbances,
                                      variables, latitudes, longitudes, timestamp, placeholder=False):
-    """Render a large raw-field/difference overview with one pair of rows per corruption."""
+    """Render a compact overview with labelled rows and per-corruption scales."""
     n_corruptions, n_severity, n_variables = corrupted_fields.shape[:3]
-    n_columns = n_severity
+    endpoint_only = {"hemisphere_splice", "field_splice", "field_replace"}
     for variable_index, variable in enumerate(variables):
         raw = corrupted_fields[:, :, variable_index]
         difference = disturbances[:, :, variable_index]
         if placeholder:
-            raw_low, raw_high, difference_limit = -1.0, 1.0, 1.0
+            raw_low = np.full(n_corruptions, -1.0)
+            raw_high = np.full(n_corruptions, 1.0)
+            difference_limit = np.full(n_corruptions, 1.0)
         else:
-            raw_low, raw_high = np.nanpercentile(raw, [1.0, 99.0])
-            if np.isclose(raw_low, raw_high):
-                raw_low -= 1e-8; raw_high += 1e-8
-            difference_limit = max(float(np.nanpercentile(np.abs(difference), 99.0)), 1e-8)
+            raw_low = np.nanpercentile(raw, 1.0, axis=(1, 2, 3))
+            raw_high = np.nanpercentile(raw, 99.0, axis=(1, 2, 3))
+            equal = np.isclose(raw_low, raw_high)
+            raw_low[equal] -= 1e-8
+            raw_high[equal] += 1e-8
+            difference_limit = np.maximum(
+                np.nanpercentile(np.abs(difference), 99.0, axis=(1, 2, 3)), 1e-8,
+            )
         n_rows = 2 * n_corruptions
-        figure, axes = plt.subplots(
-            n_rows, n_columns,
-            figsize=(3.05 * n_columns, 2.45 * n_rows + 0.8),
-            squeeze=False, subplot_kw={"projection": ccrs.PlateCarree()},
+        figure = plt.figure(figsize=(2.63 * n_severity + 1.25, 1.40 * n_rows + 0.55))
+        grid = figure.add_gridspec(
+            n_rows, n_severity + 2,
+            width_ratios=[0.62] + [1.0] * n_severity + [0.075],
+            left=0.015, right=0.965, bottom=0.018, top=0.962,
+            wspace=0.055, hspace=0.065,
         )
-        raw_artist = difference_artist = None
         for corruption_index, corruption in enumerate(corruptions):
-            for severity_index in range(n_severity):
-                raw_axis = axes[2 * corruption_index, severity_index]
-                difference_axis = axes[2 * corruption_index + 1, severity_index]
+            corruption = str(corruption)
+            raw_row = 2 * corruption_index
+            difference_row = raw_row + 1
+            display_name = textwrap.fill(displayed_corruption_name(corruption), width=13)
+
+            raw_label_axis = figure.add_subplot(grid[raw_row, 0])
+            difference_label_axis = figure.add_subplot(grid[difference_row, 0])
+            for axis in (raw_label_axis, difference_label_axis):
+                axis.set_axis_off()
+            raw_label_axis.text(
+                0.98, 0.5, f"{display_name}\nField", ha="right", va="center",
+                fontsize=8, fontweight="semibold", linespacing=1.15,
+            )
+            difference_label_axis.text(
+                0.98, 0.5, "Difference", ha="right", va="center", fontsize=7.5,
+            )
+
+            if corruption in endpoint_only and n_severity > 1:
+                severity_layout = (
+                    (0, slice(1, 1 + n_severity // 2)),
+                    (n_severity - 1, slice(1 + n_severity // 2, 1 + n_severity)),
+                )
+            else:
+                severity_layout = tuple(
+                    (severity_index, slice(1 + severity_index, 2 + severity_index))
+                    for severity_index in range(n_severity)
+                )
+
+            raw_artist = difference_artist = None
+            for severity_index, column_slice in severity_layout:
+                raw_axis = figure.add_subplot(
+                    grid[raw_row, column_slice], projection=ccrs.PlateCarree(),
+                )
+                difference_axis = figure.add_subplot(
+                    grid[difference_row, column_slice], projection=ccrs.PlateCarree(),
+                )
                 raw_artist = raw_axis.pcolormesh(
                     longitudes, latitudes,
                     (np.ma.masked_all_like(raw[corruption_index, severity_index])
                      if placeholder else raw[corruption_index, severity_index]),
-                    shading="auto",
-                    cmap="viridis", vmin=raw_low, vmax=raw_high, transform=ccrs.PlateCarree(), rasterized=True,
+                    shading="auto", cmap="viridis",
+                    vmin=float(raw_low[corruption_index]), vmax=float(raw_high[corruption_index]),
+                    transform=ccrs.PlateCarree(), rasterized=True,
                 )
                 difference_artist = difference_axis.pcolormesh(
                     longitudes, latitudes,
                     (np.ma.masked_all_like(difference[corruption_index, severity_index])
                      if placeholder else difference[corruption_index, severity_index]),
-                    shading="auto",
-                    cmap="RdBu_r", vmin=-difference_limit, vmax=difference_limit,
+                    shading="auto", cmap="RdBu_r",
+                    vmin=-float(difference_limit[corruption_index]),
+                    vmax=float(difference_limit[corruption_index]),
                     transform=ccrs.PlateCarree(), rasterized=True,
                 )
                 for axis in (raw_axis, difference_axis):
-                    axis.set_global(); axis.coastlines(linewidth=0.42)
+                    axis.set_global()
+                    axis.coastlines(linewidth=0.42)
                     axis.add_feature(cfeature.BORDERS, linewidth=0.25, alpha=0.4)
                     if placeholder:
                         axis.text(0.5, 0.5, "blank field", transform=axis.transAxes,
                                   ha="center", va="center", color="0.45", fontsize=7)
                 relative_strength = (
-                    severity_index / (n_severity - 1)
-                    if n_severity > 1 else 1.0
+                    severity_index / (n_severity - 1) if n_severity > 1 else 1.0
                 )
-                raw_axis.set_title(f"Relative strength {relative_strength:g}", fontsize=8)
-            display_name = displayed_corruption_name(corruption)
-            axes[2 * corruption_index, 0].set_ylabel(f"{display_name}\ncorrupted", fontsize=8)
-            axes[2 * corruption_index + 1, 0].set_ylabel(f"{display_name}\nminus ERA5", fontsize=8)
+                raw_axis.set_title(f"Strength {relative_strength:g}", fontsize=7.5, pad=1.5)
+
+            raw_bar = figure.colorbar(
+                raw_artist, cax=figure.add_subplot(grid[raw_row, -1]),
+                orientation="vertical", format="%.3g",
+                ticks=[float(raw_low[corruption_index]),
+                       float((raw_low[corruption_index] + raw_high[corruption_index]) / 2.0),
+                       float(raw_high[corruption_index])],
+            )
+            difference_bar = figure.colorbar(
+                difference_artist, cax=figure.add_subplot(grid[difference_row, -1]),
+                orientation="vertical", format="%.3g",
+                ticks=[-float(difference_limit[corruption_index]), 0.0,
+                       float(difference_limit[corruption_index])],
+            )
+            for colorbar in (raw_bar, difference_bar):
+                colorbar.ax.tick_params(labelsize=5.5, length=2, pad=1)
+
         figure.suptitle(
-            f"Selected corruption probes: {variable.replace('_', ' ')}\nERA5 {timestamp}", fontsize=15,
+            f"Selected corruption probes: {variable.replace('_', ' ')} — ERA5 {timestamp}",
+            fontsize=12.5, y=0.993,
         )
-        figure.subplots_adjust(left=0.075, right=0.985, top=0.965, bottom=0.075, wspace=0.025, hspace=0.16)
-        raw_colorbar_axis = figure.add_axes([0.10, 0.022, 0.34, 0.012])
-        difference_colorbar_axis = figure.add_axes([0.58, 0.022, 0.34, 0.012])
-        figure.colorbar(raw_artist, cax=raw_colorbar_axis, orientation="horizontal", label="Corrupted field")
-        figure.colorbar(difference_artist, cax=difference_colorbar_axis, orientation="horizontal", label="Corrupted − ERA5")
         suffix = "all_corruptions_gallery.png" if n_variables == 1 else f"all_corruptions_gallery_{variable}.png"
         output_path = output_dir / suffix
-        save_figure_bundle(figure, output_path, plot_type="corruption_gallery", dpi=160, bbox_inches="tight")
+        save_figure_bundle(
+            figure, output_path, plot_type="corruption_gallery", dpi=160,
+            bbox_inches="tight", paperize=False,
+        )
         plt.close(figure)
         print(f"Saved combined corruption gallery to: {output_path}")
 
@@ -4756,6 +4888,25 @@ def read_discriminator_terms(output_root):
     return rows
 
 
+def gallery_logit_bin_edges(panels, bins=40, independent_target="ERA5 Forecast"):
+    """Use a shared logit axis except for a target with a distinct critic scale."""
+    all_values = [reference for _, reference, _ in panels]
+    all_values += [candidate for _, _, groups in panels for _, candidate in groups]
+    finite = [values[np.isfinite(values)] for values in all_values if values.size]
+    common_edges = np.histogram_bin_edges(np.concatenate(finite), bins=int(bins))
+    edges_by_model = {}
+    for model, reference, groups in panels:
+        if displayed_model_name(model).lower() != independent_target.lower():
+            edges_by_model[model] = common_edges
+            continue
+        model_values = [reference, *[candidate for _, candidate in groups]]
+        model_finite = [values[np.isfinite(values)] for values in model_values if values.size]
+        edges_by_model[model] = np.histogram_bin_edges(
+            np.concatenate(model_finite), bins=int(bins),
+        )
+    return common_edges, edges_by_model
+
+
 def plot_forecast_logit_histogram_gallery(term_rows, cfg, output_root):
     """Plot every available forecast target's held-out logit densities."""
     settings = (cfg.get("plotting", {}) or {}).get("logit_histogram_gallery", {}) or {}
@@ -4821,14 +4972,9 @@ def plot_forecast_logit_histogram_gallery(term_rows, cfg, output_root):
         print(f"Skipping {architecture} forecast-logit gallery: no matching per-sample terms.")
         return
 
-    all_values = [reference for _, reference, _ in panels]
-    all_values += [candidate for _, _, groups in panels for _, candidate in groups]
-    finite = [value[np.isfinite(value)] for value in all_values if value.size]
-    edges = np.histogram_bin_edges(np.concatenate(finite), bins=40)
+    edges, edges_by_model = gallery_logit_bin_edges(panels, bins=40)
     all_leads = sorted({lead for _, _, groups in panels for lead, _ in groups})
-    colors = dict(zip(
-        all_leads, categorical_colors(len(all_leads), offset=1)
-    ))
+    colors = dict(zip(all_leads, lead_time_colors(len(all_leads))))
     nrows = int(math.ceil((len(panels) + 1) / 2))
     figure, axes = plt.subplots(
         nrows, 2, figsize=(10.0, 3.0 * nrows), squeeze=False,
@@ -4838,20 +4984,23 @@ def plot_forecast_logit_histogram_gallery(term_rows, cfg, output_root):
     for panel_index, (axis, (model, reference, groups)) in enumerate(
         zip(axes.flat, panels)
     ):
+        panel_edges = edges_by_model[model]
         axis.hist(
-            reference, bins=edges, density=True, histtype="stepfilled",
+            reference, bins=panel_edges, density=True, histtype="stepfilled",
             color=REFERENCE_COLOR, alpha=0.32, label="ERA5 test",
         )
         payload[f"model_{panel_index}"] = np.asarray(model)
+        payload[f"display_scale_{panel_index}"] = np.asarray(1.0)
+        payload[f"bin_edges_{panel_index}"] = panel_edges
         payload[f"reference_logits_{panel_index}"] = reference
         for lead, candidate in groups:
             axis.hist(
-                candidate, bins=edges, density=True, histtype="step",
+                candidate, bins=panel_edges, density=True, histtype="step",
                 linewidth=1.35, color=colors[lead], label=f"+{lead} h",
             )
             payload[f"candidate_logits_{panel_index}_{lead}h"] = candidate
         axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
-        axis.set_title(model)
+        axis.set_title(displayed_model_name(model))
         if panel_index // 2 == nrows - 1:
             axis.set_xlabel("Real-vs-fake logit")
         if panel_index % 2 == 0:
@@ -4922,7 +5071,7 @@ def plot_forecast_logit_histogram_gallery(term_rows, cfg, output_root):
             title="Lead time", fontsize=7, title_fontsize=8,
         )
         individual.suptitle(
-            f"Held-out forecast logits: {model}\n"
+            f"Held-out forecast logits: {displayed_model_name(model)}\n"
             f"{displayed_architecture_name(architecture)}; {selected_resample}"
         )
         individual.subplots_adjust(
@@ -5015,9 +5164,17 @@ def plot_forecast_critic_and_graphcast_histograms(rows, term_rows, cfg, output_r
     critic_legend_axis.set_axis_off()
     histogram_legend_axis.set_axis_off()
 
-    model_colors = categorical_colors(max(len(targets), 1))
-    maximum_lead = 0.0
-    for target_index, (color, label) in enumerate(zip(model_colors, targets)):
+    target_colors = model_colors(targets)
+    maximum_lead = max(
+        [float(row["x"]) for row in forecast_rows if not row["is_era5_test_null"]]
+        or [1.0]
+    )
+    null_positions = null_diamond_positions(
+        len(targets), 0.03 * max(maximum_lead, 1.0),
+    )
+    null_target_labels = []
+    null_x_positions = []
+    for target_index, (color, label) in enumerate(zip(target_colors, targets)):
         target_rows = [row for row in forecast_rows if row.get("target") == label]
         series = sorted(
             [row for row in target_rows if not row["is_era5_test_null"]],
@@ -5026,10 +5183,10 @@ def plot_forecast_critic_and_graphcast_histograms(rows, term_rows, cfg, output_r
         if not series:
             continue
         x_values = np.asarray([row["x"] for row in series], dtype=float)
-        maximum_lead = max(maximum_lead, float(x_values.max()))
         critic_axis.plot(
             x_values, [row["score"] for row in series],
-            marker=series_marker(target_index), color=color, label=label,
+            marker=series_marker(target_index), color=color,
+            label=displayed_model_name(label),
         )
         if "score_lower" in series[0]:
             critic_axis.fill_between(
@@ -5042,12 +5199,15 @@ def plot_forecast_critic_and_graphcast_histograms(rows, term_rows, cfg, output_r
         if null is not None:
             lower = float(null.get("score_lower", null["score"]))
             upper = float(null.get("score_upper", null["score"]))
+            null_x = float(null_positions[target_index])
             critic_axis.errorbar(
-                [0.0], [null["score"]],
+                [null_x], [null["score"]],
                 yerr=[[null["score"] - lower], [upper - null["score"]]],
                 marker="D", markersize=3.0, linestyle="None",
                 color=color, capsize=2, zorder=4,
             )
+            null_target_labels.append(label)
+            null_x_positions.append(null_x)
     critic_axis.set(
         title="Critic score vs. lead time",
         xlabel="Lead time (hours)", ylabel="Critic score",
@@ -5068,11 +5228,11 @@ def plot_forecast_critic_and_graphcast_histograms(rows, term_rows, cfg, output_r
         reference, bins=edges, density=True, histtype="stepfilled",
         color=REFERENCE_COLOR, alpha=0.32, label="ERA5 test",
     )
-    lead_colors = categorical_colors(len(groups), offset=1)
+    lead_colors = lead_time_colors(len(groups))
     for lead_index, (color, (lead, values)) in enumerate(zip(lead_colors, groups)):
         histogram_axis.hist(
             values, bins=edges, density=True, histtype="step",
-            linewidth=1.25, linestyle=("-" if lead_index < len(PLOT_PALETTE) else "--"),
+            linewidth=1.25, linestyle=("-" if lead_index < len(PLOT_PALETTE) - 1 else "--"),
             color=color, label=f"+{lead} h",
         )
     histogram_axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
@@ -5093,6 +5253,8 @@ def plot_forecast_critic_and_graphcast_histograms(rows, term_rows, cfg, output_r
         "histogram_bin_edges": edges,
         "graphcast_reference_logits": reference,
         "resample_id": np.asarray(selected_resample),
+        "critic_null_targets": np.asarray(null_target_labels),
+        "critic_null_x_positions": np.asarray(null_x_positions, dtype=float),
     }
     for lead, values in groups:
         payload[f"graphcast_logits_{lead}h"] = values
@@ -5138,7 +5300,10 @@ def plot_discriminator_baselines(rows, cfg, output_root):
             axis = figure.add_subplot(grid[0])
             legend_axis = figure.add_subplot(grid[1])
             legend_axis.set_axis_off()
-            colors = categorical_colors(max(len(targets), 1))
+            colors = (
+                model_colors(targets) if kind == "forecast"
+                else categorical_colors(max(len(targets), 1))
+            )
             for target_index, (color, target) in enumerate(zip(colors, targets)):
                 target_rows = [
                     row for row in architecture_rows
@@ -5157,7 +5322,7 @@ def plot_discriminator_baselines(rows, cfg, output_root):
                 )
                 label = (
                     corruption_range_label(target, series, "x")
-                    if visual_corruption_scale else target
+                    if visual_corruption_scale else displayed_model_name(target)
                 )
                 axis.plot(
                     x_values, [row["score"] for row in series],
@@ -5446,6 +5611,7 @@ def plot_main_corruption_comparison(
         sharey="row",
     )
     axes = axes.ravel()
+    null_positions = null_diamond_positions(len(metric_names) + 1, 0.035)
 
     for panel_index, (axis, corruption) in enumerate(zip(axes[:5], corruptions)):
         series = sorted(
@@ -5487,13 +5653,13 @@ def plot_main_corruption_comparison(
                     zorder=1,
                 )
             if null_row is not None:
-                axis.scatter(
-                    [0.0],
-                    [normalized_metric_value(null_row, metric_name, scales)],
-                    marker="D",
-                    s=14,
-                    color=colors[metric_name],
-                    zorder=4,
+                null_value = normalized_metric_value(null_row, metric_name, scales)
+                null_lower, null_upper = normalized_metric_bounds(
+                    null_row, metric_name, scales,
+                )
+                plot_null_diamond(
+                    axis, null_positions[metric_index], null_value,
+                    null_lower, null_upper, colors[metric_name],
                 )
         target_rows = [row for row in critic_rows if row["target"] == corruption]
         critic_series = sorted(
@@ -5518,9 +5684,12 @@ def plot_main_corruption_comparison(
             (row for row in target_rows if row["is_era5_test_null"]), None
         )
         if critic_null is not None:
-            axis.scatter(
-                [0.0], [critic_null["score"] / critic_scale],
-                marker="D", s=14, color=critic_color, zorder=4,
+            critic_value = critic_null["score"] / critic_scale
+            critic_lower = critic_null.get("score_lower", critic_null["score"]) / critic_scale
+            critic_upper = critic_null.get("score_upper", critic_null["score"]) / critic_scale
+            plot_null_diamond(
+                axis, null_positions[-1], critic_value, critic_lower, critic_upper,
+                critic_color,
             )
         axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.35)
         axis.set(
@@ -5593,7 +5762,9 @@ def plot_saved_standard_metric_baselines(cfg):
 
     plot_lead_metrics(lead_rows, metric_names, variables, output_root)
     plot_corruption_metrics(corruption_rows, metric_names, variables, output_root)
-    plot_normalized_lead_metrics_by_model(lead_rows, metric_names, variables, output_root)
+    plot_normalized_lead_metrics_by_model(
+        lead_rows, metric_names, variables, output_root, discriminator_rows,
+    )
     plot_normalized_corruption_metrics_by_type(corruption_rows, metric_names, variables, output_root)
     plot_main_corruption_comparison(
         corruption_rows, discriminator_rows, metric_names, variables, cfg, output_root

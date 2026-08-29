@@ -1,3 +1,4 @@
+import json
 import tempfile
 from unittest.mock import patch
 import unittest
@@ -28,12 +29,14 @@ from Discriminator.scripts.plot_standard_metric_baselines import (
     fit_vissio_ulam_grid,
     global_mean_wasserstein_diagnostic,
     representative_corruption_time_index,
+    gallery_logit_bin_edges,
     repeated_diagnostic_labels,
     relative_corruption_coordinates,
     corruption_range_label,
     pairwise_sample_positions,
     mmd_rbf_bandwidths,
     mmd_rbf_distance,
+    null_diamond_positions,
     reference_features_from_config,
     scwd_anchor_diagnostic,
     scwd_anchor_transport_costs,
@@ -213,6 +216,24 @@ class FullStatisticsBaselineTest(unittest.TestCase):
 
 
 
+    def test_null_diamond_positions_dodge_left_of_zero(self):
+        positions = null_diamond_positions(5, 6.0)
+        np.testing.assert_allclose(positions, [-6.0, -4.5, -3.0, -1.5, 0.0])
+        self.assertEqual(len(np.unique(positions)), 5)
+
+    def test_era5_forecast_gallery_uses_original_logits_on_independent_axis(self):
+        panels = [
+            ("GraphCast", np.asarray([-4.0, 4.0]), [(6, np.asarray([-6.0, 6.0]))]),
+            ("Pangu-Weather", np.asarray([-2.0, 2.0]), [(6, np.asarray([-3.0, 3.0]))]),
+            ("ERA5 Forecast", np.asarray([-0.2, 0.2]), [(6, np.asarray([-0.3, 0.3]))]),
+        ]
+        common, by_model = gallery_logit_bin_edges(panels)
+        np.testing.assert_array_equal(by_model["GraphCast"], common)
+        np.testing.assert_array_equal(by_model["Pangu-Weather"], common)
+        self.assertAlmostEqual(float(by_model["ERA5 Forecast"][0]), -0.3)
+        self.assertAlmostEqual(float(by_model["ERA5 Forecast"][-1]), 0.3)
+        self.assertGreater(float(common[-1]), 5.0)
+
     def test_normalized_converse_plots_use_global_signed_metric_scales(self):
         metrics = ["positive", "mixed", "negative_only", "zero_only"]
         scale_rows = [
@@ -236,9 +257,23 @@ class FullStatisticsBaselineTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            plot_normalized_lead_metrics_by_model(lead_rows, metrics, ["T2M"], root)
+            discriminator_rows = [
+                {"architecture": "squeezenet", "kind": "forecast", "target": target,
+                 "x": 6.0, "score": score, "score_lower": score - 0.1,
+                 "score_upper": score + 0.1, "is_era5_test_null": False}
+                for target, score in (("Model A", 2.0), ("Model B", 1.0))
+            ]
+            plot_normalized_lead_metrics_by_model(
+                lead_rows, metrics, ["T2M"], root, discriminator_rows,
+            )
             plot_normalized_corruption_metrics_by_type(corruption_rows, metrics, ["T2M"], root)
             self.assertTrue((root / "plots" / "lead_time_by_model_normalized.png").is_file())
+            with np.load(root / "plots" / "lead_time_by_model_normalized.npz", allow_pickle=False) as bundle:
+                metadata = json.loads(str(bundle["metadata_json"]))
+            line_labels = {
+                line["label"] for axis in metadata["axes"] for line in axis["lines"]
+            }
+            self.assertIn("Learned critic", line_labels)
             self.assertTrue((root / "plots" / "corruption_by_type_normalized.png").is_file())
 
     def test_discriminator_outputs_are_separated_by_architecture(self):

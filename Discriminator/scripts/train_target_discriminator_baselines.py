@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 try:
     from .plot_bundles import (
-        CRITIC_COLOR, REFERENCE_COLOR, categorical_colors, all_plot_bundle_paths,
+        CANDIDATE_COLOR, REFERENCE_COLOR, categorical_colors, lead_time_colors, all_plot_bundle_paths,
         configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle,
     )
     from .fake_matching_apply import match_raw, match_standardized
@@ -39,7 +39,7 @@ try:
     )
 except ImportError:
     from plot_bundles import (
-        CRITIC_COLOR, REFERENCE_COLOR, categorical_colors, all_plot_bundle_paths,
+        CANDIDATE_COLOR, REFERENCE_COLOR, categorical_colors, lead_time_colors, all_plot_bundle_paths,
         configure_plot_bundle_saving_from_cfg, profiled_plot_path, save_figure_bundle,
     )
     from fake_matching_apply import match_raw, match_standardized
@@ -589,7 +589,7 @@ def _logit_histogram_edges(values, bins=40):
     return np.histogram_bin_edges(combined, bins=max(2, int(bins)))
 
 
-def _plot_logit_histogram(reference, candidate, title, candidate_label, output_path, color=CRITIC_COLOR):
+def _plot_logit_histogram(reference, candidate, title, candidate_label, output_path, color=CANDIDATE_COLOR):
     edges = _logit_histogram_edges([reference, candidate])
     figure, axis = plt.subplots(figsize=(6.4, 5.0), layout="constrained")
     axis.hist(reference, bins=edges, density=True, histtype="stepfilled", color=REFERENCE_COLOR, alpha=0.35, label="ERA5 test")
@@ -609,7 +609,7 @@ def _plot_logit_histogram(reference, candidate, title, candidate_label, output_p
     ); plt.close(figure)
 
 
-def _plot_logit_histogram_overlay(groups, title, output_path):
+def _plot_logit_histogram_overlay(groups, title, output_path, colors=None):
     edges = _logit_histogram_edges([value for group in groups for value in (group["reference"], group["candidate"])])
     legend_columns = 2
     legend_rows = int(np.ceil((len(groups) + 1) / legend_columns))
@@ -624,7 +624,7 @@ def _plot_logit_histogram_overlay(groups, title, output_path):
     legend_axis.set_axis_off()
     pooled_reference = np.concatenate([group["reference"] for group in groups])
     axis.hist(pooled_reference, bins=edges, density=True, histtype="stepfilled", color=REFERENCE_COLOR, alpha=0.30, label="ERA5 test (pooled)")
-    colors = categorical_colors(len(groups), offset=1)
+    colors = colors or categorical_colors(len(groups), offset=1)
     for color, group in zip(colors, groups):
         axis.hist(group["candidate"], bins=edges, density=True, histtype="step", linewidth=1.7, color=color, label=group["label"])
     axis.axvline(0.0, color="black", linewidth=0.7, alpha=0.45)
@@ -717,7 +717,12 @@ def plot_target_test_logit_histograms(model, architecture, kind, label, test_rea
                            "path": profiled_plot_path(path)})
         overlay_path = root / "all_lead_times.png"
         if groups:
-            _plot_logit_histogram_overlay(groups, f"{_histogram_display_name(label)}: all lead times ({_histogram_display_name(architecture)})", overlay_path)
+            _plot_logit_histogram_overlay(
+                groups,
+                f"{_histogram_display_name(label)}: all lead times ({_histogram_display_name(architecture)})",
+                overlay_path,
+                colors=lead_time_colors(len(groups)),
+            )
             overlay_path = profiled_plot_path(overlay_path)
     return [group["path"] for group in groups] + ([overlay_path] if groups else [])
 

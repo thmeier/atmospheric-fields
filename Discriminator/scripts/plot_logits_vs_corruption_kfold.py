@@ -11,6 +11,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Dataset
 
 try:
+    from .plot_bundles import categorical_colors
     from .corruptions import get_corruption_ladder
     from .train_corruption_kfold import (
         corruption_group_tag,
@@ -27,6 +28,7 @@ try:
     from .analysis_utils import normalization_stats, resolve_device
     from .train_kfold import variable_tag
 except ImportError:
+    from plot_bundles import categorical_colors
     from corruptions import get_corruption_ladder
     from train_corruption_kfold import (
         corruption_group_tag,
@@ -208,7 +210,7 @@ def plot_results(cfg, results, view):
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5 * n_rows))
     axes = np.atleast_1d(axes).flatten()
 
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(results), 1)))
+    colors = categorical_colors(max(len(results), 1))
     for axis_idx, corruption_type in enumerate(corruption_types):
         ax = axes[axis_idx]
         for color, (_, fold_result) in zip(colors, results.items()):

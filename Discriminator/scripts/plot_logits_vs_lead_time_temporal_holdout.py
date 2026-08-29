@@ -9,12 +9,14 @@ from omegaconf import DictConfig
 import torch
 
 try:
+    from .plot_bundles import categorical_colors, model_colors
     from .analysis_utils import resolve_device
     from .monthly_split import concatenate_forecasts, forecast_pairs, lead_hours
     from .train_target_discriminator_baselines import logits_for, matched_statistics
     from .temporal_holdout_utils import checkpoint_path, discover_temporal_pairs, safe_model_name, variable_tag, variables_from_config
     from .train_discriminator import WeatherDiscriminator, normalize_prediction_timedelta, safe_open_dataset
 except ImportError:
+    from plot_bundles import categorical_colors, model_colors
     from analysis_utils import resolve_device
     from monthly_split import concatenate_forecasts, forecast_pairs, lead_hours
     from train_target_discriminator_baselines import logits_for, matched_statistics
@@ -68,7 +70,7 @@ def main(cfg: DictConfig):
     model = WeatherDiscriminator(len(model_vars), cfg.model_name).to(device)
 
     plt.figure(figsize=(13, 8))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(pairs)))
+    colors = model_colors(pairs)
     era5_means = []
     era5_stds = []
     max_lead_hour = 0

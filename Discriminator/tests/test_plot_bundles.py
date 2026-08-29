@@ -7,13 +7,36 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from Discriminator.scripts.plot_bundles import (
-    all_plot_bundle_paths, configure_plot_bundle_saving, rasterize_field_artists, save_figure_bundle,
-    titleless_plot_path, without_suptitle,
+    all_plot_bundle_paths, configure_plot_bundle_saving, displayed_model_name, lead_time_colors, model_colors, rasterize_field_artists,
+    save_figure_bundle, titleless_plot_path, without_suptitle,
 )
 from Discriminator.scripts.render_npz_paper_plots import load_bundle, reconstruct
 
 
 class PlotBundleTests(unittest.TestCase):
+    def test_ucast_member_zero_has_concise_display_name(self):
+        self.assertEqual(displayed_model_name("UCast member 0"), "UCast")
+        self.assertEqual(displayed_model_name("UCast_member_0"), "UCast")
+        self.assertEqual(displayed_model_name("GraphCast"), "GraphCast")
+
+    def test_standard_lead_times_use_six_distinct_extended_colors(self):
+        colors = lead_time_colors(6)
+        self.assertEqual(colors, [
+            "#5CA4A9", "#DC9E82", "#AB494B",
+            "#C58F2A", "#356859", "#AD99FF",
+        ])
+        self.assertEqual(len(set(colors)), 6)
+
+    def test_selected_forecast_models_have_stable_distinct_colors(self):
+        labels = ["GraphCast", "ERA5 Forecast", "UCast member 0", "SWIFT"]
+        colors = model_colors(labels)
+        self.assertEqual(colors[1:], ["#030027", "#C58F2A", "#356859"])
+        self.assertEqual(
+            model_colors(["SWIFT", "ERA5_Forecast", "UCast_member_0"]),
+            ["#356859", "#030027", "#C58F2A"],
+        )
+        self.assertEqual(len(set(colors)), len(colors))
+
     def test_bundle_writes_png_and_safe_npz_sidecar_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "plots" / "curve.png"
@@ -120,6 +143,23 @@ class PlotBundleTests(unittest.TestCase):
             self.assertEqual(metadata["axes"][0]["xscale"], "log")
             self.assertEqual(metadata["axes"][0]["lines"][0]["label"], "Metric")
             self.assertEqual(metadata["axes"][0]["lines"][0]["marker"], "s")
+
+    def test_paper_profile_can_preserve_authored_gallery_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run" / "plots" / "gallery.png"
+            figure, _ = plt.subplots(figsize=(11.5, 14.0))
+            configure_plot_bundle_saving(
+                profile="paper", paper_width_inches=5.5, paper_width_kind="full"
+            )
+            try:
+                paths = save_figure_bundle(
+                    figure, output, plot_type="gallery", paperize=False,
+                )
+            finally:
+                configure_plot_bundle_saving()
+                plt.close(figure)
+            self.assertTrue(paths[0].is_file())
+            np.testing.assert_allclose(figure.get_size_inches(), [11.5, 14.0])
 
     def test_paper_profile_can_filter_filenames(self):
         configure_plot_bundle_saving(profile="paper", include_patterns=["keep*.png"])

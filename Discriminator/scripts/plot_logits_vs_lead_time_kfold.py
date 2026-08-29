@@ -16,6 +16,7 @@ from omegaconf import DictConfig
 import torch
 
 try:
+    from .plot_bundles import categorical_colors, model_colors
     from .analysis_utils import (
         LeadTimeInferenceDataset,
         mean_logits_by_lead,
@@ -24,6 +25,7 @@ try:
     )
     from .train_discriminator import WeatherDiscriminator, safe_open_dataset, select_time_ranges
 except ImportError:
+    from plot_bundles import categorical_colors, model_colors
     from analysis_utils import (
         LeadTimeInferenceDataset,
         mean_logits_by_lead,
@@ -200,7 +202,7 @@ def main(cfg: DictConfig):
         raise RuntimeError("No k-fold results were produced. Check comparison files and checkpoint names.")
 
     plt.figure(figsize=(15, 10))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(plot_results)))
+    colors = model_colors([result[0] for result in plot_results])
 
     avg_era5_mean = float(np.mean([r["era5_mean"] for r in plot_results]))
     avg_era5_std = float(np.mean([r["era5_std"] for r in plot_results]))
