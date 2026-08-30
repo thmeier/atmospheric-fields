@@ -1,6 +1,6 @@
 # Metric for Realism of Atmospheric Fields
 
-Course project for ETH AI Center, Projects in Machine Learning Research (PMLR) 2026.
+ETH Zurich, 2026.
 
 ## Overview
 
