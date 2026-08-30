@@ -36,6 +36,7 @@ and configuration options.
 .
 ├── Discriminator/     discriminator pipeline (training, evaluation, plotting)
 ├── download/          shared data-download utilities (ERA5 and forecasts from WeatherBench2)
+├── environment.yml
 ├── .gitignore
 └── README.md
 ```
@@ -56,8 +57,14 @@ surface fields listed above.
 
 ## Setup
 
-Python 3.12 with PyTorch, torchvision, and Hydra. See
-[`Discriminator/README.md`](Discriminator/README.md) for specific requirements.
+Create the conda environment from the provided file:
+
+```bash
+conda env create -f environment.yml
+conda activate atmospheric-fields
+```
+
+See [`Discriminator/README.md`](Discriminator/README.md) for pipeline-specific usage.
 
 ## Getting started
 
