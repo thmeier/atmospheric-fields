@@ -35,7 +35,9 @@ and configuration options.
 ```
 .
 ├── Discriminator/     discriminator pipeline (training, evaluation, plotting)
-├── download/          shared data-download utilities (ERA5 and forecasts from WeatherBench2)
+├── download/          data-download utilities (ERA5 and forecasts from WeatherBench2)
+├── ucast/             UCast forecast postprocessing and evaluation
+├── FeatureMetric/     SWIFT data conversion utilities
 ├── environment.yml
 ├── .gitignore
 └── README.md
