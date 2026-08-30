@@ -20,7 +20,7 @@ target_discriminator:
   # pretrained on ERA5 through 2019, so these are not leakage-free temporal
   # holdout results. Set SFNO_REPO or override repo_root explicitly.
   sfno:
-    enabled: true
+    enabled: false
     repo_root: null
     weights_subdir: weights_4fields
     # If enabled, only target_variables come from forecasts/corruptions;
