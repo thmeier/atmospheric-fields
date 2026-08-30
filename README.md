@@ -46,42 +46,18 @@ Generated and large artifacts (`data/`, `checkpoints/`, `results/`, `plots/`, `w
 ## Data
 
 All fields are obtained from the [WeatherBench2](https://weatherbench2.readthedocs.io/) Google
-Cloud buckets at 1.5-degree resolution and 6-hourly cadence. Shared download utilities are located
-in [`download/`](download/):
+Cloud buckets at 1.5-degree resolution and 6-hourly cadence. Download utilities are in
+[`download/`](download/), e.g.
+[`download/download_era5_netcdf.py`](download/download_era5_netcdf.py) downloads an ERA5 or
+forecast variable and time slice from a WeatherBench2 zarr store to NetCDF.
 
-- [`download/download_era5_netcdf.py`](download/download_era5_netcdf.py): download an ERA5 or
-  forecast variable and time slice from a WeatherBench2 zarr store to NetCDF.
-- [`download/download_era5_args.sh`](download/download_era5_args.sh): SLURM wrapper. Edit the
-  source, time range, variables, and output path, then submit with `sbatch`.
-- [`download/download_gen_data.sh`](download/download_gen_data.sh): recipes for the various
-  forecast sources (ERA5, GraphCast, Pangu, FuXi, IFS HRES, and others).
-
-On the cluster, data is downloaded once into the shared team directory
-`/cluster/courses/pmlr/teams/team07/data`. Please do not re-download or overwrite files that
-others are using.
-
-The current ERA5 dataset covers 1.5-degree resolution, 2004 to 2023, for the four surface fields
-listed above.
+The ERA5 dataset used in this work covers 1.5-degree resolution, 2004 to 2023, for the four
+surface fields listed above.
 
 ## Setup
 
-Each team member uses their own conda environment (Python 3.12):
-
-```bash
-conda create -n pmlr python=3.12 -y && conda activate pmlr
-```
-
-The Discriminator direction uses PyTorch Lightning, torchvision, and Hydra. See
+Python 3.12 with PyTorch, torchvision, and Hydra. See
 [`Discriminator/README.md`](Discriminator/README.md) for specific requirements.
-
-### Cluster access
-
-```bash
-ssh <your-eth-username>@student-cluster.inf.ethz.ch
-```
-
-Connect to the ETH VPN first if off-campus. Install a personal Miniconda in your home directory
-and create the `pmlr` environment as described above.
 
 ## Getting started
 
